@@ -1,0 +1,19 @@
+{
+  "name": "osimi-backend",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run --watch index.ts",
+    "start": "bun run index.ts",
+    "test": "bun test",
+    "migrate": "bun run src/db/migrate.ts",
+    "create-user": "bun run src/cli/create-user.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
