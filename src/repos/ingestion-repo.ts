@@ -55,6 +55,22 @@ export interface IngestionFileRecord {
   updatedAt: Date;
 }
 
+export interface StagingCleanupCandidate {
+  ingestionId: string;
+  tenantId: string;
+  status: IngestionStatus;
+  updatedAt: Date;
+  storageKey: string;
+}
+
+export interface StuckIngestionRecord {
+  ingestionId: string;
+  tenantId: string;
+  status: IngestionStatus;
+  updatedAt: Date;
+  createdBy: string;
+}
+
 function mapIngestion(row: IngestionRow): IngestionRecord {
   return {
     id: row.id,
@@ -82,6 +98,38 @@ function mapIngestionFile(row: IngestionFileRow): IngestionFileRecord {
     error: row.error,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
+  };
+}
+
+function mapStagingCleanupCandidate(row: {
+  ingestion_id: string;
+  tenant_id: string;
+  status: IngestionStatus;
+  updated_at: Date;
+  storage_key: string;
+}): StagingCleanupCandidate {
+  return {
+    ingestionId: row.ingestion_id,
+    tenantId: row.tenant_id,
+    status: row.status,
+    updatedAt: new Date(row.updated_at),
+    storageKey: row.storage_key,
+  };
+}
+
+function mapStuckIngestion(row: {
+  id: string;
+  tenant_id: string;
+  status: IngestionStatus;
+  updated_at: Date;
+  created_by: string;
+}): StuckIngestionRecord {
+  return {
+    ingestionId: row.id,
+    tenantId: row.tenant_id,
+    status: row.status,
+    updatedAt: new Date(row.updated_at),
+    createdBy: row.created_by,
   };
 }
 
@@ -310,4 +358,69 @@ export async function markIngestionFileUploaded(params: {
 
   const row = rows[0];
   return row ? mapIngestionFile(row) : undefined;
+}
+
+export async function listStagingCleanupCandidates(params: {
+  completedRetentionDays: number;
+  failedCanceledRetentionDays: number;
+}): Promise<StagingCleanupCandidate[]> {
+  const sql = db();
+  const ingestionsTable = qualifiedTableName("ingestions");
+  const filesTable = qualifiedTableName("ingestion_files");
+
+  const rows = (await sql.unsafe(
+    `
+      SELECT
+        i.id AS ingestion_id,
+        i.tenant_id,
+        i.status,
+        i.updated_at,
+        f.storage_key
+      FROM ${ingestionsTable} i
+      INNER JOIN ${filesTable} f ON f.ingestion_id = i.id
+      WHERE (
+        i.status = 'COMPLETED'
+        AND i.updated_at <= now() - ($1::int * interval '1 day')
+      )
+      OR (
+        i.status IN ('FAILED', 'CANCELED')
+        AND i.updated_at <= now() - ($2::int * interval '1 day')
+      )
+    `,
+    [params.completedRetentionDays, params.failedCanceledRetentionDays],
+  )) as Array<{
+    ingestion_id: string;
+    tenant_id: string;
+    status: IngestionStatus;
+    updated_at: Date;
+    storage_key: string;
+  }>;
+
+  return rows.map(mapStagingCleanupCandidate);
+}
+
+export async function listStuckIngestions(params: {
+  thresholdMinutes: number;
+}): Promise<StuckIngestionRecord[]> {
+  const sql = db();
+  const ingestionsTable = qualifiedTableName("ingestions");
+
+  const rows = (await sql.unsafe(
+    `
+      SELECT id, tenant_id, status, updated_at, created_by
+      FROM ${ingestionsTable}
+      WHERE status IN ('UPLOADING', 'PROCESSING')
+        AND updated_at <= now() - ($1::int * interval '1 minute')
+      ORDER BY updated_at ASC
+    `,
+    [params.thresholdMinutes],
+  )) as Array<{
+    id: string;
+    tenant_id: string;
+    status: IngestionStatus;
+    updated_at: Date;
+    created_by: string;
+  }>;
+
+  return rows.map(mapStuckIngestion);
 }

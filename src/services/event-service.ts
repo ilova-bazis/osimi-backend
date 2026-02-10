@@ -5,7 +5,7 @@ import { ConflictError, NotFoundError, UnauthorizedError, ValidationError } from
 import { resolveStagingPath, stagingRootPath } from "../storage/index.ts";
 import { findIngestionById, updateIngestionStatus } from "../repos/ingestion-repo.ts";
 import { insertObjectEvent } from "../repos/event-repo.ts";
-import { createObject, createObjectArtifact, findObjectBySourceIngestion } from "../repos/object-repo.ts";
+import { createObject, createObjectArtifact, findArtifactByStorageKey, findObjectBySourceIngestion } from "../repos/object-repo.ts";
 import { findActiveLeaseByToken } from "../repos/lease-repo.ts";
 import { parseLeaseToken } from "./lease-service.ts";
 
@@ -261,13 +261,20 @@ export async function ingestWorkerEvents(params: {
           ingestJson: ingestJson as Record<string, unknown>,
         });
 
-        await createObjectArtifact({
+        const existingArtifact = await findArtifactByStorageKey({
           objectId: object.objectId,
-          kind: "ingest_json",
           storageKey: manifest.storageKey,
-          contentType: "application/json",
-          sizeBytes: manifest.sizeBytes,
         });
+
+        if (!existingArtifact) {
+          await createObjectArtifact({
+            objectId: object.objectId,
+            kind: "ingest_json",
+            storageKey: manifest.storageKey,
+            contentType: "application/json",
+            sizeBytes: manifest.sizeBytes,
+          });
+        }
       }
 
       await updateIngestionStatus({

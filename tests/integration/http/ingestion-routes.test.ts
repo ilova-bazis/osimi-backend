@@ -376,4 +376,176 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
     expect(detailBody.files[0]?.id).toBe(firstPresignBody.file_id);
     expect(detailBody.files[0]?.status).toBe("UPLOADED");
   });
+
+  test("rejects upload content-type/content-length mismatches and checksum mismatches", async () => {
+    const app = createApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          upload_id: "batch-mismatch-001",
+        }),
+      }),
+    );
+
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+    const ingestionId = createBody.ingestion.id;
+
+    const presignResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/presign`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          filename: "constraints.txt",
+          content_type: "text/plain",
+          size_bytes: 5,
+        }),
+      }),
+    );
+
+    expect(presignResponse.status).toBe(201);
+    const presignBody = (await presignResponse.json()) as { file_id: string; upload_url: string };
+
+    const wrongType = await app.fetch(
+      new Request(`http://localhost${presignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          "content-length": "5",
+        },
+        body: "hello",
+      }),
+    );
+
+    expect(wrongType.status).toBe(400);
+
+    const wrongLength = await app.fetch(
+      new Request(`http://localhost${presignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "text/plain",
+          "content-length": "4",
+        },
+        body: "hello",
+      }),
+    );
+
+    expect(wrongLength.status).toBe(400);
+
+    const validUpload = await app.fetch(
+      new Request(`http://localhost${presignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "text/plain",
+          "content-length": "5",
+        },
+        body: "hello",
+      }),
+    );
+
+    expect(validUpload.status).toBe(200);
+
+    const badCommit = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/commit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          file_id: presignBody.file_id,
+          checksum_sha256: sha256Hex("wrong"),
+        }),
+      }),
+    );
+
+    expect(badCommit.status).toBe(409);
+  });
+
+  test("rejects re-presign after file is already committed", async () => {
+    const app = createApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          upload_id: "batch-represign-after-commit-001",
+        }),
+      }),
+    );
+
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+    const ingestionId = createBody.ingestion.id;
+
+    const presignResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/presign`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          filename: "once.txt",
+          content_type: "text/plain",
+          size_bytes: 4,
+        }),
+      }),
+    );
+
+    const presignBody = (await presignResponse.json()) as { file_id: string; upload_url: string };
+
+    await app.fetch(
+      new Request(`http://localhost${presignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "text/plain",
+          "content-length": "4",
+        },
+        body: "once",
+      }),
+    );
+
+    const commitResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/commit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          file_id: presignBody.file_id,
+          checksum_sha256: sha256Hex("once"),
+        }),
+      }),
+    );
+
+    expect(commitResponse.status).toBe(200);
+
+    const reprsignResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/presign`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          file_id: presignBody.file_id,
+        }),
+      }),
+    );
+
+    expect(reprsignResponse.status).toBe(409);
+  });
 });

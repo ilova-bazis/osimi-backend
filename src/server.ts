@@ -1,5 +1,6 @@
 import { createApp } from "./app.ts";
 import { ConfigurationError, createErrorResponse } from "./http/errors.ts";
+import { startBackgroundJobs } from "./jobs/index.ts";
 
 const DEFAULT_PORT = 3000;
 const DEFAULT_HOSTNAME = "0.0.0.0";
@@ -41,6 +42,15 @@ export function startServer(options: ServerOptions = {}): Bun.Server<unknown> {
       return response;
     },
   });
+
+  const jobs = startBackgroundJobs();
+
+  const shutdown = (): void => {
+    jobs?.stop();
+  };
+
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
 
   console.info(`[server] listening on http://${hostname}:${port}`);
   return server;

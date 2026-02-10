@@ -64,3 +64,16 @@ Optional environment variables:
 - `LOG_FORMAT=pretty|json` (`pretty` default)
 - `LOG_COLOR=true|false` to force color output in `pretty` mode
 - `NO_COLOR=1` to disable ANSI colors
+
+## Background Jobs
+
+By default, the server runs background operations for staging retention and stuck-ingestion attention.
+
+Optional environment variables:
+
+- `BACKGROUND_JOBS_ENABLED=true|false` (default: `true`)
+- `COMPLETED_STAGING_RETENTION_DAYS` (default: `7`)
+- `FAILED_CANCELED_STAGING_RETENTION_DAYS` (default: `14`)
+- `STAGING_RETENTION_SWEEP_INTERVAL_SECONDS` (default: `300`)
+- `STUCK_ATTENTION_THRESHOLD_MINUTES` (default: `60`)
+- `STUCK_ATTENTION_INTERVAL_SECONDS` (default: `120`)

@@ -8,6 +8,7 @@ import {
   updateUserRole,
   findUsersByTenant,
   getUserRole,
+  deleteUser,
   type TenantSummary,
   type UserWithRole,
 } from "../repos/auth-repo.ts";
@@ -18,7 +19,7 @@ interface Choice<T> {
   label: string;
 }
 
-type Action = "create" | "edit";
+type Action = "create" | "edit" | "cancel";
 
 async function promptText(question: string): Promise<string> {
   const rl = createInterface({ input, output });
@@ -78,6 +79,7 @@ async function selectAction(): Promise<Action> {
   const choices: Choice<Action>[] = [
     { value: "create", label: "Create new user" },
     { value: "edit", label: "Edit existing user" },
+    { value: "cancel", label: "Cancel / Exit" },
   ];
 
   return await promptSelect("What would you like to do?", choices);
@@ -198,13 +200,15 @@ async function selectExistingUser(tenantId: string): Promise<UserWithRole> {
   return await promptSelect("Select user to edit:", choices);
 }
 
-async function selectEditAction(): Promise<"password" | "role"> {
-  const choices: Choice<"password" | "role">[] = [
+async function selectEditAction(): Promise<"password" | "role" | "delete" | "cancel"> {
+  const choices: Choice<"password" | "role" | "delete" | "cancel">[] = [
     { value: "password", label: "Reset password" },
     { value: "role", label: "Change role" },
+    { value: "delete", label: "Delete user" },
+    { value: "cancel", label: "Go back" },
   ];
 
-  return await promptSelect("What would you like to edit?", choices);
+  return await promptSelect("What would you like to do?", choices);
 }
 
 async function runCreateUser(): Promise<void> {
@@ -311,7 +315,42 @@ async function runEditUser(): Promise<void> {
     console.log(`\n✓ Role updated successfully for user '${user.username}'`);
     console.log(`  Old role: ${currentRole}`);
     console.log(`  New role: ${newRole}`);
+  } else if (editAction === "delete") {
+    await runDeleteUser(user, tenant);
+  } else if (editAction === "cancel") {
+    console.log("Going back...");
+    return;
   }
+}
+
+async function runDeleteUser(user: UserWithRole, tenant: TenantSummary): Promise<void> {
+  console.log("\n⚠️  WARNING: You are about to delete a user");
+  console.log(`User: ${user.username}`);
+  console.log(`Role: ${user.role}`);
+  console.log(`Tenant: ${tenant.name}`);
+  console.log("\nThis action will soft-delete the user (set as inactive).");
+  console.log("The user will no longer be able to log in.\n");
+
+  const confirmFirst = await promptConfirm("Do you want to proceed with deletion?", false);
+
+  if (!confirmFirst) {
+    console.log("\nCancelled. No changes were made.");
+    return;
+  }
+
+  console.log("\nFor security, please type the username to confirm deletion:");
+  const confirmationText = await promptText(`Type '${user.username}' to confirm: `);
+
+  if (confirmationText !== user.username) {
+    console.log("\n✗ Username mismatch. Deletion cancelled.");
+    return;
+  }
+
+  console.log("\nDeleting user...");
+
+  await deleteUser(user.id);
+
+  console.log(`\n✓ User '${user.username}' has been deleted successfully`);
 }
 
 export async function runUserManagement(): Promise<void> {
@@ -319,6 +358,11 @@ export async function runUserManagement(): Promise<void> {
 
   const action = await selectAction();
   console.log();
+
+  if (action === "cancel") {
+    console.log("Goodbye!");
+    return;
+  }
 
   if (action === "create") {
     await runCreateUser();

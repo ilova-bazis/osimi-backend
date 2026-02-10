@@ -79,7 +79,9 @@ export async function findLoginCandidates(
   const membershipsTable = qualifiedTableName("tenant_memberships");
 
   const tenantClause = tenantId ? " AND tm.tenant_id = $2" : "";
-  const values = tenantId ? [usernameNormalized, tenantId] : [usernameNormalized];
+  const values = tenantId
+    ? [usernameNormalized, tenantId]
+    : [usernameNormalized];
 
   const rows = (await sql.unsafe(
     `
@@ -110,7 +112,10 @@ export async function updateUserLastLoginAt(userId: string): Promise<void> {
   const sql = db();
   const usersTable = qualifiedTableName("users");
 
-  await sql.unsafe(`UPDATE ${usersTable} SET last_login_at = now(), updated_at = now() WHERE id = $1`, [userId]);
+  await sql.unsafe(
+    `UPDATE ${usersTable} SET last_login_at = now(), updated_at = now() WHERE id = $1`,
+    [userId],
+  );
 }
 
 export async function createSession(params: {
@@ -153,7 +158,9 @@ export async function createSession(params: {
   );
 }
 
-export async function findActiveSessionByTokenHash(tokenHash: string): Promise<ActiveSession | undefined> {
+export async function findActiveSessionByTokenHash(
+  tokenHash: string,
+): Promise<ActiveSession | undefined> {
   const sql = db();
   const sessionsTable = qualifiedTableName("auth_sessions");
   const usersTable = qualifiedTableName("users");
@@ -200,10 +207,15 @@ export async function touchSessionLastSeenAt(sessionId: string): Promise<void> {
   const sql = db();
   const sessionsTable = qualifiedTableName("auth_sessions");
 
-  await sql.unsafe(`UPDATE ${sessionsTable} SET last_seen_at = now() WHERE id = $1`, [sessionId]);
+  await sql.unsafe(
+    `UPDATE ${sessionsTable} SET last_seen_at = now() WHERE id = $1`,
+    [sessionId],
+  );
 }
 
-export async function revokeSessionByTokenHash(tokenHash: string): Promise<boolean> {
+export async function revokeSessionByTokenHash(
+  tokenHash: string,
+): Promise<boolean> {
   const sql = db();
   const sessionsTable = qualifiedTableName("auth_sessions");
 
@@ -323,7 +335,9 @@ function mapUser(row: UserRow): UserSummary {
   };
 }
 
-export async function findUserByUsername(usernameNormalized: string): Promise<UserSummary | undefined> {
+export async function findUserByUsername(
+  usernameNormalized: string,
+): Promise<UserSummary | undefined> {
   const sql = db();
   const usersTable = qualifiedTableName("users");
 
@@ -358,7 +372,12 @@ export async function createUser(params: {
       INSERT INTO ${usersTable} (id, username, username_normalized, password_hash, is_active, created_at, updated_at)
       VALUES ($1, $2, $3, $4, true, now(), now())
     `,
-    [params.userId, params.username, params.usernameNormalized, params.passwordHash],
+    [
+      params.userId,
+      params.username,
+      params.usernameNormalized,
+      params.passwordHash,
+    ],
   );
 
   await sql.unsafe(
@@ -390,14 +409,16 @@ function mapUserWithRole(row: UserWithRoleRow): UserWithRole {
   };
 }
 
-export async function findUsersByTenant(tenantId: string): Promise<UserWithRole[]> {
+export async function findUsersByTenant(
+  tenantId: string,
+): Promise<UserWithRole[]> {
   const sql = db();
   const usersTable = qualifiedTableName("users");
   const membershipsTable = qualifiedTableName("tenant_memberships");
 
   const rows = (await sql.unsafe(
     `
-      SELECT 
+      SELECT
         u.id,
         u.username,
         u.username_normalized,
@@ -415,7 +436,10 @@ export async function findUsersByTenant(tenantId: string): Promise<UserWithRole[
   return rows.map(mapUserWithRole);
 }
 
-export async function getUserRole(userId: string, tenantId: string): Promise<UserRole | undefined> {
+export async function getUserRole(
+  userId: string,
+  tenantId: string,
+): Promise<UserRole | undefined> {
   const sql = db();
   const membershipsTable = qualifiedTableName("tenant_memberships");
 
@@ -427,7 +451,10 @@ export async function getUserRole(userId: string, tenantId: string): Promise<Use
   return rows[0]?.role;
 }
 
-export async function updateUserPassword(userId: string, passwordHash: string): Promise<void> {
+export async function updateUserPassword(
+  userId: string,
+  passwordHash: string,
+): Promise<void> {
   const sql = db();
   const usersTable = qualifiedTableName("users");
 
@@ -437,12 +464,26 @@ export async function updateUserPassword(userId: string, passwordHash: string): 
   );
 }
 
-export async function updateUserRole(userId: string, tenantId: string, role: UserRole): Promise<void> {
+export async function updateUserRole(
+  userId: string,
+  tenantId: string,
+  role: UserRole,
+): Promise<void> {
   const sql = db();
   const membershipsTable = qualifiedTableName("tenant_memberships");
 
   await sql.unsafe(
     `UPDATE ${membershipsTable} SET role = $1, updated_at = now() WHERE user_id = $2 AND tenant_id = $3`,
     [role, userId, tenantId],
+  );
+}
+
+export async function deleteUser(userId: string): Promise<void> {
+  const sql = db();
+  const usersTable = qualifiedTableName("users");
+
+  await sql.unsafe(
+    `UPDATE ${usersTable} SET is_active = false, updated_at = now() WHERE id = $1`,
+    [userId],
   );
 }

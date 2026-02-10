@@ -2,11 +2,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 
 import { createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
+import { createDownloadToken } from "../../../src/storage/index.ts";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 
@@ -33,6 +34,53 @@ async function cancelQueuedIngestions(schema: string): Promise<void> {
         SET status = 'CANCELED',
             updated_at = now()
         WHERE status = 'QUEUED'
+      `,
+    );
+  } finally {
+    await sql.close();
+  }
+}
+
+async function expireActiveLease(schema: string, ingestionId: string): Promise<void> {
+  const sql = createSqlClient(TEST_DATABASE_URL!);
+
+  try {
+    const leasesTable = qualifiedTable(schema, "ingestion_leases");
+    await sql.unsafe(
+      `
+        UPDATE ${leasesTable}
+        SET lease_expires_at = now() - interval '1 minute'
+        WHERE ingestion_id = $1
+          AND released_at IS NULL
+      `,
+      [ingestionId],
+    );
+  } finally {
+    await sql.close();
+  }
+}
+
+async function resetActiveIngestions(schema: string): Promise<void> {
+  const sql = createSqlClient(TEST_DATABASE_URL!);
+
+  try {
+    const ingestionsTable = qualifiedTable(schema, "ingestions");
+    const leasesTable = qualifiedTable(schema, "ingestion_leases");
+
+    await sql.unsafe(
+      `
+        UPDATE ${ingestionsTable}
+        SET status = 'CANCELED',
+            updated_at = now()
+        WHERE status IN ('DRAFT', 'UPLOADING', 'QUEUED', 'PROCESSING')
+      `,
+    );
+
+    await sql.unsafe(
+      `
+        UPDATE ${leasesTable}
+        SET released_at = now()
+        WHERE released_at IS NULL
       `,
     );
   } finally {
@@ -248,6 +296,10 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     }
   });
 
+  beforeEach(async () => {
+    await resetActiveIngestions(schema);
+  });
+
   test("leases queued ingestion, supports heartbeat, serves download, and releases", async () => {
     const app = createApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
@@ -358,5 +410,123 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
 
     const winnerCount = Number(firstBody.lease != null) + Number(secondBody.lease != null);
     expect(winnerCount).toBe(1);
+  });
+
+  test("rejects heartbeat when ingestion id does not match lease token", async () => {
+    const app = createApp();
+    const sourceIngestionId = await createQueuedIngestion(app, authToken);
+    const targetIngestionId = await createQueuedIngestion(app, authToken);
+
+    const leaseResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-heartbeat",
+        },
+      }),
+    );
+
+    const leaseBody = (await leaseResponse.json()) as {
+      lease: {
+        ingestion_id: string;
+        lease_token: string;
+      };
+    };
+
+    expect(leaseBody.lease.ingestion_id).toBe(sourceIngestionId);
+
+    const mismatchResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${targetIngestionId}/lease/heartbeat`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          lease_token: leaseBody.lease.lease_token,
+        }),
+      }),
+    );
+
+    expect(mismatchResponse.status).toBe(401);
+  });
+
+  test("re-queues ingestion when active lease expires and worker requests next lease", async () => {
+    const app = createApp();
+    await cancelQueuedIngestions(schema);
+    const ingestionId = await createQueuedIngestion(app, authToken);
+
+    const firstLease = await app.fetch(
+      new Request("http://localhost/api/ingestions/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-expire-a",
+        },
+      }),
+    );
+
+    expect(firstLease.status).toBe(200);
+    await expireActiveLease(schema, ingestionId);
+
+    const secondLease = await app.fetch(
+      new Request("http://localhost/api/ingestions/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-expire-b",
+        },
+      }),
+    );
+
+    expect(secondLease.status).toBe(200);
+    const secondBody = (await secondLease.json()) as {
+      lease: {
+        ingestion_id: string;
+      };
+    };
+
+    expect(secondBody.lease.ingestion_id).toBe(ingestionId);
+  });
+
+  test("rejects expired worker download token", async () => {
+    const app = createApp();
+    const ingestionId = await createQueuedIngestion(app, authToken);
+
+    const leaseResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-expired-download",
+        },
+      }),
+    );
+
+    const leaseBody = (await leaseResponse.json()) as {
+      lease: {
+        download_urls: Array<{ storage_key: string; file_id: string; content_type: string; size_bytes: number }>;
+      };
+    };
+
+    const file = leaseBody.lease.download_urls[0];
+    expect(file).toBeDefined();
+
+    const expiredToken = createDownloadToken({
+      ingestion_id: ingestionId,
+      file_id: file!.file_id,
+      tenant_id: "00000000-0000-0000-0000-000000000001",
+      storage_key: file!.storage_key,
+      content_type: file!.content_type,
+      size_bytes: file!.size_bytes,
+      expires_at: new Date(Date.now() - 1000).toISOString(),
+    });
+
+    const downloadResponse = await app.fetch(
+      new Request(`http://localhost/api/worker/downloads/${expiredToken}`),
+    );
+
+    expect(downloadResponse.status).toBe(401);
   });
 });
