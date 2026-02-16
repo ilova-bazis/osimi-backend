@@ -91,7 +91,7 @@ END $$;
 
 CREATE TABLE IF NOT EXISTS ingestions (
   id uuid PRIMARY KEY,
-  upload_id text NOT NULL,
+  batch_label text NOT NULL,
   tenant_id uuid NOT NULL,
   status ingestion_status NOT NULL DEFAULT 'DRAFT',
   created_by uuid NOT NULL,
@@ -104,8 +104,8 @@ CREATE TABLE IF NOT EXISTS ingestions (
 CREATE INDEX IF NOT EXISTS ingestions_tenant_created_idx
   ON ingestions (tenant_id, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS ingestions_tenant_upload_idx
-  ON ingestions (tenant_id, upload_id);
+CREATE INDEX IF NOT EXISTS ingestions_tenant_batch_label_idx
+  ON ingestions (tenant_id, batch_label);
 
 CREATE TABLE IF NOT EXISTS ingestion_files (
   id uuid PRIMARY KEY,
@@ -161,8 +161,9 @@ CREATE TABLE IF NOT EXISTS objects (
 CREATE INDEX IF NOT EXISTS objects_tenant_created_idx
   ON objects (tenant_id, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS objects_source_ingestion_idx
-  ON objects (source_ingestion_id);
+CREATE UNIQUE INDEX IF NOT EXISTS objects_source_ingestion_unique_idx
+  ON objects (source_ingestion_id)
+  WHERE source_ingestion_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS object_artifacts (
   id uuid PRIMARY KEY,

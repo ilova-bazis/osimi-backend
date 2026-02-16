@@ -1,9 +1,28 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-import { ConflictError, NotFoundError, UnauthorizedError, ValidationError } from "../http/errors.ts";
-import { findIngestionById, listIngestionFiles, updateIngestionStatus } from "../repos/ingestion-repo.ts";
-import { extendLease, leaseNextQueuedIngestion, releaseLease, sweepExpiredLeases } from "../repos/lease-repo.ts";
-import { createDownloadToken, parseDownloadToken, resolveStagingPath } from "../storage/index.ts";
+import {
+  ConflictError,
+  NotFoundError,
+  UnauthorizedError,
+  ValidationError,
+} from "../http/errors.ts";
+import {
+  findIngestionById,
+  listIngestionFiles,
+  updateIngestionStatus,
+} from "../repos/ingestion-repo.ts";
+import {
+  extendLease,
+  leaseNextQueuedIngestion,
+  releaseLease,
+  sweepExpiredLeases,
+} from "../repos/lease-repo.ts";
+import {
+  createDownloadToken,
+  parseDownloadToken,
+  resolveStagingPath,
+} from "../storage/index.ts";
+import { getRuntimeConfig } from "../runtime/config.ts";
 
 const DEFAULT_LEASE_TTL_SECONDS = 60 * 5;
 const DEFAULT_LEASE_SIGNING_SECRET = "dev-local-lease-secret";
@@ -18,7 +37,12 @@ export interface LeaseTokenPayload {
 }
 
 function leaseSigningSecret(): string {
-  return process.env.LEASE_SIGNING_SECRET?.trim() || DEFAULT_LEASE_SIGNING_SECRET;
+  const runtimeLeaseSigningSecret = getRuntimeConfig().leaseSigningSecret;
+  return (
+    runtimeLeaseSigningSecret?.trim() ||
+    process.env.LEASE_SIGNING_SECRET?.trim() ||
+    DEFAULT_LEASE_SIGNING_SECRET
+  );
 }
 
 function encodePayload(value: LeaseTokenPayload): string {
@@ -50,7 +74,10 @@ function decodePayload(value: string): LeaseTokenPayload {
     throw new UnauthorizedError("Lease token payload is invalid.");
   }
 
-  if (candidate.worker_id !== undefined && typeof candidate.worker_id !== "string") {
+  if (
+    candidate.worker_id !== undefined &&
+    typeof candidate.worker_id !== "string"
+  ) {
     throw new UnauthorizedError("Lease token payload is invalid.");
   }
 
@@ -65,7 +92,9 @@ function decodePayload(value: string): LeaseTokenPayload {
 }
 
 function signPayload(encodedPayload: string): string {
-  return createHmac("sha256", leaseSigningSecret()).update(encodedPayload).digest("base64url");
+  return createHmac("sha256", leaseSigningSecret())
+    .update(encodedPayload)
+    .digest("base64url");
 }
 
 function secureEquals(left: string, right: string): boolean {
@@ -121,8 +150,8 @@ function buildDownloadUrls(params: {
   expiresAt: Date;
 }): Array<Record<string, unknown>> {
   return params.files
-    .filter(file => file.status === "UPLOADED" || file.status === "VALIDATED")
-    .map(file => {
+    .filter((file) => file.status === "UPLOADED" || file.status === "VALIDATED")
+    .map((file) => {
       const token = createDownloadToken({
         ingestion_id: params.ingestionId,
         file_id: file.id,
@@ -183,7 +212,7 @@ export async function leaseNextIngestion(params: {
       lease_token: leaseToken,
       lease_expires_at: leaseResult.lease.leaseExpiresAt.toISOString(),
       ingestion_id: leaseResult.ingestion.id,
-      batch_id: leaseResult.ingestion.uploadId,
+      batch_label: leaseResult.ingestion.batchLabel,
       tenant_id: leaseResult.ingestion.tenantId,
       download_urls: buildDownloadUrls({
         tenantId: leaseResult.ingestion.tenantId,
@@ -203,7 +232,9 @@ function requireLeaseToken(body: unknown): string {
   const token = (body as Record<string, unknown>).lease_token;
 
   if (typeof token !== "string" || token.trim().length === 0) {
-    throw new ValidationError("Field 'lease_token' must be a non-empty string.");
+    throw new ValidationError(
+      "Field 'lease_token' must be a non-empty string.",
+    );
   }
 
   return token;
@@ -231,10 +262,15 @@ export async function heartbeatLease(params: {
     throw new ConflictError("Lease is no longer active.");
   }
 
-  const ingestion = await findIngestionById(payload.tenant_id, payload.ingestion_id);
+  const ingestion = await findIngestionById(
+    payload.tenant_id,
+    payload.ingestion_id,
+  );
 
   if (!ingestion) {
-    throw new NotFoundError(`Ingestion '${payload.ingestion_id}' was not found.`);
+    throw new NotFoundError(
+      `Ingestion '${payload.ingestion_id}' was not found.`,
+    );
   }
 
   const ingestionFiles = await listIngestionFiles({
@@ -257,7 +293,7 @@ export async function heartbeatLease(params: {
       lease_token: refreshedToken,
       lease_expires_at: updatedLease.leaseExpiresAt.toISOString(),
       ingestion_id: payload.ingestion_id,
-      batch_id: ingestion.uploadId,
+      batch_label: ingestion.batchLabel,
       tenant_id: payload.tenant_id,
       download_urls: buildDownloadUrls({
         tenantId: payload.tenant_id,
@@ -290,17 +326,23 @@ export async function releaseActiveLease(params: {
     throw new ConflictError("Lease is no longer active.");
   }
 
-  const ingestion = await findIngestionById(payload.tenant_id, payload.ingestion_id);
+  const ingestion = await findIngestionById(
+    payload.tenant_id,
+    payload.ingestion_id,
+  );
 
   if (!ingestion) {
-    throw new NotFoundError(`Ingestion '${payload.ingestion_id}' was not found.`);
+    throw new NotFoundError(
+      `Ingestion '${payload.ingestion_id}' was not found.`,
+    );
   }
 
   if (ingestion.status === "PROCESSING") {
     await updateIngestionStatus({
       ingestionId: ingestion.id,
       tenantId: ingestion.tenantId,
-      status: "QUEUED",
+      fromStatus: ingestion.status,
+      toStatus: "QUEUED",
     });
   }
 

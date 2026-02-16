@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
-import { createApp } from "../../../src/app.ts";
+import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
 
-const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
+const TEST_DATABASE_URL =
+  process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 
 function quoteIdentifier(identifier: string): string {
   return `"${identifier}"`;
@@ -18,8 +19,14 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
   let schema = "";
   let viewerToken = "";
 
-  let previousDatabaseUrl: string | undefined;
-  let previousSchema: string | undefined;
+  function createTestApp() {
+    return createApp({
+      runtimeConfig: {
+        databaseUrl: TEST_DATABASE_URL,
+        dbSchema: schema,
+      },
+    });
+  }
 
   beforeAll(async () => {
     schema = `dashboard_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
@@ -28,12 +35,6 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
       databaseUrl: TEST_DATABASE_URL,
       schema,
     });
-
-    previousDatabaseUrl = process.env.DATABASE_URL;
-    previousSchema = process.env.DB_SCHEMA;
-
-    process.env.DATABASE_URL = TEST_DATABASE_URL;
-    process.env.DB_SCHEMA = schema;
 
     const sql = createSqlClient(TEST_DATABASE_URL!);
 
@@ -92,7 +93,7 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
 
       await sql.unsafe(
         `
-          INSERT INTO ${ingestionsTable} (id, upload_id, tenant_id, status, created_by, summary, error_summary)
+          INSERT INTO ${ingestionsTable} (id, batch_label, tenant_id, status, created_by, summary, error_summary)
           VALUES
             ($1, $2, $3, 'COMPLETED', $4, '{}'::jsonb, '{}'::jsonb),
             ($5, $6, $7, 'COMPLETED', $8, '{}'::jsonb, '{}'::jsonb),
@@ -199,7 +200,7 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
       await sql.close();
     }
 
-    const app = createApp();
+    const app = createTestApp();
     const loginResponse = await app.fetch(
       new Request("http://localhost/api/auth/login", {
         method: "POST",
@@ -212,7 +213,6 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
         }),
       }),
     );
-
     const loginBody = (await loginResponse.json()) as { token: string };
     viewerToken = loginBody.token;
   });
@@ -222,27 +222,18 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
       const sql = createSqlClient(TEST_DATABASE_URL!);
 
       try {
-        await sql.unsafe(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+        await sql.unsafe(
+          `DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`,
+        );
       } finally {
         await sql.close();
       }
     }
 
-    if (previousDatabaseUrl === undefined) {
-      delete process.env.DATABASE_URL;
-    } else {
-      process.env.DATABASE_URL = previousDatabaseUrl;
-    }
-
-    if (previousSchema === undefined) {
-      delete process.env.DB_SCHEMA;
-    } else {
-      process.env.DB_SCHEMA = previousSchema;
-    }
   });
 
   test("returns tenant-scoped dashboard summary", async () => {
-    const app = createApp();
+    const app = createTestApp();
     const response = await app.fetch(
       new Request("http://localhost/api/dashboard/summary", {
         method: "GET",
@@ -268,11 +259,13 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
     expect(body.summary.total_objects).toBe(2);
     expect(body.summary.failed_count).toBe(1);
     expect(body.summary.processed_today).toBeGreaterThanOrEqual(1);
-    expect(body.summary.processed_week).toBeGreaterThanOrEqual(body.summary.processed_today);
+    expect(body.summary.processed_week).toBeGreaterThanOrEqual(
+      body.summary.processed_today,
+    );
   });
 
   test("returns tenant-scoped activity feed with cursor pagination", async () => {
-    const app = createApp();
+    const app = createTestApp();
 
     const firstPageResponse = await app.fetch(
       new Request("http://localhost/api/dashboard/activity?limit=2", {
@@ -291,17 +284,22 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
 
     expect(firstPage.activity.length).toBe(2);
     expect(firstPage.next_cursor).not.toBeNull();
-    expect(new Date(firstPage.activity[0]!.created_at).getTime()).toBeGreaterThanOrEqual(
+    expect(
+      new Date(firstPage.activity[0]!.created_at).getTime(),
+    ).toBeGreaterThanOrEqual(
       new Date(firstPage.activity[1]!.created_at).getTime(),
     );
 
     const secondPageResponse = await app.fetch(
-      new Request(`http://localhost/api/dashboard/activity?limit=2&cursor=${firstPage.next_cursor!}`, {
-        method: "GET",
-        headers: {
-          authorization: `Bearer ${viewerToken}`,
+      new Request(
+        `http://localhost/api/dashboard/activity?limit=2&cursor=${firstPage.next_cursor!}`,
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${viewerToken}`,
+          },
         },
-      }),
+      ),
     );
 
     expect(secondPageResponse.status).toBe(200);

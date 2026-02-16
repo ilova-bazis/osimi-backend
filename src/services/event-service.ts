@@ -1,15 +1,31 @@
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-import { ConflictError, NotFoundError, UnauthorizedError, ValidationError } from "../http/errors.ts";
+import {
+  ConflictError,
+  NotFoundError,
+  UnauthorizedError,
+  ValidationError,
+} from "../http/errors.ts";
+import {
+  requireObject,
+  requireOptionalStringField,
+  requireStringField,
+  requireUuid,
+} from "../http/validation.ts";
 import { resolveStagingPath, stagingRootPath } from "../storage/index.ts";
-import { findIngestionById, updateIngestionStatus } from "../repos/ingestion-repo.ts";
+import { findIngestionById } from "../repos/ingestion-repo.ts";
 import { insertObjectEvent } from "../repos/event-repo.ts";
-import { createObject, createObjectArtifact, findArtifactByStorageKey, findObjectBySourceIngestion } from "../repos/object-repo.ts";
+import {
+  createOrGetObjectBySourceIngestion,
+  createObjectArtifact,
+  findArtifactByStorageKey,
+} from "../repos/object-repo.ts";
 import { findActiveLeaseByToken } from "../repos/lease-repo.ts";
+import { applyStatusTransition } from "./ingestion-transition.ts";
 import { parseLeaseToken } from "./lease-service.ts";
 
-const OBJECT_EVENT_TYPES = new Set([
+const OBJECT_EVENT_TYPES_LIST = [
   "INGESTION_SUBMITTED",
   "INGESTION_QUEUED",
   "INGESTION_PROCESSING",
@@ -27,26 +43,19 @@ const OBJECT_EVENT_TYPES = new Set([
   "PIPELINE_STEP_FAILED",
   "OBJECT_CREATED",
   "ARTIFACT_CREATED",
-] as const);
+] as const;
 
-type ObjectEventType =
-  | "INGESTION_SUBMITTED"
-  | "INGESTION_QUEUED"
-  | "INGESTION_PROCESSING"
-  | "INGESTION_COMPLETED"
-  | "INGESTION_FAILED"
-  | "INGESTION_CANCELED"
-  | "LEASE_GRANTED"
-  | "LEASE_RENEWED"
-  | "LEASE_EXPIRED"
-  | "LEASE_RELEASED"
-  | "FILE_VALIDATED"
-  | "FILE_FAILED"
-  | "PIPELINE_STEP_STARTED"
-  | "PIPELINE_STEP_COMPLETED"
-  | "PIPELINE_STEP_FAILED"
-  | "OBJECT_CREATED"
-  | "ARTIFACT_CREATED";
+const OBJECT_EVENT_TYPES = new Set(OBJECT_EVENT_TYPES_LIST);
+
+const OBJECT_ID_REQUIRED_EVENT_TYPES = new Set<ObjectEventType>([
+  "INGESTION_COMPLETED",
+  "OBJECT_CREATED",
+  "ARTIFACT_CREATED",
+]);
+
+const OBJECT_ID_PATTERN = /^OBJ-[0-9]{8}-[A-Z0-9]+$/;
+
+type ObjectEventType = (typeof OBJECT_EVENT_TYPES_LIST)[number];
 
 interface IncomingEvent {
   event_id: string;
@@ -56,73 +65,62 @@ interface IncomingEvent {
   object_id?: string;
 }
 
-function validateUuid(value: string, fieldName: string): string {
-  const pattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-  if (!pattern.test(value)) {
-    throw new ValidationError(`Field '${fieldName}' must be a UUID.`);
-  }
-
-  return value;
-}
-
 function parseEvent(candidate: unknown): IncomingEvent {
-  if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
-    throw new ValidationError("Each event must be an object.");
-  }
+  const event = requireObject(candidate, "Each event");
+  const eventId = requireStringField(event, "event_id");
+  requireUuid(eventId, "event_id");
 
-  const event = candidate as Record<string, unknown>;
-
-  if (typeof event.event_id !== "string") {
-    throw new ValidationError("Field 'event_id' must be a string.");
-  }
-
-  validateUuid(event.event_id, "event_id");
-
-  if (typeof event.event_type !== "string" || !OBJECT_EVENT_TYPES.has(event.event_type as ObjectEventType)) {
+  if (
+    typeof event.event_type !== "string" ||
+    !OBJECT_EVENT_TYPES.has(event.event_type as ObjectEventType)
+  ) {
     throw new ValidationError("Field 'event_type' is invalid.");
   }
 
   if (typeof event.timestamp !== "string") {
-    throw new ValidationError("Field 'timestamp' must be an ISO timestamp string.");
+    throw new ValidationError(
+      "Field 'timestamp' must be an ISO timestamp string.",
+    );
   }
 
   const timestamp = new Date(event.timestamp);
 
   if (Number.isNaN(timestamp.getTime())) {
-    throw new ValidationError("Field 'timestamp' must be a valid ISO timestamp.");
+    throw new ValidationError(
+      "Field 'timestamp' must be a valid ISO timestamp.",
+    );
   }
 
-  if (event.payload === null || typeof event.payload !== "object" || Array.isArray(event.payload)) {
-    throw new ValidationError("Field 'payload' must be an object.");
-  }
+  const payload = requireObject(event.payload, "Field 'payload'");
+  const objectId = requireOptionalStringField(event, "object_id");
 
-  if (event.object_id !== undefined && typeof event.object_id !== "string") {
-    throw new ValidationError("Field 'object_id' must be a string when provided.");
+  const eventType = event.event_type as ObjectEventType;
+
+  if (OBJECT_ID_REQUIRED_EVENT_TYPES.has(eventType)) {
+    if (!objectId || objectId.trim().length === 0) {
+      throw new ValidationError(
+        `Field 'object_id' is required for event type '${eventType}'.`,
+      );
+    }
+
+    if (!OBJECT_ID_PATTERN.test(objectId)) {
+      throw new ValidationError(
+        "Field 'object_id' must match format 'OBJ-YYYYMMDD-XXXXXX'.",
+      );
+    }
+  } else if (objectId !== undefined && !OBJECT_ID_PATTERN.test(objectId)) {
+    throw new ValidationError(
+      "Field 'object_id' must match format 'OBJ-YYYYMMDD-XXXXXX' when provided.",
+    );
   }
 
   return {
-    event_id: event.event_id,
-    event_type: event.event_type as ObjectEventType,
+    event_id: eventId,
+    event_type: eventType,
     timestamp: event.timestamp,
-    payload: event.payload as Record<string, unknown>,
-    object_id: event.object_id as string | undefined,
+    payload,
+    object_id: objectId,
   };
-}
-
-function generateObjectId(): string {
-  const now = new Date();
-  const y = String(now.getUTCFullYear());
-  const m = String(now.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(now.getUTCDate()).padStart(2, "0");
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let suffix = "";
-
-  for (let index = 0; index < 6; index += 1) {
-    suffix += alphabet[Math.floor(Math.random() * alphabet.length)];
-  }
-
-  return `OBJ-${y}${m}${d}-${suffix}`;
 }
 
 async function storeIngestManifest(params: {
@@ -146,16 +144,14 @@ export async function ingestWorkerEvents(params: {
   ingestionId: string;
   body: unknown;
 }): Promise<Record<string, unknown>> {
-  if (params.body === null || typeof params.body !== "object" || Array.isArray(params.body)) {
-    throw new ValidationError("Request body must be an object.");
-  }
-
-  const payload = params.body as Record<string, unknown>;
+  const payload = requireObject(params.body);
   const leaseTokenRaw = payload.lease_token;
   const eventsRaw = payload.events;
 
   if (typeof leaseTokenRaw !== "string" || leaseTokenRaw.trim().length === 0) {
-    throw new ValidationError("Field 'lease_token' must be a non-empty string.");
+    throw new ValidationError(
+      "Field 'lease_token' must be a non-empty string.",
+    );
   }
 
   if (!Array.isArray(eventsRaw)) {
@@ -178,15 +174,21 @@ export async function ingestWorkerEvents(params: {
     throw new ConflictError("Lease is no longer active.");
   }
 
-  const ingestion = await findIngestionById(leaseToken.tenant_id, params.ingestionId);
+  const ingestion = await findIngestionById(
+    leaseToken.tenant_id,
+    params.ingestionId,
+  );
 
   if (!ingestion) {
     throw new NotFoundError(`Ingestion '${params.ingestionId}' was not found.`);
   }
 
+  const ingestionRecord = ingestion;
+
   let insertedCount = 0;
   let duplicateCount = 0;
   let completedObjectId: string | undefined;
+  let currentStatus = ingestionRecord.status;
 
   for (const rawEvent of eventsRaw) {
     const event = parseEvent(rawEvent);
@@ -199,7 +201,7 @@ export async function ingestWorkerEvents(params: {
       ingestionId: params.ingestionId,
       objectId: event.object_id,
       payload: event.payload,
-      actorUserId: ingestion.createdBy,
+      actorUserId: ingestionRecord.createdBy,
       createdAt,
     });
 
@@ -210,53 +212,73 @@ export async function ingestWorkerEvents(params: {
 
     insertedCount += 1;
 
-    if (event.event_type === "INGESTION_PROCESSING" && ingestion.status !== "PROCESSING") {
-      await updateIngestionStatus({
-        ingestionId: ingestion.id,
-        tenantId: ingestion.tenantId,
-        status: "PROCESSING",
+    if (
+      event.event_type === "INGESTION_PROCESSING" &&
+      currentStatus !== "PROCESSING"
+    ) {
+      currentStatus = await applyStatusTransition({
+        ingestionId: ingestionRecord.id,
+        tenantId: ingestionRecord.tenantId,
+        fromStatus: currentStatus,
+        toStatus: "PROCESSING",
       });
     }
 
     if (event.event_type === "INGESTION_FAILED") {
-      await updateIngestionStatus({
-        ingestionId: ingestion.id,
-        tenantId: ingestion.tenantId,
-        status: "FAILED",
+      currentStatus = await applyStatusTransition({
+        ingestionId: ingestionRecord.id,
+        tenantId: ingestionRecord.tenantId,
+        fromStatus: currentStatus,
+        toStatus: "FAILED",
       });
     }
 
     if (event.event_type === "INGESTION_CANCELED") {
-      await updateIngestionStatus({
-        ingestionId: ingestion.id,
-        tenantId: ingestion.tenantId,
-        status: "CANCELED",
+      currentStatus = await applyStatusTransition({
+        ingestionId: ingestionRecord.id,
+        tenantId: ingestionRecord.tenantId,
+        fromStatus: currentStatus,
+        toStatus: "CANCELED",
       });
     }
 
     if (event.event_type === "INGESTION_COMPLETED") {
-      let object = await findObjectBySourceIngestion({
-        tenantId: ingestion.tenantId,
-        ingestionId: ingestion.id,
+      const completedObjectIdFromEvent = event.object_id;
+
+      if (!completedObjectIdFromEvent) {
+        throw new ValidationError(
+          "Field 'object_id' is required for event type 'INGESTION_COMPLETED'.",
+        );
+      }
+
+      const object = await createOrGetObjectBySourceIngestion({
+        objectId: completedObjectIdFromEvent,
+        tenantId: ingestionRecord.tenantId,
+        sourceIngestionId: ingestionRecord.id,
+        type: "GENERIC",
+        title:
+          typeof event.payload.title === "string" ? event.payload.title : "",
+        metadata: event.payload,
       });
 
-      if (!object) {
-        object = await createObject({
-          objectId: generateObjectId(),
-          tenantId: ingestion.tenantId,
-          sourceIngestionId: ingestion.id,
-          type: "GENERIC",
-          title: typeof event.payload.title === "string" ? event.payload.title : "",
-          metadata: event.payload,
+      if (object.objectId !== completedObjectIdFromEvent) {
+        throw new ConflictError("Conflicting object_id for this ingestion.", {
+          ingestion_id: ingestionRecord.id,
+          expected_object_id: object.objectId,
+          received_object_id: completedObjectIdFromEvent,
         });
       }
 
       completedObjectId = object.objectId;
 
       const ingestJson = event.payload.ingest_json;
-      if (ingestJson && typeof ingestJson === "object" && !Array.isArray(ingestJson)) {
+      if (
+        ingestJson &&
+        typeof ingestJson === "object" &&
+        !Array.isArray(ingestJson)
+      ) {
         const manifest = await storeIngestManifest({
-          tenantId: ingestion.tenantId,
+          tenantId: ingestionRecord.tenantId,
           objectId: object.objectId,
           ingestJson: ingestJson as Record<string, unknown>,
         });
@@ -277,10 +299,11 @@ export async function ingestWorkerEvents(params: {
         }
       }
 
-      await updateIngestionStatus({
-        ingestionId: ingestion.id,
-        tenantId: ingestion.tenantId,
-        status: "COMPLETED",
+      currentStatus = await applyStatusTransition({
+        ingestionId: ingestionRecord.id,
+        tenantId: ingestionRecord.tenantId,
+        fromStatus: currentStatus,
+        toStatus: "COMPLETED",
       });
     }
   }
@@ -294,7 +317,9 @@ export async function ingestWorkerEvents(params: {
   };
 }
 
-export async function downloadStagedArtifactByStorageKey(storageKey: string): Promise<Response> {
+export async function downloadStagedArtifactByStorageKey(
+  storageKey: string,
+): Promise<Response> {
   const filePath = resolveStagingPath(storageKey);
   const file = Bun.file(filePath);
 

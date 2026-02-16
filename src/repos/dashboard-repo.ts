@@ -1,4 +1,4 @@
-import { db, qualifiedTableName } from "../db/runtime.ts";
+import { withSchemaClient } from "../db/client.ts";
 
 interface SummaryCountsRow {
   total_ingestions: number;
@@ -54,13 +54,11 @@ function mapActivity(row: ActivityRow): ActivityRecord {
   };
 }
 
-export async function getDashboardSummary(tenantId: string): Promise<DashboardSummary> {
-  const sql = db();
-  const ingestionsTable = qualifiedTableName("ingestions");
-  const objectsTable = qualifiedTableName("objects");
-
-  const ingestionRows = (await sql.unsafe(
-    `
+export async function getDashboardSummary(
+  tenantId: string,
+): Promise<DashboardSummary> {
+  const ingestionRows = await withSchemaClient(async (sql) => {
+    return await sql<SummaryCountsRow[]>`
       SELECT
         COUNT(*)::int AS total_ingestions,
         COUNT(*) FILTER (WHERE status = 'FAILED')::int AS failed_count,
@@ -72,20 +70,18 @@ export async function getDashboardSummary(tenantId: string): Promise<DashboardSu
           WHERE status = 'COMPLETED'
             AND updated_at >= date_trunc('week', now())
         )::int AS processed_week
-      FROM ${ingestionsTable}
-      WHERE tenant_id = $1
-    `,
-    [tenantId],
-  )) as SummaryCountsRow[];
+      FROM ingestions
+      WHERE tenant_id = ${tenantId}
+    `;
+  });
 
-  const objectRows = (await sql.unsafe(
-    `
+  const objectRows = await withSchemaClient(async (sql) => {
+    return await sql<TotalObjectsRow[]>`
       SELECT COUNT(*)::int AS total_objects
-      FROM ${objectsTable}
-      WHERE tenant_id = $1
-    `,
-    [tenantId],
-  )) as TotalObjectsRow[];
+      FROM objects
+      WHERE tenant_id = ${tenantId}
+    `;
+  });
 
   return {
     totalIngestions: Number(ingestionRows[0]?.total_ingestions ?? 0),
@@ -102,27 +98,26 @@ export async function listDashboardActivity(params: {
   cursorCreatedAt?: string;
   cursorId?: string;
 }): Promise<ActivityRecord[]> {
-  const sql = db();
-  const eventsTable = qualifiedTableName("object_events");
-  const values: Array<string | number> = [params.tenantId, params.limit];
-  let cursorClause = "";
+  const rows = await withSchemaClient(async (sql) => {
+    if (params.cursorCreatedAt && params.cursorId) {
+      return await sql<ActivityRow[]>`
+        SELECT id, event_id, type, ingestion_id, object_id, payload, actor_user_id, created_at
+        FROM object_events
+        WHERE tenant_id = ${params.tenantId}
+          AND (created_at, id) < (${params.cursorCreatedAt}::timestamptz, ${params.cursorId}::uuid)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ${params.limit}
+      `;
+    }
 
-  if (params.cursorCreatedAt && params.cursorId) {
-    values.push(params.cursorCreatedAt, params.cursorId);
-    cursorClause = "AND (created_at, id) < ($3::timestamptz, $4::uuid)";
-  }
-
-  const rows = (await sql.unsafe(
-    `
+    return await sql<ActivityRow[]>`
       SELECT id, event_id, type, ingestion_id, object_id, payload, actor_user_id, created_at
-      FROM ${eventsTable}
-      WHERE tenant_id = $1
-      ${cursorClause}
+      FROM object_events
+      WHERE tenant_id = ${params.tenantId}
       ORDER BY created_at DESC, id DESC
-      LIMIT $2
-    `,
-    values,
-  )) as ActivityRow[];
+      LIMIT ${params.limit}
+    `;
+  });
 
   return rows.map(mapActivity);
 }

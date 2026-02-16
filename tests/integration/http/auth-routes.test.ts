@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
-import { createApp } from "../../../src/app.ts";
+import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
 
@@ -20,8 +20,15 @@ function qualifiedTable(schema: string, table: string): string {
 
 describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
   let schema = "";
-  let previousDatabaseUrl: string | undefined;
-  let previousSchema: string | undefined;
+
+  function createTestApp() {
+    return createApp({
+      runtimeConfig: {
+        databaseUrl: TEST_DATABASE_URL,
+        dbSchema: schema,
+      },
+    });
+  }
 
   beforeAll(async () => {
     schema = `auth_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
@@ -30,12 +37,6 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
       databaseUrl: TEST_DATABASE_URL,
       schema,
     });
-
-    previousDatabaseUrl = process.env.DATABASE_URL;
-    previousSchema = process.env.DB_SCHEMA;
-
-    process.env.DATABASE_URL = TEST_DATABASE_URL;
-    process.env.DB_SCHEMA = schema;
 
     const sql = createSqlClient(TEST_DATABASE_URL);
 
@@ -128,21 +129,10 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
       }
     }
 
-    if (previousDatabaseUrl === undefined) {
-      delete process.env.DATABASE_URL;
-    } else {
-      process.env.DATABASE_URL = previousDatabaseUrl;
-    }
-
-    if (previousSchema === undefined) {
-      delete process.env.DB_SCHEMA;
-    } else {
-      process.env.DB_SCHEMA = previousSchema;
-    }
   });
 
   test("login succeeds and me returns authenticated user", async () => {
-    const app = createApp();
+    const app = createTestApp();
 
     const loginResponse = await app.fetch(
       new Request("http://localhost/api/auth/login", {
@@ -180,7 +170,7 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
   });
 
   test("login rejects invalid credentials", async () => {
-    const app = createApp();
+    const app = createTestApp();
 
     const loginResponse = await app.fetch(
       new Request("http://localhost/api/auth/login", {
@@ -201,7 +191,7 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
   });
 
   test("me returns 401 without authentication", async () => {
-    const app = createApp();
+    const app = createTestApp();
 
     const response = await app.fetch(new Request("http://localhost/api/auth/me", { method: "GET" }));
     expect(response.status).toBe(401);
@@ -211,7 +201,7 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
   });
 
   test("tenant mismatch between header and session returns 403", async () => {
-    const app = createApp();
+    const app = createTestApp();
 
     const loginResponse = await app.fetch(
       new Request("http://localhost/api/auth/login", {
@@ -243,7 +233,7 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
   });
 
   test("logout invalidates active session token", async () => {
-    const app = createApp();
+    const app = createTestApp();
 
     const loginResponse = await app.fetch(
       new Request("http://localhost/api/auth/login", {
@@ -286,7 +276,7 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
   });
 
   test("records auth audit events for login and logout", async () => {
-    const app = createApp();
+    const app = createTestApp();
 
     const loginResponse = await app.fetch(
       new Request("http://localhost/api/auth/login", {

@@ -1,6 +1,6 @@
 import { requireWorkerAuthentication } from "../auth/worker.ts";
-import { ValidationError } from "../http/errors.ts";
 import { jsonResponse } from "../http/response.ts";
+import { parseJsonBody } from "../http/validation.ts";
 import { ingestWorkerEvents } from "../services/event-service.ts";
 import {
   downloadStagedFileByToken,
@@ -8,26 +8,8 @@ import {
   leaseNextIngestion,
   releaseActiveLease,
 } from "../services/lease-service.ts";
+import { extractPathParam } from "./params.ts";
 import type { RouteDefinition } from "./types.ts";
-
-function extractPathParam(pathname: string, pattern: RegExp, parameterName: string): string {
-  const match = pathname.match(pattern);
-  const value = match?.[1];
-
-  if (!value) {
-    throw new ValidationError(`Path parameter '${parameterName}' is invalid.`);
-  }
-
-  return value;
-}
-
-async function parseJsonBody(request: Request): Promise<unknown> {
-  try {
-    return await request.json();
-  } catch {
-    throw new ValidationError("Request body must be valid JSON.");
-  }
-}
 
 const leaseRoute: RouteDefinition = {
   method: "POST",

@@ -1,6 +1,10 @@
 import { requireRole, requireTenantScope } from "../auth/guards.ts";
-import { ValidationError } from "../http/errors.ts";
 import { jsonResponse } from "../http/response.ts";
+import {
+  parseJsonBody,
+  requireObject,
+  requireStringField,
+} from "../http/validation.ts";
 import {
   cancelIngestion,
   commitUploadedFile,
@@ -12,49 +16,22 @@ import {
   submitIngestion,
   uploadFileBySignedToken,
 } from "../services/ingestion-service.ts";
+import { extractPathParam } from "./params.ts";
 import type { RouteDefinition } from "./types.ts";
-
-function extractPathParam(pathname: string, pattern: RegExp, parameterName: string): string {
-  const match = pathname.match(pattern);
-  const value = match?.[1];
-
-  if (!value) {
-    throw new ValidationError(`Path parameter '${parameterName}' is invalid.`);
-  }
-
-  return value;
-}
-
-async function parseJsonBody(request: Request): Promise<unknown> {
-  try {
-    return await request.json();
-  } catch {
-    throw new ValidationError("Request body must be valid JSON.");
-  }
-}
 
 const createIngestionRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions",
   handler: async (request, context) => {
     const auth = requireRole(context, ["operator", "admin"]);
-    const body = await parseJsonBody(request);
-
-    if (body === null || typeof body !== "object" || Array.isArray(body)) {
-      throw new ValidationError("Request body must be an object.");
-    }
-
-    const uploadId = (body as Record<string, unknown>).upload_id;
-
-    if (typeof uploadId !== "string") {
-      throw new ValidationError("Field 'upload_id' must be a string.");
-    }
+    const body = requireObject(await parseJsonBody(request));
+    const batchLabel = requireStringField(body, "batch_label");
 
     return jsonResponse(
       await createIngestionDraft({
         tenantId: auth.tenantId,
         userId: auth.userId,
-        uploadId,
+        batchLabel,
       }),
       {
         status: 201,

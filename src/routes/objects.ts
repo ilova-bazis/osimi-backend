@@ -1,6 +1,6 @@
 import { requireRole, requireTenantScope } from "../auth/guards.ts";
-import { ValidationError } from "../http/errors.ts";
 import { jsonResponse } from "../http/response.ts";
+import { parseJsonBody } from "../http/validation.ts";
 import {
   downloadObjectArtifactForTenant,
   getObjectDetail,
@@ -8,26 +8,8 @@ import {
   listObjectsForTenant,
   patchObjectTitleForTenant,
 } from "../services/object-service.ts";
+import { extractPathParam } from "./params.ts";
 import type { RouteDefinition } from "./types.ts";
-
-function extractPathParam(pathname: string, pattern: RegExp, parameterName: string): string {
-  const match = pathname.match(pattern);
-  const value = match?.[1];
-
-  if (!value) {
-    throw new ValidationError(`Path parameter '${parameterName}' is invalid.`);
-  }
-
-  return value;
-}
-
-async function parseJsonBody(request: Request): Promise<unknown> {
-  try {
-    return await request.json();
-  } catch {
-    throw new ValidationError("Request body must be valid JSON.");
-  }
-}
 
 const listObjectsRoute: RouteDefinition = {
   method: "GET",

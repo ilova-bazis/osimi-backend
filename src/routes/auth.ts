@@ -1,41 +1,19 @@
 import { createAuthAuditContext, logoutByToken, loginWithPassword } from "../auth/service.ts";
 import { requireAuthenticated } from "../auth/guards.ts";
-import { ValidationError } from "../http/errors.ts";
 import { jsonResponse } from "../http/response.ts";
+import {
+  parseJsonBody,
+  requireObject,
+  requireOptionalStringField,
+  requireStringField,
+} from "../http/validation.ts";
 import type { RouteDefinition } from "./types.ts";
 
-interface LoginBody {
-  username?: unknown;
-  password?: unknown;
-  tenant_id?: unknown;
-}
-
-async function parseJsonBody(request: Request): Promise<unknown> {
-  try {
-    return await request.json();
-  } catch {
-    throw new ValidationError("Request body must be valid JSON.");
-  }
-}
-
 function parseLoginBody(payload: unknown): { username: string; password: string; tenantId?: string } {
-  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new ValidationError("Request body must be an object.");
-  }
-
-  const { username, password, tenant_id } = payload as LoginBody;
-
-  if (typeof username !== "string") {
-    throw new ValidationError("Field 'username' must be a string.");
-  }
-
-  if (typeof password !== "string") {
-    throw new ValidationError("Field 'password' must be a string.");
-  }
-
-  if (tenant_id !== undefined && typeof tenant_id !== "string") {
-    throw new ValidationError("Field 'tenant_id' must be a string when provided.");
-  }
+  const data = requireObject(payload);
+  const username = requireStringField(data, "username");
+  const password = requireStringField(data, "password");
+  const tenant_id = requireOptionalStringField(data, "tenant_id");
 
   const normalizedTenant = tenant_id?.trim();
 

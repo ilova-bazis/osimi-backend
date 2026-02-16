@@ -1,4 +1,4 @@
-import { db, qualifiedTableName } from "../db/runtime.ts";
+import { withSchemaClient } from "../db/client.ts";
 
 interface LeaseRow {
   id: string;
@@ -12,7 +12,7 @@ interface LeaseRow {
 
 interface QueuedIngestionRow {
   id: string;
-  upload_id: string;
+  batch_label: string;
   tenant_id: string;
   status: "QUEUED" | "PROCESSING";
 }
@@ -29,7 +29,7 @@ export interface LeaseRecord {
 
 export interface LeasedIngestionRecord {
   id: string;
-  uploadId: string;
+  batchLabel: string;
   tenantId: string;
   status: "QUEUED" | "PROCESSING";
 }
@@ -49,28 +49,24 @@ function mapLease(row: LeaseRow): LeaseRecord {
 function mapLeasedIngestion(row: QueuedIngestionRow): LeasedIngestionRecord {
   return {
     id: row.id,
-    uploadId: row.upload_id,
+    batchLabel: row.batch_label,
     tenantId: row.tenant_id,
     status: row.status,
   };
 }
 
 export async function sweepExpiredLeases(): Promise<number> {
-  const sql = db();
-  const leasesTable = qualifiedTableName("ingestion_leases");
-  const ingestionsTable = qualifiedTableName("ingestions");
-
-  const rows = (await sql.unsafe(
-    `
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<Array<{ count: number }>>`
       WITH expired AS (
-        UPDATE ${leasesTable}
+        UPDATE ingestion_leases
         SET released_at = now()
         WHERE released_at IS NULL
           AND lease_expires_at <= now()
         RETURNING ingestion_id
       ),
       requeued AS (
-        UPDATE ${ingestionsTable}
+        UPDATE ingestions
         SET status = 'QUEUED',
             updated_at = now()
         WHERE id IN (SELECT ingestion_id FROM expired)
@@ -79,8 +75,8 @@ export async function sweepExpiredLeases(): Promise<number> {
       )
       SELECT COUNT(*)::int AS count
       FROM requeued
-    `,
-  )) as Array<{ count: number }>;
+    `;
+  });
 
   return Number(rows[0]?.count ?? 0);
 }
@@ -89,19 +85,15 @@ export async function leaseNextQueuedIngestion(params: {
   workerId?: string;
   leaseDurationSeconds: number;
 }): Promise<{ ingestion: LeasedIngestionRecord; lease: LeaseRecord } | undefined> {
-  const sql = db();
-  const ingestionsTable = qualifiedTableName("ingestions");
-  const leasesTable = qualifiedTableName("ingestion_leases");
-
-  return sql.begin(async transaction => {
-    const candidates = (await transaction.unsafe(
-      `
-        SELECT i.id, i.upload_id, i.tenant_id, i.status
-        FROM ${ingestionsTable} i
+  return withSchemaClient(async (sql) => {
+    return sql.begin(async (transaction) => {
+      const candidates = await transaction<QueuedIngestionRow[]>`
+        SELECT i.id, i.batch_label, i.tenant_id, i.status
+        FROM ingestions i
         WHERE i.status = 'QUEUED'
           AND NOT EXISTS (
             SELECT 1
-            FROM ${leasesTable} l
+            FROM ingestion_leases l
             WHERE l.ingestion_id = i.id
               AND l.released_at IS NULL
               AND l.lease_expires_at > now()
@@ -109,20 +101,18 @@ export async function leaseNextQueuedIngestion(params: {
         ORDER BY i.created_at ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
-      `,
-    )) as QueuedIngestionRow[];
+      `;
 
-    const candidate = candidates[0];
+      const candidate = candidates[0];
 
-    if (!candidate) {
-      return undefined;
-    }
+      if (!candidate) {
+        return undefined;
+      }
 
-    const leaseId = crypto.randomUUID();
-    const leaseTokenId = crypto.randomUUID();
-    const leaseRows = (await transaction.unsafe(
-      `
-        INSERT INTO ${leasesTable} (
+      const leaseId = crypto.randomUUID();
+      const leaseTokenId = crypto.randomUUID();
+      const leaseRows = await transaction<LeaseRow[]>`
+        INSERT INTO ingestion_leases (
           id,
           ingestion_id,
           leased_by,
@@ -130,34 +120,30 @@ export async function leaseNextQueuedIngestion(params: {
           lease_expires_at
         )
         VALUES (
-          $1,
-          $2,
-          $3,
-          $4,
-          now() + ($5::int * interval '1 second')
+          ${leaseId},
+          ${candidate.id},
+          ${params.workerId ?? null},
+          ${leaseTokenId},
+          now() + (${params.leaseDurationSeconds}::int * interval '1 second')
         )
         RETURNING id, ingestion_id, leased_by, lease_token_id, lease_expires_at, created_at, released_at
-      `,
-      [leaseId, candidate.id, params.workerId ?? null, leaseTokenId, params.leaseDurationSeconds],
-    )) as LeaseRow[];
+      `;
 
-    await transaction.unsafe(
-      `
-        UPDATE ${ingestionsTable}
+      await transaction`
+        UPDATE ingestions
         SET status = 'PROCESSING',
             updated_at = now()
-        WHERE id = $1
-      `,
-      [candidate.id],
-    );
+        WHERE id = ${candidate.id}
+      `;
 
-    return {
-      ingestion: {
-        ...mapLeasedIngestion(candidate),
-        status: "PROCESSING",
-      },
-      lease: mapLease(leaseRows[0]!),
-    };
+      return {
+        ingestion: {
+          ...mapLeasedIngestion(candidate),
+          status: "PROCESSING",
+        },
+        lease: mapLease(leaseRows[0]!),
+      };
+    });
   });
 }
 
@@ -167,22 +153,18 @@ export async function extendLease(params: {
   leaseTokenId: string;
   leaseDurationSeconds: number;
 }): Promise<LeaseRecord | undefined> {
-  const sql = db();
-  const leasesTable = qualifiedTableName("ingestion_leases");
-
-  const rows = (await sql.unsafe(
-    `
-      UPDATE ${leasesTable}
-      SET lease_expires_at = now() + ($4::int * interval '1 second')
-      WHERE id = $1
-        AND ingestion_id = $2
-        AND lease_token_id = $3
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<LeaseRow[]>`
+      UPDATE ingestion_leases
+      SET lease_expires_at = now() + (${params.leaseDurationSeconds}::int * interval '1 second')
+      WHERE id = ${params.leaseId}
+        AND ingestion_id = ${params.ingestionId}
+        AND lease_token_id = ${params.leaseTokenId}
         AND released_at IS NULL
         AND lease_expires_at > now()
       RETURNING id, ingestion_id, leased_by, lease_token_id, lease_expires_at, created_at, released_at
-    `,
-    [params.leaseId, params.ingestionId, params.leaseTokenId, params.leaseDurationSeconds],
-  )) as LeaseRow[];
+    `;
+  });
 
   const row = rows[0];
   return row ? mapLease(row) : undefined;
@@ -193,21 +175,17 @@ export async function releaseLease(params: {
   leaseId: string;
   leaseTokenId: string;
 }): Promise<LeaseRecord | undefined> {
-  const sql = db();
-  const leasesTable = qualifiedTableName("ingestion_leases");
-
-  const rows = (await sql.unsafe(
-    `
-      UPDATE ${leasesTable}
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<LeaseRow[]>`
+      UPDATE ingestion_leases
       SET released_at = now()
-      WHERE id = $1
-        AND ingestion_id = $2
-        AND lease_token_id = $3
+      WHERE id = ${params.leaseId}
+        AND ingestion_id = ${params.ingestionId}
+        AND lease_token_id = ${params.leaseTokenId}
         AND released_at IS NULL
       RETURNING id, ingestion_id, leased_by, lease_token_id, lease_expires_at, created_at, released_at
-    `,
-    [params.leaseId, params.ingestionId, params.leaseTokenId],
-  )) as LeaseRow[];
+    `;
+  });
 
   const row = rows[0];
   return row ? mapLease(row) : undefined;
@@ -218,22 +196,18 @@ export async function findActiveLeaseByToken(params: {
   leaseId: string;
   leaseTokenId: string;
 }): Promise<LeaseRecord | undefined> {
-  const sql = db();
-  const leasesTable = qualifiedTableName("ingestion_leases");
-
-  const rows = (await sql.unsafe(
-    `
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<LeaseRow[]>`
       SELECT id, ingestion_id, leased_by, lease_token_id, lease_expires_at, created_at, released_at
-      FROM ${leasesTable}
-      WHERE id = $1
-        AND ingestion_id = $2
-        AND lease_token_id = $3
+      FROM ingestion_leases
+      WHERE id = ${params.leaseId}
+        AND ingestion_id = ${params.ingestionId}
+        AND lease_token_id = ${params.leaseTokenId}
         AND released_at IS NULL
         AND lease_expires_at > now()
       LIMIT 1
-    `,
-    [params.leaseId, params.ingestionId, params.leaseTokenId],
-  )) as LeaseRow[];
+    `;
+  });
 
   const row = rows[0];
   return row ? mapLease(row) : undefined;

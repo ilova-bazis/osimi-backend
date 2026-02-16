@@ -2,6 +2,10 @@ import { withRequestContext } from "./http/context.ts";
 import { MethodNotAllowedError, NotFoundError } from "./http/errors.ts";
 import { routes as defaultRoutes } from "./routes/index.ts";
 import type { RouteDefinition } from "./routes/types.ts";
+import {
+  runWithRuntimeConfig,
+  type RuntimeConfig,
+} from "./runtime/config.ts";
 
 interface App {
   fetch: (request: Request) => Promise<Response>;
@@ -79,6 +83,17 @@ interface DynamicRoute {
 }
 
 export function createApp(routeDefinitions: RouteDefinition[] = defaultRoutes): App {
+  return createAppWithOptions({ routeDefinitions });
+}
+
+interface CreateAppOptions {
+  routeDefinitions?: RouteDefinition[];
+  runtimeConfig?: RuntimeConfig;
+}
+
+export function createAppWithOptions(options: CreateAppOptions = {}): App {
+  const routeDefinitions = options.routeDefinitions ?? defaultRoutes;
+  const runtimeConfig = options.runtimeConfig ?? {};
   const handlers = new Map<string, RouteDefinition["handler"]>();
   const methodsByPath = new Map<string, Set<string>>();
   const dynamicRoutes: DynamicRoute[] = [];
@@ -112,64 +127,66 @@ export function createApp(routeDefinitions: RouteDefinition[] = defaultRoutes): 
 
   return {
     async fetch(request: Request): Promise<Response> {
-      const corsHeaders = resolveCorsHeaders(request.headers.get("origin"));
+      return runWithRuntimeConfig(runtimeConfig, () => {
+        const corsHeaders = resolveCorsHeaders(request.headers.get("origin"));
 
-      if (request.method.toUpperCase() === "OPTIONS") {
-        return new Response(null, {
-          status: 204,
-          headers: corsHeaders ?? {},
-        });
-      }
-
-      return withRequestContext(request, async context => {
-        const url = new URL(request.url);
-        const pathname = normalizePath(url.pathname);
-        const method = request.method.toUpperCase();
-        const key = routeKey(method, pathname);
-        let handler = handlers.get(key);
-
-        if (!handler) {
-          for (const route of dynamicRoutes) {
-            if (route.method === method && pathMatches(route.path, pathname)) {
-              handler = route.handler;
-              break;
-            }
-          }
+        if (request.method.toUpperCase() === "OPTIONS") {
+          return new Response(null, {
+            status: 204,
+            headers: corsHeaders ?? {},
+          });
         }
 
-        if (!handler) {
-          let allowedMethods = methodsByPath.get(pathname);
+        return withRequestContext(request, async context => {
+          const url = new URL(request.url);
+          const pathname = normalizePath(url.pathname);
+          const method = request.method.toUpperCase();
+          const key = routeKey(method, pathname);
+          let handler = handlers.get(key);
 
-          if (!allowedMethods) {
-            const matchedMethods = new Set<string>();
-
+          if (!handler) {
             for (const route of dynamicRoutes) {
-              if (pathMatches(route.path, pathname)) {
-                matchedMethods.add(route.method);
+              if (route.method === method && pathMatches(route.path, pathname)) {
+                handler = route.handler;
+                break;
+              }
+            }
+          }
+
+          if (!handler) {
+            let allowedMethods = methodsByPath.get(pathname);
+
+            if (!allowedMethods) {
+              const matchedMethods = new Set<string>();
+
+              for (const route of dynamicRoutes) {
+                if (pathMatches(route.path, pathname)) {
+                  matchedMethods.add(route.method);
+                }
+              }
+
+              if (matchedMethods.size > 0) {
+                allowedMethods = matchedMethods;
               }
             }
 
-            if (matchedMethods.size > 0) {
-              allowedMethods = matchedMethods;
+            if (allowedMethods) {
+              throw new MethodNotAllowedError(pathname, [...allowedMethods]);
+            }
+
+            throw new NotFoundError(`Route '${method} ${pathname}' was not found.`);
+          }
+
+          const response = await handler(request, context);
+
+          if (corsHeaders) {
+            for (const [key, value] of Object.entries(corsHeaders)) {
+              response.headers.set(key, value);
             }
           }
 
-          if (allowedMethods) {
-            throw new MethodNotAllowedError(pathname, [...allowedMethods]);
-          }
-
-          throw new NotFoundError(`Route '${method} ${pathname}' was not found.`);
-        }
-
-        const response = await handler(request, context);
-
-        if (corsHeaders) {
-          for (const [key, value] of Object.entries(corsHeaders)) {
-            response.headers.set(key, value);
-          }
-        }
-
-        return response;
+          return response;
+        });
       });
     },
   };

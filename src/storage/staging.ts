@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import { join, normalize } from "node:path";
 
 import { UnauthorizedError, ValidationError } from "../http/errors.ts";
+import { getRuntimeConfig } from "../runtime/config.ts";
 
 const DEFAULT_STAGING_ROOT = ".staging";
 const DEFAULT_SIGNING_SECRET = "dev-local-signing-secret";
@@ -27,7 +28,8 @@ interface DownloadTokenPayload {
 }
 
 function getSigningSecret(): string {
-  return process.env.UPLOAD_SIGNING_SECRET?.trim() || DEFAULT_SIGNING_SECRET;
+  const runtimeSigningSecret = getRuntimeConfig().uploadSigningSecret;
+  return runtimeSigningSecret?.trim() || process.env.UPLOAD_SIGNING_SECRET?.trim() || DEFAULT_SIGNING_SECRET;
 }
 
 function toBase64Url(value: string): string {
@@ -47,7 +49,8 @@ function safeStorageKeySegment(segment: string): string {
 }
 
 export function stagingRootPath(): string {
-  return process.env.STAGING_ROOT?.trim() || DEFAULT_STAGING_ROOT;
+  const runtimeStagingRoot = getRuntimeConfig().stagingRoot;
+  return runtimeStagingRoot?.trim() || process.env.STAGING_ROOT?.trim() || DEFAULT_STAGING_ROOT;
 }
 
 export function buildStagingStorageKey(params: {

@@ -1,4 +1,5 @@
 import { ConfigurationError, UnauthorizedError } from "../http/errors.ts";
+import { getRuntimeConfig } from "../runtime/config.ts";
 
 const WORKER_AUTH_HEADER = "x-worker-auth-token";
 const WORKER_TOKEN_ENV = "WORKER_AUTH_TOKEN";
@@ -9,7 +10,8 @@ export interface WorkerPrincipal {
 }
 
 export function requireWorkerAuthentication(request: Request): WorkerPrincipal {
-  const expectedToken = process.env[WORKER_TOKEN_ENV]?.trim();
+  const runtimeToken = getRuntimeConfig().workerAuthToken;
+  const expectedToken = (runtimeToken ?? process.env[WORKER_TOKEN_ENV])?.trim();
 
   if (!expectedToken) {
     throw new ConfigurationError(`Environment variable '${WORKER_TOKEN_ENV}' is required for worker endpoints.`);

@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
-import { createApp } from "../../../src/app.ts";
+import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
 
@@ -32,9 +32,15 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
   const artifactId = "60000000-0000-0000-0000-000000000001";
   const artifactStorageKey = `tenants/${tenantOneId}/objects/${tenantOneObjectId}/artifacts/ingest.json`;
 
-  let previousDatabaseUrl: string | undefined;
-  let previousSchema: string | undefined;
-  let previousStagingRoot: string | undefined;
+  function createTestApp() {
+    return createApp({
+      runtimeConfig: {
+        databaseUrl: TEST_DATABASE_URL,
+        dbSchema: schema,
+        stagingRoot,
+      },
+    });
+  }
 
   beforeAll(async () => {
     schema = `objects_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
@@ -44,14 +50,6 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
       databaseUrl: TEST_DATABASE_URL,
       schema,
     });
-
-    previousDatabaseUrl = process.env.DATABASE_URL;
-    previousSchema = process.env.DB_SCHEMA;
-    previousStagingRoot = process.env.STAGING_ROOT;
-
-    process.env.DATABASE_URL = TEST_DATABASE_URL;
-    process.env.DB_SCHEMA = schema;
-    process.env.STAGING_ROOT = stagingRoot;
 
     const sql = createSqlClient(TEST_DATABASE_URL!);
 
@@ -147,7 +145,7 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
     await mkdir(dirname(artifactPath), { recursive: true });
     await Bun.write(artifactPath, '{"status":"ready"}');
 
-    const app = createApp();
+    const app = createTestApp();
 
     const operatorLogin = await app.fetch(
       new Request("http://localhost/api/auth/login", {
@@ -193,27 +191,10 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
       await rm(stagingRoot, { recursive: true, force: true });
     }
 
-    if (previousDatabaseUrl === undefined) {
-      delete process.env.DATABASE_URL;
-    } else {
-      process.env.DATABASE_URL = previousDatabaseUrl;
-    }
-
-    if (previousSchema === undefined) {
-      delete process.env.DB_SCHEMA;
-    } else {
-      process.env.DB_SCHEMA = previousSchema;
-    }
-
-    if (previousStagingRoot === undefined) {
-      delete process.env.STAGING_ROOT;
-    } else {
-      process.env.STAGING_ROOT = previousStagingRoot;
-    }
   });
 
   test("lists tenant-scoped objects", async () => {
-    const app = createApp();
+    const app = createTestApp();
     const response = await app.fetch(
       new Request("http://localhost/api/objects?type=DOCUMENT", {
         method: "GET",
@@ -233,7 +214,7 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
   });
 
   test("returns object detail and blocks cross-tenant object", async () => {
-    const app = createApp();
+    const app = createTestApp();
 
     const okResponse = await app.fetch(
       new Request(`http://localhost/api/objects/${tenantOneObjectId}`, {
@@ -259,7 +240,7 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
   });
 
   test("patches title for operator and blocks viewer", async () => {
-    const app = createApp();
+    const app = createTestApp();
 
     const patchResponse = await app.fetch(
       new Request(`http://localhost/api/objects/${tenantOneObjectId}`, {
@@ -297,7 +278,7 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
   });
 
   test("lists and downloads object artifacts", async () => {
-    const app = createApp();
+    const app = createTestApp();
 
     const listResponse = await app.fetch(
       new Request(`http://localhost/api/objects/${tenantOneObjectId}/artifacts`, {

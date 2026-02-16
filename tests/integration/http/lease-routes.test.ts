@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 
-import { createApp } from "../../../src/app.ts";
+import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
 import { createDownloadToken } from "../../../src/storage/index.ts";
@@ -97,7 +97,7 @@ async function createQueuedIngestion(app: ReturnType<typeof createApp>, token: s
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        upload_id: `batch-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+        batch_label: `batch-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
       }),
     }),
   );
@@ -168,10 +168,16 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
   let stagingRoot = "";
   let authToken = "";
 
-  let previousDatabaseUrl: string | undefined;
-  let previousSchema: string | undefined;
-  let previousStagingRoot: string | undefined;
-  let previousWorkerToken: string | undefined;
+  function createTestApp() {
+    return createApp({
+      runtimeConfig: {
+        databaseUrl: TEST_DATABASE_URL,
+        dbSchema: schema,
+        stagingRoot,
+        workerAuthToken: "worker-secret",
+      },
+    });
+  }
 
   beforeAll(async () => {
     schema = `lease_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
@@ -181,16 +187,6 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
       databaseUrl: TEST_DATABASE_URL,
       schema,
     });
-
-    previousDatabaseUrl = process.env.DATABASE_URL;
-    previousSchema = process.env.DB_SCHEMA;
-    previousStagingRoot = process.env.STAGING_ROOT;
-    previousWorkerToken = process.env.WORKER_AUTH_TOKEN;
-
-    process.env.DATABASE_URL = TEST_DATABASE_URL;
-    process.env.DB_SCHEMA = schema;
-    process.env.STAGING_ROOT = stagingRoot;
-    process.env.WORKER_AUTH_TOKEN = "worker-secret";
 
     const sql = createSqlClient(TEST_DATABASE_URL);
 
@@ -238,7 +234,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
       await sql.close();
     }
 
-    const app = createApp();
+    const app = createTestApp();
     const loginResponse = await app.fetch(
       new Request("http://localhost/api/auth/login", {
         method: "POST",
@@ -271,29 +267,6 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
       await rm(stagingRoot, { recursive: true, force: true });
     }
 
-    if (previousDatabaseUrl === undefined) {
-      delete process.env.DATABASE_URL;
-    } else {
-      process.env.DATABASE_URL = previousDatabaseUrl;
-    }
-
-    if (previousSchema === undefined) {
-      delete process.env.DB_SCHEMA;
-    } else {
-      process.env.DB_SCHEMA = previousSchema;
-    }
-
-    if (previousStagingRoot === undefined) {
-      delete process.env.STAGING_ROOT;
-    } else {
-      process.env.STAGING_ROOT = previousStagingRoot;
-    }
-
-    if (previousWorkerToken === undefined) {
-      delete process.env.WORKER_AUTH_TOKEN;
-    } else {
-      process.env.WORKER_AUTH_TOKEN = previousWorkerToken;
-    }
   });
 
   beforeEach(async () => {
@@ -301,7 +274,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
   });
 
   test("leases queued ingestion, supports heartbeat, serves download, and releases", async () => {
-    const app = createApp();
+    const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
 
     const leaseResponse = await app.fetch(
@@ -380,7 +353,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
   });
 
   test("concurrent lease attempts produce a single winner", async () => {
-    const app = createApp();
+    const app = createTestApp();
     await cancelQueuedIngestions(schema);
     await createQueuedIngestion(app, authToken);
 
@@ -413,7 +386,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
   });
 
   test("rejects heartbeat when ingestion id does not match lease token", async () => {
-    const app = createApp();
+    const app = createTestApp();
     const sourceIngestionId = await createQueuedIngestion(app, authToken);
     const targetIngestionId = await createQueuedIngestion(app, authToken);
 
@@ -453,7 +426,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
   });
 
   test("re-queues ingestion when active lease expires and worker requests next lease", async () => {
-    const app = createApp();
+    const app = createTestApp();
     await cancelQueuedIngestions(schema);
     const ingestionId = await createQueuedIngestion(app, authToken);
 
@@ -491,7 +464,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
   });
 
   test("rejects expired worker download token", async () => {
-    const app = createApp();
+    const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
 
     const leaseResponse = await app.fetch(

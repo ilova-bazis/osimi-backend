@@ -16,6 +16,14 @@ This document captures the implementation stack for the Osimi backend (VPS contr
 - PostgreSQL
 - Bun SQL client (`import { sql, SQL } from "bun"`)
 
+## Type Safety Rules
+
+- Do not use convenience casts like `as T` after `sql<T>` queries
+- Use `sql<T>` generics directly for typed query results
+- Use explicit row mappers for normalization and conversion
+- If a cast is unavoidable due to a Bun typing limitation, keep it isolated and add a short justification comment
+- Auth and security-sensitive code must avoid assertion casts by default
+
 ## Storage
 
 - Local disk storage on the VPS (staging)

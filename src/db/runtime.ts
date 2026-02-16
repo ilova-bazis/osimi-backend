@@ -1,10 +1,10 @@
 import { createSqlClient, resolveDatabaseUrl } from "./client.ts";
+import { getRuntimeConfig } from "../runtime/config.ts";
 
 const SCHEMA_PATTERN = /^[a-z_][a-z0-9_]*$/;
 const IDENTIFIER_PATTERN = /^[a-z_][a-z0-9_]*$/;
 
-let cachedUrl: string | undefined;
-let cachedClient: ReturnType<typeof createSqlClient> | undefined;
+const cachedClientsByKey = new Map<string, ReturnType<typeof createSqlClient>>();
 
 function validateIdentifier(value: string, kind: string): string {
   if (!IDENTIFIER_PATTERN.test(value)) {
@@ -15,7 +15,10 @@ function validateIdentifier(value: string, kind: string): string {
 }
 
 export function resolveDbSchema(): string {
-  const schema = (process.env.DB_SCHEMA ?? "public").trim().toLowerCase();
+  const runtimeSchema = getRuntimeConfig().dbSchema;
+  const schema = (runtimeSchema ?? process.env.DB_SCHEMA ?? "public")
+    .trim()
+    .toLowerCase();
 
   if (!SCHEMA_PATTERN.test(schema)) {
     throw new Error(`Invalid DB_SCHEMA '${schema}'. Must match ${SCHEMA_PATTERN.source}.`);
@@ -32,11 +35,15 @@ export function qualifiedTableName(tableName: string): string {
 
 export function db(): ReturnType<typeof createSqlClient> {
   const url = resolveDatabaseUrl();
+  const schema = resolveDbSchema();
+  const cacheKey = `${url}::${schema}`;
+  const cachedClient = cachedClientsByKey.get(cacheKey);
 
-  if (!cachedClient || cachedUrl !== url) {
-    cachedClient = createSqlClient(url);
-    cachedUrl = url;
+  if (cachedClient) {
+    return cachedClient;
   }
 
-  return cachedClient;
+  const createdClient = createSqlClient(url);
+  cachedClientsByKey.set(cacheKey, createdClient);
+  return createdClient;
 }

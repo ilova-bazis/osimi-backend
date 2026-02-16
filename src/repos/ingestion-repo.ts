@@ -1,11 +1,11 @@
-import { db, qualifiedTableName } from "../db/runtime.ts";
+import { withSchemaClient } from "../db/client.ts";
 import type { IngestionStatus } from "../domain/ingestions/state-machine.ts";
 
 type IngestionFileStatus = "PENDING" | "UPLOADED" | "VALIDATED" | "FAILED";
 
 interface IngestionRow {
   id: string;
-  upload_id: string;
+  batch_label: string;
   tenant_id: string;
   status: IngestionStatus;
   created_by: string;
@@ -31,7 +31,7 @@ interface IngestionFileRow {
 
 export interface IngestionRecord {
   id: string;
-  uploadId: string;
+  batchLabel: string;
   tenantId: string;
   status: IngestionStatus;
   createdBy: string;
@@ -74,7 +74,7 @@ export interface StuckIngestionRecord {
 function mapIngestion(row: IngestionRow): IngestionRecord {
   return {
     id: row.id,
-    uploadId: row.upload_id,
+    batchLabel: row.batch_label,
     tenantId: row.tenant_id,
     status: row.status,
     createdBy: row.created_by,
@@ -135,45 +135,40 @@ function mapStuckIngestion(row: {
 
 export async function createIngestion(params: {
   id: string;
-  uploadId: string;
+  batchLabel: string;
   tenantId: string;
   createdBy: string;
 }): Promise<IngestionRecord> {
-  const sql = db();
-  const ingestionsTable = qualifiedTableName("ingestions");
-
-  const rows = (await sql.unsafe(
-    `
-      INSERT INTO ${ingestionsTable} (
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionRow[]>`
+      INSERT INTO ingestions (
         id,
-        upload_id,
+        batch_label,
         tenant_id,
         status,
         created_by
       )
-      VALUES ($1, $2, $3, 'DRAFT', $4)
-      RETURNING id, upload_id, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
-    `,
-    [params.id, params.uploadId, params.tenantId, params.createdBy],
-  )) as IngestionRow[];
+      VALUES (${params.id}, ${params.batchLabel}, ${params.tenantId}, 'DRAFT', ${params.createdBy})
+      RETURNING id, batch_label, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
+    `;
+  });
 
   return mapIngestion(rows[0]!);
 }
 
-export async function findIngestionById(tenantId: string, ingestionId: string): Promise<IngestionRecord | undefined> {
-  const sql = db();
-  const ingestionsTable = qualifiedTableName("ingestions");
-
-  const rows = (await sql.unsafe(
-    `
-      SELECT id, upload_id, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
-      FROM ${ingestionsTable}
-      WHERE id = $1
-        AND tenant_id = $2
+export async function findIngestionById(
+  tenantId: string,
+  ingestionId: string,
+): Promise<IngestionRecord | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionRow[]>`
+      SELECT id, batch_label, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
+      FROM ingestions
+      WHERE id = ${ingestionId}
+        AND tenant_id = ${tenantId}
       LIMIT 1
-    `,
-    [ingestionId, tenantId],
-  )) as IngestionRow[];
+    `;
+  });
 
   const row = rows[0];
   return row ? mapIngestion(row) : undefined;
@@ -185,28 +180,26 @@ export async function listIngestions(params: {
   cursorCreatedAt?: string;
   cursorId?: string;
 }): Promise<IngestionRecord[]> {
-  const sql = db();
-  const ingestionsTable = qualifiedTableName("ingestions");
+  const rows = await withSchemaClient(async (sql) => {
+    if (params.cursorCreatedAt && params.cursorId) {
+      return await sql<IngestionRow[]>`
+        SELECT id, batch_label, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
+        FROM ingestions
+        WHERE tenant_id = ${params.tenantId}
+          AND (created_at, id) < (${params.cursorCreatedAt}::timestamptz, ${params.cursorId}::uuid)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ${params.limit}
+      `;
+    }
 
-  const values: Array<string | number> = [params.tenantId, params.limit];
-  let cursorClause = "";
-
-  if (params.cursorCreatedAt && params.cursorId) {
-    values.push(params.cursorCreatedAt, params.cursorId);
-    cursorClause = "AND (created_at, id) < ($3::timestamptz, $4::uuid)";
-  }
-
-  const rows = (await sql.unsafe(
-    `
-      SELECT id, upload_id, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
-      FROM ${ingestionsTable}
-      WHERE tenant_id = $1
-        ${cursorClause}
+    return await sql<IngestionRow[]>`
+      SELECT id, batch_label, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
+      FROM ingestions
+      WHERE tenant_id = ${params.tenantId}
       ORDER BY created_at DESC, id DESC
-      LIMIT $2
-    `,
-    values,
-  )) as IngestionRow[];
+      LIMIT ${params.limit}
+    `;
+  });
 
   return rows.map(mapIngestion);
 }
@@ -214,22 +207,20 @@ export async function listIngestions(params: {
 export async function updateIngestionStatus(params: {
   ingestionId: string;
   tenantId: string;
-  status: IngestionStatus;
+  fromStatus: IngestionStatus;
+  toStatus: IngestionStatus;
 }): Promise<IngestionRecord | undefined> {
-  const sql = db();
-  const ingestionsTable = qualifiedTableName("ingestions");
-
-  const rows = (await sql.unsafe(
-    `
-      UPDATE ${ingestionsTable}
-      SET status = $1,
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionRow[]>`
+      UPDATE ingestions
+      SET status = ${params.toStatus},
           updated_at = now()
-      WHERE id = $2
-        AND tenant_id = $3
-      RETURNING id, upload_id, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
-    `,
-    [params.status, params.ingestionId, params.tenantId],
-  )) as IngestionRow[];
+      WHERE id = ${params.ingestionId}
+        AND tenant_id = ${params.tenantId}
+        AND status = ${params.fromStatus}
+      RETURNING id, batch_label, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
+    `;
+  });
 
   const row = rows[0];
   return row ? mapIngestion(row) : undefined;
@@ -243,12 +234,9 @@ export async function createIngestionFile(params: {
   sizeBytes: number;
   storageKey: string;
 }): Promise<IngestionFileRecord> {
-  const sql = db();
-  const filesTable = qualifiedTableName("ingestion_files");
-
-  const rows = (await sql.unsafe(
-    `
-      INSERT INTO ${filesTable} (
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionFileRow[]>`
+      INSERT INTO ingestion_files (
         id,
         ingestion_id,
         filename,
@@ -257,11 +245,10 @@ export async function createIngestionFile(params: {
         storage_key,
         status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
+      VALUES (${params.id}, ${params.ingestionId}, ${params.filename}, ${params.contentType}, ${params.sizeBytes}, ${params.storageKey}, 'PENDING')
       RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256, error, created_at, updated_at
-    `,
-    [params.id, params.ingestionId, params.filename, params.contentType, params.sizeBytes, params.storageKey],
-  )) as IngestionFileRow[];
+    `;
+  });
 
   return mapIngestionFile(rows[0]!);
 }
@@ -271,12 +258,8 @@ export async function findIngestionFileById(params: {
   ingestionId: string;
   fileId: string;
 }): Promise<IngestionFileRecord | undefined> {
-  const sql = db();
-  const filesTable = qualifiedTableName("ingestion_files");
-  const ingestionsTable = qualifiedTableName("ingestions");
-
-  const rows = (await sql.unsafe(
-    `
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionFileRow[]>`
       SELECT
         f.id,
         f.ingestion_id,
@@ -289,15 +272,14 @@ export async function findIngestionFileById(params: {
         f.error,
         f.created_at,
         f.updated_at
-      FROM ${filesTable} f
-      INNER JOIN ${ingestionsTable} i ON i.id = f.ingestion_id
-      WHERE f.id = $1
-        AND f.ingestion_id = $2
-        AND i.tenant_id = $3
+      FROM ingestion_files f
+      INNER JOIN ingestions i ON i.id = f.ingestion_id
+      WHERE f.id = ${params.fileId}
+        AND f.ingestion_id = ${params.ingestionId}
+        AND i.tenant_id = ${params.tenantId}
       LIMIT 1
-    `,
-    [params.fileId, params.ingestionId, params.tenantId],
-  )) as IngestionFileRow[];
+    `;
+  });
 
   const row = rows[0];
   return row ? mapIngestionFile(row) : undefined;
@@ -307,12 +289,8 @@ export async function listIngestionFiles(params: {
   tenantId: string;
   ingestionId: string;
 }): Promise<IngestionFileRecord[]> {
-  const sql = db();
-  const filesTable = qualifiedTableName("ingestion_files");
-  const ingestionsTable = qualifiedTableName("ingestions");
-
-  const rows = (await sql.unsafe(
-    `
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionFileRow[]>`
       SELECT
         f.id,
         f.ingestion_id,
@@ -325,36 +303,34 @@ export async function listIngestionFiles(params: {
         f.error,
         f.created_at,
         f.updated_at
-      FROM ${filesTable} f
-      INNER JOIN ${ingestionsTable} i ON i.id = f.ingestion_id
-      WHERE f.ingestion_id = $1
-        AND i.tenant_id = $2
+      FROM ingestion_files f
+      INNER JOIN ingestions i ON i.id = f.ingestion_id
+      WHERE f.ingestion_id = ${params.ingestionId}
+        AND i.tenant_id = ${params.tenantId}
       ORDER BY f.created_at ASC, f.id ASC
-    `,
-    [params.ingestionId, params.tenantId],
-  )) as IngestionFileRow[];
+    `;
+  });
 
   return rows.map(mapIngestionFile);
 }
 
 export async function markIngestionFileUploaded(params: {
   fileId: string;
+  ingestionId: string;
   checksumSha256: string;
 }): Promise<IngestionFileRecord | undefined> {
-  const sql = db();
-  const filesTable = qualifiedTableName("ingestion_files");
-
-  const rows = (await sql.unsafe(
-    `
-      UPDATE ${filesTable}
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionFileRow[]>`
+      UPDATE ingestion_files
       SET status = 'UPLOADED',
-          checksum_sha256 = $2,
+          checksum_sha256 = ${params.checksumSha256},
           updated_at = now()
-      WHERE id = $1
+      WHERE id = ${params.fileId}
+        AND ingestion_id = ${params.ingestionId}
+        AND status = 'PENDING'
       RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256, error, created_at, updated_at
-    `,
-    [params.fileId, params.checksumSha256],
-  )) as IngestionFileRow[];
+    `;
+  });
 
   const row = rows[0];
   return row ? mapIngestionFile(row) : undefined;
@@ -364,37 +340,34 @@ export async function listStagingCleanupCandidates(params: {
   completedRetentionDays: number;
   failedCanceledRetentionDays: number;
 }): Promise<StagingCleanupCandidate[]> {
-  const sql = db();
-  const ingestionsTable = qualifiedTableName("ingestions");
-  const filesTable = qualifiedTableName("ingestion_files");
-
-  const rows = (await sql.unsafe(
-    `
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<
+      Array<{
+        ingestion_id: string;
+        tenant_id: string;
+        status: IngestionStatus;
+        updated_at: Date;
+        storage_key: string;
+      }>
+    >`
       SELECT
         i.id AS ingestion_id,
         i.tenant_id,
         i.status,
         i.updated_at,
         f.storage_key
-      FROM ${ingestionsTable} i
-      INNER JOIN ${filesTable} f ON f.ingestion_id = i.id
+      FROM ingestions i
+      INNER JOIN ingestion_files f ON f.ingestion_id = i.id
       WHERE (
         i.status = 'COMPLETED'
-        AND i.updated_at <= now() - ($1::int * interval '1 day')
+        AND i.updated_at <= now() - (${params.completedRetentionDays}::int * interval '1 day')
       )
       OR (
         i.status IN ('FAILED', 'CANCELED')
-        AND i.updated_at <= now() - ($2::int * interval '1 day')
+        AND i.updated_at <= now() - (${params.failedCanceledRetentionDays}::int * interval '1 day')
       )
-    `,
-    [params.completedRetentionDays, params.failedCanceledRetentionDays],
-  )) as Array<{
-    ingestion_id: string;
-    tenant_id: string;
-    status: IngestionStatus;
-    updated_at: Date;
-    storage_key: string;
-  }>;
+    `;
+  });
 
   return rows.map(mapStagingCleanupCandidate);
 }
@@ -402,25 +375,23 @@ export async function listStagingCleanupCandidates(params: {
 export async function listStuckIngestions(params: {
   thresholdMinutes: number;
 }): Promise<StuckIngestionRecord[]> {
-  const sql = db();
-  const ingestionsTable = qualifiedTableName("ingestions");
-
-  const rows = (await sql.unsafe(
-    `
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<
+      Array<{
+        id: string;
+        tenant_id: string;
+        status: IngestionStatus;
+        updated_at: Date;
+        created_by: string;
+      }>
+    >`
       SELECT id, tenant_id, status, updated_at, created_by
-      FROM ${ingestionsTable}
+      FROM ingestions
       WHERE status IN ('UPLOADING', 'PROCESSING')
-        AND updated_at <= now() - ($1::int * interval '1 minute')
+        AND updated_at <= now() - (${params.thresholdMinutes}::int * interval '1 minute')
       ORDER BY updated_at ASC
-    `,
-    [params.thresholdMinutes],
-  )) as Array<{
-    id: string;
-    tenant_id: string;
-    status: IngestionStatus;
-    updated_at: Date;
-    created_by: string;
-  }>;
+    `;
+  });
 
   return rows.map(mapStuckIngestion);
 }

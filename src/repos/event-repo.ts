@@ -1,4 +1,4 @@
-import { db, qualifiedTableName } from "../db/runtime.ts";
+import { withSchemaClient } from "../db/client.ts";
 
 type ObjectEventType =
   | "INGESTION_SUBMITTED"
@@ -33,12 +33,9 @@ export async function insertObjectEvent(params: {
   actorUserId?: string;
   createdAt?: Date;
 }): Promise<boolean> {
-  const sql = db();
-  const eventsTable = qualifiedTableName("object_events");
-
-  const rows = (await sql.unsafe(
-    `
-      INSERT INTO ${eventsTable} (
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<InsertResult[]>`
+      INSERT INTO object_events (
         id,
         event_id,
         tenant_id,
@@ -49,22 +46,21 @@ export async function insertObjectEvent(params: {
         actor_user_id,
         created_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, COALESCE($9::timestamptz, now()))
+      VALUES (
+        ${crypto.randomUUID()},
+        ${params.eventId},
+        ${params.tenantId},
+        ${params.type},
+        ${params.ingestionId ?? null},
+        ${params.objectId ?? null},
+        CAST(${JSON.stringify(params.payload ?? {})} AS jsonb),
+        ${params.actorUserId ?? null},
+        COALESCE(${params.createdAt ? params.createdAt.toISOString() : null}::timestamptz, now())
+      )
       ON CONFLICT (event_id) DO NOTHING
       RETURNING id
-    `,
-    [
-      crypto.randomUUID(),
-      params.eventId,
-      params.tenantId,
-      params.type,
-      params.ingestionId ?? null,
-      params.objectId ?? null,
-      JSON.stringify(params.payload ?? {}),
-      params.actorUserId ?? null,
-      params.createdAt ? params.createdAt.toISOString() : null,
-    ],
-  )) as InsertResult[];
+    `;
+  });
 
   return rows.length > 0;
 }

@@ -103,9 +103,10 @@ Goal: persist worker progress, support idempotent event ingestion, and finalize 
 - Accept out-of-order events safely (best-effort ordering semantics).
 - Persist all events in `object_events` for feed and audit.
 - On successful completion:
-  - generate immutable `object_id` (`OBJ-YYYYMMDD-XXXXXX`)
+  - validate archive-supplied immutable `object_id` (`OBJ-YYYYMMDD-XXXXXX`)
   - create object and artifact records
   - store `ingest.json` under object artifact layout
+  - reject conflicting `object_id` values for the same ingestion
 
 Exit criteria:
 

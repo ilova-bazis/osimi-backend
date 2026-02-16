@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 
-import { createApp } from "../../../src/app.ts";
+import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
 
@@ -31,7 +31,7 @@ async function createQueuedIngestion(app: ReturnType<typeof createApp>, token: s
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        upload_id: `batch-events-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+        batch_label: `batch-events-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
       }),
     }),
   );
@@ -158,10 +158,16 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
   let stagingRoot = "";
   let authToken = "";
 
-  let previousDatabaseUrl: string | undefined;
-  let previousSchema: string | undefined;
-  let previousStagingRoot: string | undefined;
-  let previousWorkerToken: string | undefined;
+  function createTestApp() {
+    return createApp({
+      runtimeConfig: {
+        databaseUrl: TEST_DATABASE_URL,
+        dbSchema: schema,
+        stagingRoot,
+        workerAuthToken: "worker-secret",
+      },
+    });
+  }
 
   beforeAll(async () => {
     schema = `events_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
@@ -171,16 +177,6 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
       databaseUrl: TEST_DATABASE_URL,
       schema,
     });
-
-    previousDatabaseUrl = process.env.DATABASE_URL;
-    previousSchema = process.env.DB_SCHEMA;
-    previousStagingRoot = process.env.STAGING_ROOT;
-    previousWorkerToken = process.env.WORKER_AUTH_TOKEN;
-
-    process.env.DATABASE_URL = TEST_DATABASE_URL;
-    process.env.DB_SCHEMA = schema;
-    process.env.STAGING_ROOT = stagingRoot;
-    process.env.WORKER_AUTH_TOKEN = "worker-secret";
 
     const sql = createSqlClient(TEST_DATABASE_URL);
 
@@ -228,7 +224,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
       await sql.close();
     }
 
-    const app = createApp();
+    const app = createTestApp();
     const loginResponse = await app.fetch(
       new Request("http://localhost/api/auth/login", {
         method: "POST",
@@ -261,29 +257,6 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
       await rm(stagingRoot, { recursive: true, force: true });
     }
 
-    if (previousDatabaseUrl === undefined) {
-      delete process.env.DATABASE_URL;
-    } else {
-      process.env.DATABASE_URL = previousDatabaseUrl;
-    }
-
-    if (previousSchema === undefined) {
-      delete process.env.DB_SCHEMA;
-    } else {
-      process.env.DB_SCHEMA = previousSchema;
-    }
-
-    if (previousStagingRoot === undefined) {
-      delete process.env.STAGING_ROOT;
-    } else {
-      process.env.STAGING_ROOT = previousStagingRoot;
-    }
-
-    if (previousWorkerToken === undefined) {
-      delete process.env.WORKER_AUTH_TOKEN;
-    } else {
-      process.env.WORKER_AUTH_TOKEN = previousWorkerToken;
-    }
   });
 
   beforeEach(async () => {
@@ -291,7 +264,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
   });
 
   test("ingests worker events with dedupe and completion object finalization", async () => {
-    const app = createApp();
+    const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
 
     const lease = await leaseIngestion(app);
@@ -311,6 +284,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
         {
           event_id: crypto.randomUUID(),
           event_type: "INGESTION_COMPLETED",
+          object_id: "OBJ-20260213-EVT001",
           timestamp: new Date().toISOString(),
           payload: {
             title: "Event-completed object",
@@ -415,7 +389,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
   });
 
   test("rejects events when lease token does not match ingestion id", async () => {
-    const app = createApp();
+    const app = createTestApp();
     const ingestionOne = await createQueuedIngestion(app, authToken);
     const ingestionTwo = await createQueuedIngestion(app, authToken);
     const lease = await leaseIngestion(app);
@@ -448,7 +422,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
   });
 
   test("accepts out-of-order events and keeps ingestion completed", async () => {
-    const app = createApp();
+    const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
     const lease = await leaseIngestion(app);
     expect(lease.ingestionId).toBe(ingestionId);
@@ -466,6 +440,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
             {
               event_id: crypto.randomUUID(),
               event_type: "INGESTION_COMPLETED",
+              object_id: "OBJ-20260213-OOO001",
               timestamp: new Date().toISOString(),
               payload: {
                 title: "Out of order object",
@@ -503,7 +478,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
   });
 
   test("does not duplicate object or ingest_json artifact on repeated completion events", async () => {
-    const app = createApp();
+    const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
     const lease = await leaseIngestion(app);
     expect(lease.ingestionId).toBe(ingestionId);
@@ -515,6 +490,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
         ingest: { ingest_id: "ING-repeat" },
       },
     };
+    const completionObjectId = "OBJ-20260213-IDEMP01";
 
     const first = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
@@ -529,6 +505,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
             {
               event_id: crypto.randomUUID(),
               event_type: "INGESTION_COMPLETED",
+              object_id: completionObjectId,
               timestamp: new Date().toISOString(),
               payload: completionPayload,
             },
@@ -552,6 +529,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
             {
               event_id: crypto.randomUUID(),
               event_type: "INGESTION_COMPLETED",
+              object_id: completionObjectId,
               timestamp: new Date().toISOString(),
               payload: completionPayload,
             },
@@ -580,6 +558,82 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
       )) as Array<{ id: string }>;
 
       expect(artifacts.length).toBe(1);
+    } finally {
+      await sql.close();
+    }
+  });
+
+  test("does not create duplicate objects under concurrent completion requests", async () => {
+    const app = createTestApp();
+    const ingestionId = await createQueuedIngestion(app, authToken);
+    const lease = await leaseIngestion(app);
+    expect(lease.ingestionId).toBe(ingestionId);
+
+    const requestBodyOne = JSON.stringify({
+      lease_token: lease.leaseToken,
+      events: [
+        {
+          event_id: crypto.randomUUID(),
+          event_type: "INGESTION_COMPLETED",
+          object_id: "OBJ-20260213-CONCUR1",
+          timestamp: new Date().toISOString(),
+          payload: {
+            title: "Concurrent completion A",
+          },
+        },
+      ],
+    });
+
+    const requestBodyTwo = JSON.stringify({
+      lease_token: lease.leaseToken,
+      events: [
+        {
+          event_id: crypto.randomUUID(),
+          event_type: "INGESTION_COMPLETED",
+          object_id: "OBJ-20260213-CONCUR1",
+          timestamp: new Date().toISOString(),
+          payload: {
+            title: "Concurrent completion B",
+          },
+        },
+      ],
+    });
+
+    const [responseOne, responseTwo] = await Promise.all([
+      app.fetch(
+        new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+          method: "POST",
+          headers: {
+            "x-worker-auth-token": "worker-secret",
+            "content-type": "application/json",
+          },
+          body: requestBodyOne,
+        }),
+      ),
+      app.fetch(
+        new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+          method: "POST",
+          headers: {
+            "x-worker-auth-token": "worker-secret",
+            "content-type": "application/json",
+          },
+          body: requestBodyTwo,
+        }),
+      ),
+    ]);
+
+    expect(responseOne.status).toBe(200);
+    expect(responseTwo.status).toBe(200);
+
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+    try {
+      const objectsTable = qualifiedTable(schema, "objects");
+      const objects = (await sql.unsafe(
+        `SELECT object_id FROM ${objectsTable} WHERE source_ingestion_id = $1`,
+        [ingestionId],
+      )) as Array<{ object_id: string }>;
+
+      expect(objects.length).toBe(1);
     } finally {
       await sql.close();
     }

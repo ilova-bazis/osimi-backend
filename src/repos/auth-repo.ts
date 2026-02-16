@@ -1,5 +1,5 @@
-import { db, qualifiedTableName } from "../db/runtime.ts";
 import type { UserRole } from "../auth/types.ts";
+import { withSchemaClient } from "../db/client.ts";
 
 type AuthAuditEventType =
   | "LOGIN_SUCCEEDED"
@@ -73,18 +73,29 @@ export async function findLoginCandidates(
   usernameNormalized: string,
   tenantId?: string,
 ): Promise<LoginCandidate[]> {
-  const sql = db();
-  const usersTable = qualifiedTableName("users");
-  const tenantsTable = qualifiedTableName("tenants");
-  const membershipsTable = qualifiedTableName("tenant_memberships");
+  const rows = await withSchemaClient(async (sql) => {
+    if (tenantId) {
+      return await sql<LoginCandidateRow[]>`
+        SELECT
+          u.id AS user_id,
+          u.username,
+          u.password_hash,
+          tm.tenant_id,
+          tm.role,
+          tm.id AS membership_id
+        FROM users u
+        INNER JOIN tenant_memberships tm ON tm.user_id = u.id
+        INNER JOIN tenants t ON t.id = tm.tenant_id
+        WHERE u.username_normalized = ${usernameNormalized}
+          AND tm.tenant_id = ${tenantId}
+          AND u.is_active = true
+          AND tm.is_active = true
+          AND t.is_active = true
+        ORDER BY tm.created_at ASC
+      `;
+    }
 
-  const tenantClause = tenantId ? " AND tm.tenant_id = $2" : "";
-  const values = tenantId
-    ? [usernameNormalized, tenantId]
-    : [usernameNormalized];
-
-  const rows = (await sql.unsafe(
-    `
+    return await sql<LoginCandidateRow[]>`
       SELECT
         u.id AS user_id,
         u.username,
@@ -92,30 +103,28 @@ export async function findLoginCandidates(
         tm.tenant_id,
         tm.role,
         tm.id AS membership_id
-      FROM ${usersTable} u
-      INNER JOIN ${membershipsTable} tm ON tm.user_id = u.id
-      INNER JOIN ${tenantsTable} t ON t.id = tm.tenant_id
-      WHERE u.username_normalized = $1
+      FROM users u
+      INNER JOIN tenant_memberships tm ON tm.user_id = u.id
+      INNER JOIN tenants t ON t.id = tm.tenant_id
+      WHERE u.username_normalized = ${usernameNormalized}
         AND u.is_active = true
         AND tm.is_active = true
         AND t.is_active = true
-        ${tenantClause}
       ORDER BY tm.created_at ASC
-    `,
-    values,
-  )) as LoginCandidateRow[];
+    `;
+  });
 
   return rows.map(mapLoginCandidate);
 }
 
 export async function updateUserLastLoginAt(userId: string): Promise<void> {
-  const sql = db();
-  const usersTable = qualifiedTableName("users");
-
-  await sql.unsafe(
-    `UPDATE ${usersTable} SET last_login_at = now(), updated_at = now() WHERE id = $1`,
-    [userId],
-  );
+  await withSchemaClient(async (sql) => {
+    await sql`
+      UPDATE users
+      SET last_login_at = now(), updated_at = now()
+      WHERE id = ${userId}
+    `;
+  });
 }
 
 export async function createSession(params: {
@@ -128,12 +137,9 @@ export async function createSession(params: {
   ip?: string;
   userAgent?: string;
 }): Promise<void> {
-  const sql = db();
-  const sessionsTable = qualifiedTableName("auth_sessions");
-
-  await sql.unsafe(
-    `
-      INSERT INTO ${sessionsTable} (
+  await withSchemaClient(async (sql) => {
+    await sql`
+      INSERT INTO auth_sessions (
         id,
         session_token_hash,
         user_id,
@@ -143,32 +149,25 @@ export async function createSession(params: {
         ip,
         user_agent
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    `,
-    [
-      params.sessionId,
-      params.tokenHash,
-      params.userId,
-      params.tenantId,
-      params.membershipId,
-      params.expiresAt.toISOString(),
-      params.ip ?? null,
-      params.userAgent ?? null,
-    ],
-  );
+      VALUES (
+        ${params.sessionId},
+        ${params.tokenHash},
+        ${params.userId},
+        ${params.tenantId},
+        ${params.membershipId},
+        ${params.expiresAt.toISOString()},
+        ${params.ip ?? null},
+        ${params.userAgent ?? null}
+      )
+    `;
+  });
 }
 
 export async function findActiveSessionByTokenHash(
   tokenHash: string,
 ): Promise<ActiveSession | undefined> {
-  const sql = db();
-  const sessionsTable = qualifiedTableName("auth_sessions");
-  const usersTable = qualifiedTableName("users");
-  const tenantsTable = qualifiedTableName("tenants");
-  const membershipsTable = qualifiedTableName("tenant_memberships");
-
-  const rows = (await sql.unsafe(
-    `
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<ActiveSessionRow[]>`
       SELECT
         s.id AS session_id,
         s.user_id,
@@ -177,11 +176,11 @@ export async function findActiveSessionByTokenHash(
         tm.role,
         s.issued_at,
         s.last_seen_at
-      FROM ${sessionsTable} s
-      INNER JOIN ${usersTable} u ON u.id = s.user_id
-      INNER JOIN ${tenantsTable} t ON t.id = s.tenant_id
-      INNER JOIN ${membershipsTable} tm ON tm.id = s.membership_id
-      WHERE s.session_token_hash = $1
+      FROM auth_sessions s
+      INNER JOIN users u ON u.id = s.user_id
+      INNER JOIN tenants t ON t.id = s.tenant_id
+      INNER JOIN tenant_memberships tm ON tm.id = s.membership_id
+      WHERE s.session_token_hash = ${tokenHash}
         AND s.revoked_at IS NULL
         AND s.expires_at > now()
         AND u.is_active = true
@@ -190,9 +189,8 @@ export async function findActiveSessionByTokenHash(
         AND tm.user_id = s.user_id
         AND tm.tenant_id = s.tenant_id
       LIMIT 1
-    `,
-    [tokenHash],
-  )) as ActiveSessionRow[];
+    `;
+  });
 
   const row = rows.at(0);
 
@@ -204,31 +202,27 @@ export async function findActiveSessionByTokenHash(
 }
 
 export async function touchSessionLastSeenAt(sessionId: string): Promise<void> {
-  const sql = db();
-  const sessionsTable = qualifiedTableName("auth_sessions");
-
-  await sql.unsafe(
-    `UPDATE ${sessionsTable} SET last_seen_at = now() WHERE id = $1`,
-    [sessionId],
-  );
+  await withSchemaClient(async (sql) => {
+    await sql`
+      UPDATE auth_sessions
+      SET last_seen_at = now()
+      WHERE id = ${sessionId}
+    `;
+  });
 }
 
 export async function revokeSessionByTokenHash(
   tokenHash: string,
 ): Promise<boolean> {
-  const sql = db();
-  const sessionsTable = qualifiedTableName("auth_sessions");
-
-  const rows = (await sql.unsafe(
-    `
-      UPDATE ${sessionsTable}
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<Array<{ id: string }>>`
+      UPDATE auth_sessions
       SET revoked_at = now(), revoked_reason = 'logout'
-      WHERE session_token_hash = $1
+      WHERE session_token_hash = ${tokenHash}
         AND revoked_at IS NULL
       RETURNING id
-    `,
-    [tokenHash],
-  )) as Array<{ id: string }>;
+    `;
+  });
 
   return rows.length > 0;
 }
@@ -246,12 +240,9 @@ export async function insertAuthAuditEvent(params: {
   userAgent?: string;
   payload?: Record<string, unknown>;
 }): Promise<void> {
-  const sql = db();
-  const auditTable = qualifiedTableName("auth_audit_events");
-
-  await sql.unsafe(
-    `
-      INSERT INTO ${auditTable} (
+  await withSchemaClient(async (sql) => {
+    await sql`
+      INSERT INTO auth_audit_events (
         id,
         request_id,
         event_type,
@@ -265,23 +256,22 @@ export async function insertAuthAuditEvent(params: {
         user_agent,
         payload
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
-    `,
-    [
-      crypto.randomUUID(),
-      params.requestId,
-      params.eventType,
-      params.success,
-      params.tenantId ?? null,
-      params.userId ?? null,
-      params.sessionId ?? null,
-      params.usernameNormalized ?? null,
-      params.errorCode ?? null,
-      params.ip ?? null,
-      params.userAgent ?? null,
-      JSON.stringify(params.payload ?? {}),
-    ],
-  );
+      VALUES (
+        ${crypto.randomUUID()},
+        ${params.requestId},
+        ${params.eventType},
+        ${params.success},
+        ${params.tenantId ?? null},
+        ${params.userId ?? null},
+        ${params.sessionId ?? null},
+        ${params.usernameNormalized ?? null},
+        ${params.errorCode ?? null},
+        ${params.ip ?? null},
+        ${params.userAgent ?? null},
+        CAST(${JSON.stringify(params.payload ?? {})} AS jsonb)
+      )
+    `;
+  });
 }
 
 interface TenantRow {
@@ -305,12 +295,14 @@ function mapTenant(row: TenantRow): TenantSummary {
 }
 
 export async function findAllActiveTenants(): Promise<TenantSummary[]> {
-  const sql = db();
-  const tenantsTable = qualifiedTableName("tenants");
-
-  const rows = (await sql.unsafe(
-    `SELECT id, slug, name FROM ${tenantsTable} WHERE is_active = true ORDER BY name`,
-  )) as TenantRow[];
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<TenantRow[]>`
+      SELECT id, slug, name
+      FROM tenants
+      WHERE is_active = true
+      ORDER BY name
+    `;
+  });
 
   return rows.map(mapTenant);
 }
@@ -338,13 +330,14 @@ function mapUser(row: UserRow): UserSummary {
 export async function findUserByUsername(
   usernameNormalized: string,
 ): Promise<UserSummary | undefined> {
-  const sql = db();
-  const usersTable = qualifiedTableName("users");
-
-  const rows = (await sql.unsafe(
-    `SELECT id, username, username_normalized FROM ${usersTable} WHERE username_normalized = $1 LIMIT 1`,
-    [usernameNormalized],
-  )) as UserRow[];
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<UserRow[]>`
+      SELECT id, username, username_normalized
+      FROM users
+      WHERE username_normalized = ${usernameNormalized}
+      LIMIT 1
+    `;
+  });
 
   const row = rows.at(0);
   if (!row) {
@@ -363,30 +356,35 @@ export async function createUser(params: {
   role: UserRole;
   membershipId: string;
 }): Promise<void> {
-  const sql = db();
-  const usersTable = qualifiedTableName("users");
-  const membershipsTable = qualifiedTableName("tenant_memberships");
+  await withSchemaClient(async (sql) => {
+    await sql.begin(async (tx) => {
+      await tx`
+            INSERT INTO users (id, username, username_normalized, password_hash, is_active, created_at, updated_at)
+            VALUES (
+              ${params.userId},
+              ${params.username},
+              ${params.usernameNormalized},
+              ${params.passwordHash},
+              true,
+              now(),
+              now()
+            )
+          `;
 
-  await sql.unsafe(
-    `
-      INSERT INTO ${usersTable} (id, username, username_normalized, password_hash, is_active, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, true, now(), now())
-    `,
-    [
-      params.userId,
-      params.username,
-      params.usernameNormalized,
-      params.passwordHash,
-    ],
-  );
-
-  await sql.unsafe(
-    `
-      INSERT INTO ${membershipsTable} (id, tenant_id, user_id, role, is_active, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, true, now(), now())
-    `,
-    [params.membershipId, params.tenantId, params.userId, params.role],
-  );
+      await tx`
+            INSERT INTO tenant_memberships (id, tenant_id, user_id, role, is_active, created_at, updated_at)
+            VALUES (
+              ${params.membershipId},
+              ${params.tenantId},
+              ${params.userId},
+              ${params.role},
+              true,
+              now(),
+              now()
+            )
+          `;
+    });
+  });
 }
 
 interface UserWithRoleRow {
@@ -412,26 +410,21 @@ function mapUserWithRole(row: UserWithRoleRow): UserWithRole {
 export async function findUsersByTenant(
   tenantId: string,
 ): Promise<UserWithRole[]> {
-  const sql = db();
-  const usersTable = qualifiedTableName("users");
-  const membershipsTable = qualifiedTableName("tenant_memberships");
-
-  const rows = (await sql.unsafe(
-    `
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<UserWithRoleRow[]>`
       SELECT
         u.id,
         u.username,
         u.username_normalized,
         tm.role
-      FROM ${usersTable} u
-      INNER JOIN ${membershipsTable} tm ON tm.user_id = u.id
-      WHERE tm.tenant_id = $1
+      FROM users u
+      INNER JOIN tenant_memberships tm ON tm.user_id = u.id
+      WHERE tm.tenant_id = ${tenantId}
         AND u.is_active = true
         AND tm.is_active = true
       ORDER BY u.username
-    `,
-    [tenantId],
-  )) as UserWithRoleRow[];
+    `;
+  });
 
   return rows.map(mapUserWithRole);
 }
@@ -440,13 +433,16 @@ export async function getUserRole(
   userId: string,
   tenantId: string,
 ): Promise<UserRole | undefined> {
-  const sql = db();
-  const membershipsTable = qualifiedTableName("tenant_memberships");
-
-  const rows = (await sql.unsafe(
-    `SELECT role FROM ${membershipsTable} WHERE user_id = $1 AND tenant_id = $2 AND is_active = true LIMIT 1`,
-    [userId, tenantId],
-  )) as Array<{ role: UserRole }>;
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<Array<{ role: UserRole }>>`
+      SELECT role
+      FROM tenant_memberships
+      WHERE user_id = ${userId}
+        AND tenant_id = ${tenantId}
+        AND is_active = true
+      LIMIT 1
+    `;
+  });
 
   return rows[0]?.role;
 }
@@ -455,13 +451,13 @@ export async function updateUserPassword(
   userId: string,
   passwordHash: string,
 ): Promise<void> {
-  const sql = db();
-  const usersTable = qualifiedTableName("users");
-
-  await sql.unsafe(
-    `UPDATE ${usersTable} SET password_hash = $1, updated_at = now() WHERE id = $2`,
-    [passwordHash, userId],
-  );
+  await withSchemaClient(async (sql) => {
+    await sql`
+      UPDATE users
+      SET password_hash = ${passwordHash}, updated_at = now()
+      WHERE id = ${userId}
+    `;
+  });
 }
 
 export async function updateUserRole(
@@ -469,21 +465,22 @@ export async function updateUserRole(
   tenantId: string,
   role: UserRole,
 ): Promise<void> {
-  const sql = db();
-  const membershipsTable = qualifiedTableName("tenant_memberships");
-
-  await sql.unsafe(
-    `UPDATE ${membershipsTable} SET role = $1, updated_at = now() WHERE user_id = $2 AND tenant_id = $3`,
-    [role, userId, tenantId],
-  );
+  await withSchemaClient(async (sql) => {
+    await sql`
+      UPDATE tenant_memberships
+      SET role = ${role}, updated_at = now()
+      WHERE user_id = ${userId}
+        AND tenant_id = ${tenantId}
+    `;
+  });
 }
 
 export async function deleteUser(userId: string): Promise<void> {
-  const sql = db();
-  const usersTable = qualifiedTableName("users");
-
-  await sql.unsafe(
-    `UPDATE ${usersTable} SET is_active = false, updated_at = now() WHERE id = $1`,
-    [userId],
-  );
+  await withSchemaClient(async (sql) => {
+    await sql`
+      UPDATE users
+      SET is_active = false, updated_at = now()
+      WHERE id = ${userId}
+    `;
+  });
 }
