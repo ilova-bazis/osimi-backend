@@ -360,22 +360,17 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
     const sql = createSqlClient(TEST_DATABASE_URL!);
     try {
       const objectsTable = qualifiedTable(schema, "objects");
-      const artifactsTable = qualifiedTable(schema, "object_artifacts");
       const eventsTable = qualifiedTable(schema, "object_events");
 
       const objectRows = (await sql.unsafe(
-        `SELECT object_id FROM ${objectsTable} WHERE source_ingestion_id = $1`,
+        `SELECT object_id, ingest_manifest FROM ${objectsTable} WHERE source_ingestion_id = $1`,
         [ingestionId],
-      )) as Array<{ object_id: string }>;
+      )) as Array<{ object_id: string; ingest_manifest: unknown }>;
 
       expect(objectRows.length).toBe(1);
-
-      const artifactRows = (await sql.unsafe(
-        `SELECT id FROM ${artifactsTable} WHERE object_id = $1 AND kind = 'ingest_json'`,
-        [objectRows[0]!.object_id],
-      )) as Array<{ id: string }>;
-
-      expect(artifactRows.length).toBe(1);
+      expect(objectRows[0]?.ingest_manifest).toMatchObject({
+        schema_version: "1.0",
+      });
 
       const eventRows = (await sql.unsafe(
         `SELECT id FROM ${eventsTable} WHERE ingestion_id = $1`,
@@ -419,6 +414,124 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
     );
 
     expect(response.status).toBe(401);
+  });
+
+  test("rejects completion event without object_id", async () => {
+    const app = createTestApp();
+    const ingestionId = await createQueuedIngestion(app, authToken);
+    const lease = await leaseIngestion(app);
+    expect(lease.ingestionId).toBe(ingestionId);
+
+    const response = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          lease_token: lease.leaseToken,
+          events: [
+            {
+              event_id: crypto.randomUUID(),
+              event_type: "INGESTION_COMPLETED",
+              timestamp: new Date().toISOString(),
+              payload: {
+                title: "Missing object id",
+              },
+            },
+          ],
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as {
+      error: {
+        code: string;
+        message: string;
+      };
+    };
+    expect(body.error.code).toBe("BAD_REQUEST");
+  });
+
+  test("rejects completion event with invalid object_id format", async () => {
+    const app = createTestApp();
+    const ingestionId = await createQueuedIngestion(app, authToken);
+    const lease = await leaseIngestion(app);
+    expect(lease.ingestionId).toBe(ingestionId);
+
+    const response = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          lease_token: lease.leaseToken,
+          events: [
+            {
+              event_id: crypto.randomUUID(),
+              event_type: "INGESTION_COMPLETED",
+              object_id: "not-an-object-id",
+              timestamp: new Date().toISOString(),
+              payload: {
+                title: "Invalid object id",
+              },
+            },
+          ],
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as {
+      error: {
+        code: string;
+        message: string;
+      };
+    };
+    expect(body.error.code).toBe("BAD_REQUEST");
+  });
+
+  test("rejects invalid event_type in worker events", async () => {
+    const app = createTestApp();
+    const ingestionId = await createQueuedIngestion(app, authToken);
+    const lease = await leaseIngestion(app);
+    expect(lease.ingestionId).toBe(ingestionId);
+
+    const response = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          lease_token: lease.leaseToken,
+          events: [
+            {
+              event_id: crypto.randomUUID(),
+              event_type: "UNKNOWN_EVENT_TYPE",
+              timestamp: new Date().toISOString(),
+              payload: {
+                title: "Invalid event type",
+              },
+            },
+          ],
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as {
+      error: {
+        code: string;
+        message: string;
+      };
+    };
+    expect(body.error.code).toBe("BAD_REQUEST");
   });
 
   test("accepts out-of-order events and keeps ingestion completed", async () => {
@@ -477,7 +590,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
     expect(detailBody.ingestion.status).toBe("COMPLETED");
   });
 
-  test("does not duplicate object or ingest_json artifact on repeated completion events", async () => {
+  test("does not duplicate object and keeps latest ingest manifest on repeated completion events", async () => {
     const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
     const lease = await leaseIngestion(app);
@@ -488,6 +601,13 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
       ingest_json: {
         schema_version: "1.0",
         ingest: { ingest_id: "ING-repeat" },
+      },
+    };
+    const completionPayloadUpdated = {
+      title: "Idempotent completion object",
+      ingest_json: {
+        schema_version: "2.0",
+        ingest: { ingest_id: "ING-repeat-updated" },
       },
     };
     const completionObjectId = "OBJ-20260213-IDEMP01";
@@ -507,7 +627,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
               event_type: "INGESTION_COMPLETED",
               object_id: completionObjectId,
               timestamp: new Date().toISOString(),
-              payload: completionPayload,
+              payload: completionPayloadUpdated,
             },
           ],
         }),
@@ -543,21 +663,16 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
     const sql = createSqlClient(TEST_DATABASE_URL!);
     try {
       const objectsTable = qualifiedTable(schema, "objects");
-      const artifactsTable = qualifiedTable(schema, "object_artifacts");
-
       const objects = (await sql.unsafe(
-        `SELECT object_id FROM ${objectsTable} WHERE source_ingestion_id = $1`,
+        `SELECT object_id, ingest_manifest FROM ${objectsTable} WHERE source_ingestion_id = $1`,
         [ingestionId],
-      )) as Array<{ object_id: string }>;
+      )) as Array<{ object_id: string; ingest_manifest: unknown }>;
 
       expect(objects.length).toBe(1);
-
-      const artifacts = (await sql.unsafe(
-        `SELECT id FROM ${artifactsTable} WHERE object_id = $1 AND kind = 'ingest_json'`,
-        [objects[0]!.object_id],
-      )) as Array<{ id: string }>;
-
-      expect(artifacts.length).toBe(1);
+      expect(objects[0]?.ingest_manifest).toMatchObject({
+        schema_version: "1.0",
+        ingest: { ingest_id: "ING-repeat" },
+      });
     } finally {
       await sql.close();
     }

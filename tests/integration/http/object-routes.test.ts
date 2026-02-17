@@ -113,10 +113,10 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
 
       await sql.unsafe(
         `
-          INSERT INTO ${objectsTable} (object_id, tenant_id, type, title, metadata, source_ingestion_id, status)
+          INSERT INTO ${objectsTable} (object_id, tenant_id, type, title, metadata, ingest_manifest, source_ingestion_id, status)
           VALUES
-            ($1, $2, 'DOCUMENT', $3, $4::jsonb, NULL, 'ACTIVE'),
-            ($5, $6, 'IMAGE', $7, $8::jsonb, NULL, 'ACTIVE')
+            ($1, $2, 'DOCUMENT', $3, $4::jsonb, '{"schema_version":"1.0","ingest":{"ingest_id":"ING-object-routes"}}'::jsonb, NULL, 'ACTIVE'),
+            ($5, $6, 'IMAGE', $7, $8::jsonb, NULL, NULL, 'ACTIVE')
         `,
         [
           tenantOneObjectId,
@@ -133,7 +133,7 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
       await sql.unsafe(
         `
           INSERT INTO ${artifactsTable} (id, object_id, kind, storage_key, content_type, size_bytes)
-          VALUES ($1, $2, 'ingest_json', $3, 'application/json', $4)
+          VALUES ($1, $2, 'metadata', $3, 'application/json', $4)
         `,
         [artifactId, tenantOneObjectId, artifactStorageKey, 18],
       );
@@ -206,11 +206,12 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
-      objects: Array<{ object_id: string }>;
+      objects: Array<{ object_id: string; ingest_manifest?: unknown }>;
     };
 
     expect(body.objects.length).toBe(1);
     expect(body.objects[0]?.object_id).toBe(tenantOneObjectId);
+    expect(Object.prototype.hasOwnProperty.call(body.objects[0] ?? {}, "ingest_manifest")).toBe(false);
   });
 
   test("returns object detail and blocks cross-tenant object", async () => {
@@ -226,6 +227,14 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
     );
 
     expect(okResponse.status).toBe(200);
+    const okBody = (await okResponse.json()) as {
+      object: {
+        ingest_manifest: {
+          schema_version: string;
+        } | null;
+      };
+    };
+    expect(okBody.object.ingest_manifest?.schema_version).toBe("1.0");
 
     const notFoundResponse = await app.fetch(
       new Request(`http://localhost/api/objects/${tenantTwoObjectId}`, {

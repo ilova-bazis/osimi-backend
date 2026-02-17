@@ -6,7 +6,7 @@ import {
   requireObject,
   requireOptionalStringField,
   requireStringField,
-} from "../http/validation.ts";
+} from "../validation/common.ts";
 import type { RouteDefinition } from "./types.ts";
 
 function parseLoginBody(payload: unknown): { username: string; password: string; tenantId?: string } {

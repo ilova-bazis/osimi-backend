@@ -10,6 +10,7 @@ This document captures the implementation stack for the Osimi backend (VPS contr
 ## Language
 
 - TypeScript
+- Zod 4 for runtime schema validation
 
 ## Database
 

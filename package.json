@@ -8,12 +8,16 @@
     "start": "bun run index.ts",
     "test": "bun test",
     "migrate": "bun run src/db/migrate.ts",
-    "create-user": "bun run src/cli/create-user.ts"
+    "create-user": "bun run src/cli/create-user.ts",
+    "create-tenant": "bun run src/cli/create-tenant.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^5"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
   }
 }

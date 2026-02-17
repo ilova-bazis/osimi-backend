@@ -152,10 +152,12 @@ CREATE TABLE IF NOT EXISTS objects (
   type object_type NOT NULL DEFAULT 'GENERIC',
   title text NOT NULL DEFAULT '',
   metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  ingest_manifest jsonb,
   source_ingestion_id uuid REFERENCES ingestions(id) ON DELETE SET NULL,
   status object_status NOT NULL DEFAULT 'ACTIVE',
   created_at timestamptz NOT NULL DEFAULT now(),
-  CHECK (object_id ~ '^OBJ-[0-9]{8}-[A-Z0-9]+$')
+  CHECK (object_id ~ '^OBJ-[0-9]{8}-[A-Z0-9]+$'),
+  CHECK (ingest_manifest IS NULL OR jsonb_typeof(ingest_manifest) = 'object')
 );
 
 CREATE INDEX IF NOT EXISTS objects_tenant_created_idx

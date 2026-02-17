@@ -1,6 +1,6 @@
 import { requireRole, requireTenantScope } from "../auth/guards.ts";
 import { jsonResponse } from "../http/response.ts";
-import { parseJsonBody } from "../http/validation.ts";
+import { parseJsonBody } from "../validation/common.ts";
 import {
   downloadObjectArtifactForTenant,
   getObjectDetail,

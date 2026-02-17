@@ -69,6 +69,16 @@ describe("database migrations", () => {
         expect(indexNames.includes("ingestion_leases_one_active_idx")).toBe(
           true,
         );
+
+        const columnRows = (await sql.unsafe(`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = ${asSqlLiteral(schema)}
+          AND table_name = 'objects'
+      `)) as Array<{ column_name: string }>;
+
+        const columnNames = new Set(columnRows.map((row) => row.column_name));
+        expect(columnNames.has("ingest_manifest")).toBe(true);
       } finally {
         await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
         await sql.close();

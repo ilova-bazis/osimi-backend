@@ -1,7 +1,7 @@
 import { rm } from "node:fs/promises";
 
 import { listStagingCleanupCandidates, listStuckIngestions } from "../repos/ingestion-repo.ts";
-import { resolveStagingPath } from "../storage/index.ts";
+import { resolveStagingPath } from "../storage/staging.ts";
 
 export interface StagingRetentionConfig {
   completedRetentionDays: number;

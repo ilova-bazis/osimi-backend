@@ -158,8 +158,7 @@ Backend must support:
 ### Ingest Manifest Artifact
 
 - The worker must upload `ingest.json` on successful completion
-- `ingest.json` is stored as an object artifact (`kind = ingest_json`)
-- Storage key follows object artifact layout (e.g., `tenants/{tenant}/objects/{object_id}/artifacts/ingest.json`)
+- `ingest.json` is stored on the object record as `objects.ingest_manifest` (`jsonb`)
 - `ingest.json` is retained permanently as part of the object record
 - VPS may use `ingest.json` to reconcile or validate event history
 

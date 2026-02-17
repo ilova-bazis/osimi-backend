@@ -1,6 +1,4 @@
-import { requireWorkerAuthentication } from "../auth/worker.ts";
 import { jsonResponse } from "../http/response.ts";
-import { parseJsonBody } from "../http/validation.ts";
 import { ingestWorkerEvents } from "../services/event-service.ts";
 import {
   downloadStagedFileByToken,
@@ -8,57 +6,56 @@ import {
   leaseNextIngestion,
   releaseActiveLease,
 } from "../services/lease-service.ts";
+import { parseIngestWorkerEventsBody } from "../validation/event.ts";
+import { parseLeaseTokenBody } from "../validation/lease.ts";
+import { withWorkerAuth, withWorkerAuthorizedLease } from "./middleware.ts";
 import { extractPathParam } from "./params.ts";
 import type { RouteDefinition } from "./types.ts";
 
 const leaseRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/lease",
-  handler: async (request, _context) => {
-    const worker = requireWorkerAuthentication(request);
-
+  handler: withWorkerAuth(async (_request, _context, worker) => {
     return jsonResponse(
       await leaseNextIngestion({
         workerId: worker.workerId,
       }),
     );
-  },
+  }),
 };
 
 const heartbeatRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/lease/heartbeat",
-  handler: async (request, _context) => {
-    requireWorkerAuthentication(request);
-    const pathname = new URL(request.url).pathname;
-    const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/lease\/heartbeat$/, "id");
-    const body = await parseJsonBody(request);
-
-    return jsonResponse(
-      await heartbeatLease({
-        ingestionId,
-        body,
-      }),
-    );
-  },
+  handler: withWorkerAuthorizedLease({
+    pathPattern: /^\/api\/ingestions\/([^/]+)\/lease\/heartbeat$/,
+    pathParamName: "id",
+    parseBody: parseLeaseTokenBody,
+    handler: async (_request, _context, data) => {
+      return jsonResponse(
+        await heartbeatLease({
+          authorizedLease: data.authorizedLease,
+        }),
+      );
+    },
+  }),
 };
 
 const releaseRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/lease/release",
-  handler: async (request, _context) => {
-    requireWorkerAuthentication(request);
-    const pathname = new URL(request.url).pathname;
-    const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/lease\/release$/, "id");
-    const body = await parseJsonBody(request);
-
-    return jsonResponse(
-      await releaseActiveLease({
-        ingestionId,
-        body,
-      }),
-    );
-  },
+  handler: withWorkerAuthorizedLease({
+    pathPattern: /^\/api\/ingestions\/([^/]+)\/lease\/release$/,
+    pathParamName: "id",
+    parseBody: parseLeaseTokenBody,
+    handler: async (_request, _context, data) => {
+      return jsonResponse(
+        await releaseActiveLease({
+          authorizedLease: data.authorizedLease,
+        }),
+      );
+    },
+  }),
 };
 
 const workerDownloadRoute: RouteDefinition = {
@@ -74,19 +71,19 @@ const workerDownloadRoute: RouteDefinition = {
 const workerEventsRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/events",
-  handler: async (request, _context) => {
-    requireWorkerAuthentication(request);
-    const pathname = new URL(request.url).pathname;
-    const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/events$/, "id");
-    const body = await parseJsonBody(request);
-
-    return jsonResponse(
-      await ingestWorkerEvents({
-        ingestionId,
-        body,
-      }),
-    );
-  },
+  handler: withWorkerAuthorizedLease({
+    pathPattern: /^\/api\/ingestions\/([^/]+)\/events$/,
+    pathParamName: "id",
+    parseBody: parseIngestWorkerEventsBody,
+    handler: async (_request, _context, data) => {
+      return jsonResponse(
+        await ingestWorkerEvents({
+          authorizedLease: data.authorizedLease,
+          events: data.body.events,
+        }),
+      );
+    },
+  }),
 };
 
 export const leaseRoutes: RouteDefinition[] = [

@@ -484,3 +484,31 @@ export async function deleteUser(userId: string): Promise<void> {
     `;
   });
 }
+
+export async function findTenantBySlug(slug: string): Promise<TenantSummary | undefined> {
+  return await withSchemaClient(async (sql) => {
+    const rows = await sql<TenantRow[]>`
+      SELECT id, slug, name FROM tenants WHERE slug = ${slug} LIMIT 1
+    `;
+
+    const row = rows.at(0);
+    if (!row) {
+      return undefined;
+    }
+
+    return mapTenant(row);
+  });
+}
+
+export async function createTenant(params: {
+  tenantId: string;
+  slug: string;
+  name: string;
+}): Promise<void> {
+  await withSchemaClient(async (sql) => {
+    await sql`
+      INSERT INTO tenants (id, slug, name, is_active, created_at, updated_at)
+      VALUES (${params.tenantId}, ${params.slug}, ${params.name}, true, now(), now())
+    `;
+  });
+}

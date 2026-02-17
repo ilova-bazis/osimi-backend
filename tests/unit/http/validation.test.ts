@@ -9,7 +9,7 @@ import {
   requirePositiveIntField,
   requireStringField,
   requireUuid,
-} from "../../../src/http/validation.ts";
+} from "../../../src/validation/common.ts";
 
 describe("http validation helpers", () => {
   test("parses valid JSON body", async () => {

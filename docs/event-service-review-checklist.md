@@ -56,9 +56,8 @@ Target file: `src/services/event-service.ts`
 
 ### 6) Artifact handling
 
-- [ ] Confirm `ingest_json` artifact storage is idempotent.
-- [ ] Confirm no duplicate `ingest_json` artifacts are inserted.
-- [ ] Confirm storage key layout is correct and deterministic.
+- [ ] Confirm `ingest_json` is persisted into `objects.ingest_manifest`.
+- [ ] Confirm repeated completion events follow last-write-wins for `objects.ingest_manifest`.
 
 ### 7) Response contract
 

@@ -6,6 +6,7 @@ interface ObjectRow {
   type: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
   title: string;
   metadata: unknown;
+  ingest_manifest: unknown;
   source_ingestion_id: string | null;
   status: "ACTIVE" | "ARCHIVED" | "DELETED";
   created_at: Date;
@@ -27,6 +28,7 @@ export interface ObjectRecord {
   type: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
   title: string;
   metadata: unknown;
+  ingestManifest?: Record<string, unknown>;
   sourceIngestionId?: string;
   status: "ACTIVE" | "ARCHIVED" | "DELETED";
   createdAt: Date;
@@ -60,6 +62,12 @@ function mapObject(row: ObjectRow): ObjectRecord {
     type: row.type,
     title: row.title,
     metadata: row.metadata,
+    ingestManifest:
+      row.ingest_manifest &&
+      typeof row.ingest_manifest === "object" &&
+      !Array.isArray(row.ingest_manifest)
+        ? (row.ingest_manifest as Record<string, unknown>)
+        : undefined,
     sourceIngestionId: row.source_ingestion_id ?? undefined,
     status: row.status,
     createdAt: new Date(row.created_at),
@@ -84,7 +92,7 @@ export async function findObjectBySourceIngestion(params: {
 }): Promise<ObjectRecord | undefined> {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<ObjectRow[]>`
-      SELECT object_id, tenant_id, type, title, metadata, source_ingestion_id, status, created_at
+      SELECT object_id, tenant_id, type, title, metadata, ingest_manifest, source_ingestion_id, status, created_at
       FROM objects
       WHERE tenant_id = ${params.tenantId}
         AND source_ingestion_id = ${params.ingestionId}
@@ -121,11 +129,11 @@ export async function createObject(params: {
         ${params.tenantId},
         ${params.type ?? "GENERIC"},
         ${params.title ?? ""},
-        CAST(${JSON.stringify(params.metadata ?? {})} AS jsonb),
+        ${params.metadata ?? {}},
         ${params.sourceIngestionId},
         'ACTIVE'
       )
-      RETURNING object_id, tenant_id, type, title, metadata, source_ingestion_id, status, created_at
+      RETURNING object_id, tenant_id, type, title, metadata, ingest_manifest, source_ingestion_id, status, created_at
     `;
   });
 
@@ -140,44 +148,47 @@ export async function createOrGetObjectBySourceIngestion(params: {
   title?: string;
   metadata?: Record<string, unknown>;
 }): Promise<ObjectRecord> {
-  const rows = await withSchemaClient(async (sql) => {
-    return await sql<ObjectRow[]>`
-      WITH inserted AS (
-        INSERT INTO objects (
-          object_id,
-          tenant_id,
-          type,
-          title,
-          metadata,
-          source_ingestion_id,
-          status
-        )
-        VALUES (
-          ${params.objectId},
-          ${params.tenantId},
-          ${params.type ?? "GENERIC"},
-          ${params.title ?? ""},
-          CAST(${JSON.stringify(params.metadata ?? {})} AS jsonb),
-          ${params.sourceIngestionId},
-          'ACTIVE'
-        )
-        ON CONFLICT (source_ingestion_id)
-        WHERE source_ingestion_id IS NOT NULL
-        DO NOTHING
-        RETURNING object_id, tenant_id, type, title, metadata, source_ingestion_id, status, created_at
+  return await withSchemaClient(async (sql) => {
+    const insertedRows = await sql<ObjectRow[]>`
+      INSERT INTO objects (
+        object_id,
+        tenant_id,
+        type,
+        title,
+        metadata,
+        source_ingestion_id,
+        status
       )
-      SELECT object_id, tenant_id, type, title, metadata, source_ingestion_id, status, created_at
-      FROM inserted
-      UNION ALL
-      SELECT object_id, tenant_id, type, title, metadata, source_ingestion_id, status, created_at
+      VALUES (
+        ${params.objectId},
+        ${params.tenantId},
+        ${params.type ?? "GENERIC"},
+        ${params.title ?? ""},
+        ${params.metadata ?? {}},
+        ${params.sourceIngestionId},
+        'ACTIVE'
+      )
+      ON CONFLICT (source_ingestion_id)
+      WHERE source_ingestion_id IS NOT NULL
+      DO NOTHING
+      RETURNING object_id, tenant_id, type, title, metadata, ingest_manifest, source_ingestion_id, status, created_at
+    `;
+
+    const inserted = insertedRows[0];
+    if (inserted) {
+      return mapObject(inserted);
+    }
+
+    const existingRows = await sql<ObjectRow[]>`
+      SELECT object_id, tenant_id, type, title, metadata, ingest_manifest, source_ingestion_id, status, created_at
       FROM objects
       WHERE tenant_id = ${params.tenantId}
         AND source_ingestion_id = ${params.sourceIngestionId}
       LIMIT 1
     `;
-  });
 
-  return mapObject(rows[0]!);
+    return mapObject(existingRows[0]!);
+  });
 }
 
 export async function createObjectArtifact(params: {
@@ -225,7 +236,7 @@ export async function listObjects(
   const rows = await withSchemaClient(async (sql) => {
     if (params.cursorCreatedAt && params.cursorObjectId) {
       return await sql<ObjectRow[]>`
-        SELECT object_id, tenant_id, type, title, metadata, source_ingestion_id, status, created_at
+        SELECT object_id, tenant_id, type, title, metadata, ingest_manifest, source_ingestion_id, status, created_at
         FROM objects
         WHERE tenant_id = ${params.tenantId}
           AND (${params.type ?? null}::object_type IS NULL OR type = ${params.type ?? null}::object_type)
@@ -239,7 +250,7 @@ export async function listObjects(
     }
 
     return await sql<ObjectRow[]>`
-      SELECT object_id, tenant_id, type, title, metadata, source_ingestion_id, status, created_at
+      SELECT object_id, tenant_id, type, title, metadata, ingest_manifest, source_ingestion_id, status, created_at
       FROM objects
       WHERE tenant_id = ${params.tenantId}
         AND (${params.type ?? null}::object_type IS NULL OR type = ${params.type ?? null}::object_type)
@@ -260,7 +271,7 @@ export async function findObjectById(params: {
 }): Promise<ObjectRecord | undefined> {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<ObjectRow[]>`
-      SELECT object_id, tenant_id, type, title, metadata, source_ingestion_id, status, created_at
+      SELECT object_id, tenant_id, type, title, metadata, ingest_manifest, source_ingestion_id, status, created_at
       FROM objects
       WHERE tenant_id = ${params.tenantId}
         AND object_id = ${params.objectId}
@@ -283,7 +294,26 @@ export async function updateObjectTitle(params: {
       SET title = ${params.title}
       WHERE tenant_id = ${params.tenantId}
         AND object_id = ${params.objectId}
-      RETURNING object_id, tenant_id, type, title, metadata, source_ingestion_id, status, created_at
+      RETURNING object_id, tenant_id, type, title, metadata, ingest_manifest, source_ingestion_id, status, created_at
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapObject(row) : undefined;
+}
+
+export async function updateObjectIngestManifest(params: {
+  tenantId: string;
+  objectId: string;
+  ingestManifest: Record<string, unknown>;
+}): Promise<ObjectRecord | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<ObjectRow[]>`
+      UPDATE objects
+      SET ingest_manifest = ${params.ingestManifest}
+      WHERE tenant_id = ${params.tenantId}
+        AND object_id = ${params.objectId}
+      RETURNING object_id, tenant_id, type, title, metadata, ingest_manifest, source_ingestion_id, status, created_at
     `;
   });
 

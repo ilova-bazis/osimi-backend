@@ -10,7 +10,7 @@ import {
   requireNonEmptyStringField,
   requireObject,
   requirePositiveIntField,
-} from "../http/validation.ts";
+} from "../validation/common.ts";
 import {
   decodeCursor,
   encodeCursor,
@@ -38,7 +38,7 @@ import {
   createUploadToken,
   parseUploadToken,
   resolveStagingPath,
-} from "../storage/index.ts";
+} from "../storage/staging.ts";
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/i;
 const ONE_HOUR_MS = 60 * 60 * 1000;

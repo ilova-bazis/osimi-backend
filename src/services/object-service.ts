@@ -9,15 +9,18 @@ import {
   type ObjectArtifactRecord,
   type ObjectRecord,
 } from "../repos/object-repo.ts";
-import { resolveStagingPath } from "../storage/index.ts";
+import { resolveStagingPath } from "../storage/staging.ts";
 
 interface ObjectCursorPayload {
   created_at: string;
   object_id: string;
 }
 
-function serializeObject(record: ObjectRecord): Record<string, unknown> {
-  return {
+function serializeObject(
+  record: ObjectRecord,
+  options?: { includeIngestManifest?: boolean },
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
     object_id: record.objectId,
     tenant_id: record.tenantId,
     type: record.type,
@@ -27,6 +30,12 @@ function serializeObject(record: ObjectRecord): Record<string, unknown> {
     status: record.status,
     created_at: record.createdAt.toISOString(),
   };
+
+  if (options?.includeIngestManifest) {
+    payload.ingest_manifest = record.ingestManifest ?? null;
+  }
+
+  return payload;
 }
 
 function serializeArtifact(record: ObjectArtifactRecord): Record<string, unknown> {
@@ -119,7 +128,7 @@ export async function listObjectsForTenant(params: {
   const lastItem = visible.at(-1);
 
   return {
-    objects: visible.map(serializeObject),
+    objects: visible.map((record) => serializeObject(record)),
     next_cursor: hasMore && lastItem
       ? encodeCursor({
           created_at: lastItem.createdAt.toISOString(),
@@ -143,7 +152,7 @@ export async function getObjectDetail(params: {
   }
 
   return {
-    object: serializeObject(objectRecord),
+    object: serializeObject(objectRecord, { includeIngestManifest: true }),
   };
 }
 

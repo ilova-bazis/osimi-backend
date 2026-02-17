@@ -104,8 +104,8 @@ Goal: persist worker progress, support idempotent event ingestion, and finalize 
 - Persist all events in `object_events` for feed and audit.
 - On successful completion:
   - validate archive-supplied immutable `object_id` (`OBJ-YYYYMMDD-XXXXXX`)
-  - create object and artifact records
-  - store `ingest.json` under object artifact layout
+  - create object records
+  - store `ingest.json` in `objects.ingest_manifest` (JSONB)
   - reject conflicting `object_id` values for the same ingestion
 
 Exit criteria:
@@ -172,5 +172,5 @@ Mandatory coverage areas:
 1. Foundation + Auth + tenant tests.
 2. Ingestion CRUD + upload presign/commit + checksum tests.
 3. Lease protocol + heartbeat + redundancy sweep.
-4. Event ingestion + completion + `ingest.json` artifact flow.
+4. Event ingestion + completion + `objects.ingest_manifest` flow.
 5. Objects + dashboard + retention/stuck jobs + observability.

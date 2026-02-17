@@ -123,6 +123,8 @@ bun run create-user
 - Use ESM imports with explicit `.ts` extensions for local modules.
 - Keep import groups ordered: node built-ins -> internal modules.
 - Use `import type` for type-only imports.
+- Do not use barrel re-export files (for example `index.ts` that only re-exports symbols).
+- Prefer direct imports from concrete modules (for example `../storage/staging.ts` instead of `../storage/index.ts`).
 
 ### Formatting
 

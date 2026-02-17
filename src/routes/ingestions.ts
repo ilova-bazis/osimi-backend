@@ -4,7 +4,7 @@ import {
   parseJsonBody,
   requireObject,
   requireStringField,
-} from "../http/validation.ts";
+} from "../validation/common.ts";
 import {
   cancelIngestion,
   commitUploadedFile,

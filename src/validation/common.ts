@@ -1,9 +1,14 @@
-import { ValidationError } from "./errors.ts";
+import { ValidationError } from "../http/errors.ts";
+import { z } from "zod";
 
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const objectSchema = z.record(z.string(), z.unknown());
+const stringSchema = z.string();
+const optionalStringSchema = z.string().optional();
+const nonEmptyStringSchema = z.string().trim().min(1);
+const positiveIntSchema = z.number().int().min(1);
+const uuidSchema = z.uuid();
 
-export function parseJsonBody(request: Request): Promise<unknown> {
+export async function parseJsonBody(request: Request): Promise<unknown> {
   return request.json().catch(() => {
     throw new ValidationError("Request body must be valid JSON.");
   });
@@ -13,73 +18,73 @@ export function requireObject(
   value: unknown,
   subject = "Request body",
 ): Record<string, unknown> {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  const parsed = objectSchema.safeParse(value);
+
+  if (!parsed.success) {
     throw new ValidationError(`${subject} must be an object.`);
   }
 
-  return value as Record<string, unknown>;
+  return parsed.data;
 }
 
 export function requireStringField(
   payload: Record<string, unknown>,
   key: string,
 ): string {
-  const value = payload[key];
+  const parsed = stringSchema.safeParse(payload[key]);
 
-  if (typeof value !== "string") {
+  if (!parsed.success) {
     throw new ValidationError(`Field '${key}' must be a string.`);
   }
 
-  return value;
+  return parsed.data;
 }
 
 export function requireOptionalStringField(
   payload: Record<string, unknown>,
   key: string,
 ): string | undefined {
-  const value = payload[key];
+  const parsed = optionalStringSchema.safeParse(payload[key]);
 
-  if (value === undefined) {
-    return undefined;
-  }
-
-  if (typeof value !== "string") {
+  if (!parsed.success) {
     throw new ValidationError(`Field '${key}' must be a string when provided.`);
   }
 
-  return value;
+  return parsed.data;
 }
 
 export function requireNonEmptyStringField(
   payload: Record<string, unknown>,
   key: string,
 ): string {
-  const value = requireStringField(payload, key).trim();
+  const parsed = nonEmptyStringSchema.safeParse(payload[key]);
 
-  if (value.length === 0) {
+  if (!parsed.success) {
     throw new ValidationError(`Field '${key}' cannot be empty.`);
   }
 
-  return value;
+  return parsed.data;
 }
 
 export function requirePositiveIntField(
   payload: Record<string, unknown>,
   key: string,
 ): number {
-  const value = payload[key];
+  const parsed = positiveIntSchema.safeParse(payload[key]);
 
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+  if (!parsed.success) {
     throw new ValidationError(`Field '${key}' must be a positive integer.`);
   }
 
-  return value;
+  return parsed.data;
 }
 
 export function requireUuid(value: string, fieldName: string): string {
-  if (!UUID_PATTERN.test(value)) {
+  const parsed = uuidSchema.safeParse(value);
+
+  if (!parsed.success) {
     throw new ValidationError(`Field '${fieldName}' must be a UUID.`);
   }
 
-  return value;
+  return parsed.data;
 }

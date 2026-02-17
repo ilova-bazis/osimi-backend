@@ -691,7 +691,33 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
         },
       }),
     );
-    expect(submitResponse.status).toBe(200);
+    expect(submitResponse.status).toBe(409);
+
+    const commitResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/commit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          file_id: presignBody.file_id,
+          checksum_sha256: sha256Hex("late"),
+        }),
+      }),
+    );
+
+    expect(commitResponse.status).toBe(200);
+
+    const submittedAfterCommit = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+    expect(submittedAfterCommit.status).toBe(200);
 
     const blockedCommit = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/files/commit`, {
