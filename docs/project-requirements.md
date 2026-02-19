@@ -64,7 +64,7 @@ Backend must support:
 - Tenant scoping (even if single-tenant initially)
 - Roles:
   - `viewer` – read-only
-  - `operator` – create and manage ingestions
+  - `archiver` – create and manage ingestions
   - `admin` – destructive actions, user management
 
 All endpoints must be tenant-aware.
@@ -234,10 +234,21 @@ Backend must provide:
 | tenant_id | UUID |
 | type | enum |
 | title | string |
+| processing_state | enum (`queued`, `ingesting`, `ingested`, `derivatives_running`, `derivatives_done`, `ocr_running`, `ocr_done`, `index_running`, `index_done`, `processing_failed`, `processing_skipped`) |
+| curation_state | enum (`needs_review`, `review_in_progress`, `reviewed`, `curation_failed`) |
+| availability_state | enum (`AVAILABLE`, `ARCHIVED`, `RESTORE_PENDING`, `RESTORING`, `UNAVAILABLE`) |
+| access_level | enum (`private`, `family`, `public`) |
+| embargo_kind | enum (`none`, `timed`, `curation_state`) |
+| embargo_until | timestamp (nullable) |
+| embargo_curation_state | enum (`needs_review`, `review_in_progress`, `reviewed`, `curation_failed`, nullable) |
+| rights_note | string (nullable) |
+| sensitivity_note | string (nullable) |
+| language_code | string (nullable) |
 | metadata | JSON |
+| ingest_manifest | JSON (nullable) |
 | source_ingestion_id | UUID |
-| status | enum |
 | created_at | timestamp |
+| updated_at | timestamp |
 
 ---
 
@@ -306,7 +317,7 @@ Used for activity feed and audit log.
 | id | UUID |
 | tenant_id | UUID |
 | user_id | UUID |
-| role | enum (`viewer`, `operator`, `admin`) |
+| role | enum (`viewer`, `archiver`, `admin`) |
 | is_active | boolean |
 | created_at | timestamp |
 | updated_at | timestamp |
@@ -457,6 +468,14 @@ Purpose: allow the private worker to report ingestion progress and outcomes to t
 - `PATCH /api/objects/:object_id`
 - `GET /api/objects/:object_id/artifacts`
 - `GET /api/objects/:object_id/artifacts/:artifact_id/download`
+- `PATCH /api/objects/:object_id/access-policy` (admin)
+- `POST /api/objects/:object_id/access-requests`
+- `GET /api/objects/:object_id/access-requests` (admin)
+- `POST /api/objects/:object_id/access-requests/:request_id/approve` (admin)
+- `POST /api/objects/:object_id/access-requests/:request_id/reject` (admin)
+- `GET /api/objects/:object_id/access-assignments` (admin)
+- `PUT /api/objects/:object_id/access-assignments` (admin)
+- `DELETE /api/objects/:object_id/access-assignments/:user_id` (admin)
 
 ---
 

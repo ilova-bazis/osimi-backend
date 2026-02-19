@@ -77,40 +77,40 @@ export async function findLoginCandidates(
     if (tenantId) {
       return await sql<LoginCandidateRow[]>`
         SELECT
-          u.id AS user_id,
-          u.username,
-          u.password_hash,
-          tm.tenant_id,
-          tm.role,
-          tm.id AS membership_id
-        FROM users u
-        INNER JOIN tenant_memberships tm ON tm.user_id = u.id
-        INNER JOIN tenants t ON t.id = tm.tenant_id
-        WHERE u.username_normalized = ${usernameNormalized}
-          AND tm.tenant_id = ${tenantId}
-          AND u.is_active = true
-          AND tm.is_active = true
-          AND t.is_active = true
-        ORDER BY tm.created_at ASC
+          usr.id AS user_id,
+          usr.username,
+          usr.password_hash,
+          mem.tenant_id,
+          mem.role,
+          mem.id AS membership_id
+        FROM users usr
+        INNER JOIN tenant_memberships mem ON mem.user_id = usr.id
+        INNER JOIN tenants ten ON ten.id = mem.tenant_id
+        WHERE usr.username_normalized = ${usernameNormalized}
+          AND mem.tenant_id = ${tenantId}
+          AND usr.is_active = true
+          AND mem.is_active = true
+          AND ten.is_active = true
+        ORDER BY mem.created_at ASC
       `;
     }
 
     return await sql<LoginCandidateRow[]>`
       SELECT
-        u.id AS user_id,
-        u.username,
-        u.password_hash,
-        tm.tenant_id,
-        tm.role,
-        tm.id AS membership_id
-      FROM users u
-      INNER JOIN tenant_memberships tm ON tm.user_id = u.id
-      INNER JOIN tenants t ON t.id = tm.tenant_id
-      WHERE u.username_normalized = ${usernameNormalized}
-        AND u.is_active = true
-        AND tm.is_active = true
-        AND t.is_active = true
-      ORDER BY tm.created_at ASC
+        usr.id AS user_id,
+        usr.username,
+        usr.password_hash,
+        mem.tenant_id,
+        mem.role,
+        mem.id AS membership_id
+      FROM users usr
+      INNER JOIN tenant_memberships mem ON mem.user_id = usr.id
+      INNER JOIN tenants ten ON ten.id = mem.tenant_id
+      WHERE usr.username_normalized = ${usernameNormalized}
+        AND usr.is_active = true
+        AND mem.is_active = true
+        AND ten.is_active = true
+      ORDER BY mem.created_at ASC
     `;
   });
 
@@ -169,25 +169,25 @@ export async function findActiveSessionByTokenHash(
   const rows = await withSchemaClient(async (sql) => {
     return await sql<ActiveSessionRow[]>`
       SELECT
-        s.id AS session_id,
-        s.user_id,
-        u.username,
-        s.tenant_id,
-        tm.role,
-        s.issued_at,
-        s.last_seen_at
-      FROM auth_sessions s
-      INNER JOIN users u ON u.id = s.user_id
-      INNER JOIN tenants t ON t.id = s.tenant_id
-      INNER JOIN tenant_memberships tm ON tm.id = s.membership_id
-      WHERE s.session_token_hash = ${tokenHash}
-        AND s.revoked_at IS NULL
-        AND s.expires_at > now()
-        AND u.is_active = true
-        AND t.is_active = true
-        AND tm.is_active = true
-        AND tm.user_id = s.user_id
-        AND tm.tenant_id = s.tenant_id
+        ses.id AS session_id,
+        ses.user_id,
+        usr.username,
+        ses.tenant_id,
+        mem.role,
+        ses.issued_at,
+        ses.last_seen_at
+      FROM auth_sessions ses
+      INNER JOIN users usr ON usr.id = ses.user_id
+      INNER JOIN tenants ten ON ten.id = ses.tenant_id
+      INNER JOIN tenant_memberships mem ON mem.id = ses.membership_id
+      WHERE ses.session_token_hash = ${tokenHash}
+        AND ses.revoked_at IS NULL
+        AND ses.expires_at > now()
+        AND usr.is_active = true
+        AND ten.is_active = true
+        AND mem.is_active = true
+        AND mem.user_id = ses.user_id
+        AND mem.tenant_id = ses.tenant_id
       LIMIT 1
     `;
   });
@@ -413,16 +413,16 @@ export async function findUsersByTenant(
   const rows = await withSchemaClient(async (sql) => {
     return await sql<UserWithRoleRow[]>`
       SELECT
-        u.id,
-        u.username,
-        u.username_normalized,
-        tm.role
-      FROM users u
-      INNER JOIN tenant_memberships tm ON tm.user_id = u.id
-      WHERE tm.tenant_id = ${tenantId}
-        AND u.is_active = true
-        AND tm.is_active = true
-      ORDER BY u.username
+        usr.id,
+        usr.username,
+        usr.username_normalized,
+        mem.role
+      FROM users usr
+      INNER JOIN tenant_memberships mem ON mem.user_id = usr.id
+      WHERE mem.tenant_id = ${tenantId}
+        AND usr.is_active = true
+        AND mem.is_active = true
+      ORDER BY usr.username
     `;
   });
 

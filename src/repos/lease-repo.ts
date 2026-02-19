@@ -88,17 +88,17 @@ export async function leaseNextQueuedIngestion(params: {
   return withSchemaClient(async (sql) => {
     return sql.begin(async (transaction) => {
       const candidates = await transaction<QueuedIngestionRow[]>`
-        SELECT i.id, i.batch_label, i.tenant_id, i.status
-        FROM ingestions i
-        WHERE i.status = 'QUEUED'
+        SELECT ing.id, ing.batch_label, ing.tenant_id, ing.status
+        FROM ingestions ing
+        WHERE ing.status = 'QUEUED'
           AND NOT EXISTS (
             SELECT 1
-            FROM ingestion_leases l
-            WHERE l.ingestion_id = i.id
-              AND l.released_at IS NULL
-              AND l.lease_expires_at > now()
+            FROM ingestion_leases lease
+            WHERE lease.ingestion_id = ing.id
+              AND lease.released_at IS NULL
+              AND lease.lease_expires_at > now()
           )
-        ORDER BY i.created_at ASC
+        ORDER BY ing.created_at ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
       `;

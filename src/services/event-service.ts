@@ -8,6 +8,7 @@ import { insertObjectEvent } from "../repos/event-repo.ts";
 import {
   createOrGetObjectBySourceIngestion,
   updateObjectIngestManifest,
+  updateObjectProjectionState,
 } from "../repos/object-repo.ts";
 import type {
   IngestWorkerEventsInput,
@@ -115,6 +116,13 @@ export async function ingestWorkerEvents(
       if (!completionObject) {
         throw new ConflictError("Completion event object resolution failed.");
       }
+
+      await updateObjectProjectionState({
+        tenantId: ingestionRecord.tenantId,
+        objectId: completionObject.objectId,
+        processingState: "index_done",
+        availabilityState: "AVAILABLE",
+      });
 
       completedObjectId = completionObject.objectId;
 

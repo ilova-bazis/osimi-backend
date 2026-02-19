@@ -261,22 +261,22 @@ export async function findIngestionFileById(params: {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<IngestionFileRow[]>`
       SELECT
-        f.id,
-        f.ingestion_id,
-        f.filename,
-        f.content_type,
-        f.size_bytes,
-        f.storage_key,
-        f.status,
-        f.checksum_sha256,
-        f.error,
-        f.created_at,
-        f.updated_at
-      FROM ingestion_files f
-      INNER JOIN ingestions i ON i.id = f.ingestion_id
-      WHERE f.id = ${params.fileId}
-        AND f.ingestion_id = ${params.ingestionId}
-        AND i.tenant_id = ${params.tenantId}
+        file.id,
+        file.ingestion_id,
+        file.filename,
+        file.content_type,
+        file.size_bytes,
+        file.storage_key,
+        file.status,
+        file.checksum_sha256,
+        file.error,
+        file.created_at,
+        file.updated_at
+      FROM ingestion_files file
+      INNER JOIN ingestions ing ON ing.id = file.ingestion_id
+      WHERE file.id = ${params.fileId}
+        AND file.ingestion_id = ${params.ingestionId}
+        AND ing.tenant_id = ${params.tenantId}
       LIMIT 1
     `;
   });
@@ -292,22 +292,22 @@ export async function listIngestionFiles(params: {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<IngestionFileRow[]>`
       SELECT
-        f.id,
-        f.ingestion_id,
-        f.filename,
-        f.content_type,
-        f.size_bytes,
-        f.storage_key,
-        f.status,
-        f.checksum_sha256,
-        f.error,
-        f.created_at,
-        f.updated_at
-      FROM ingestion_files f
-      INNER JOIN ingestions i ON i.id = f.ingestion_id
-      WHERE f.ingestion_id = ${params.ingestionId}
-        AND i.tenant_id = ${params.tenantId}
-      ORDER BY f.created_at ASC, f.id ASC
+        file.id,
+        file.ingestion_id,
+        file.filename,
+        file.content_type,
+        file.size_bytes,
+        file.storage_key,
+        file.status,
+        file.checksum_sha256,
+        file.error,
+        file.created_at,
+        file.updated_at
+      FROM ingestion_files file
+      INNER JOIN ingestions ing ON ing.id = file.ingestion_id
+      WHERE file.ingestion_id = ${params.ingestionId}
+        AND ing.tenant_id = ${params.tenantId}
+      ORDER BY file.created_at ASC, file.id ASC
     `;
   });
 
@@ -351,20 +351,20 @@ export async function listStagingCleanupCandidates(params: {
       }>
     >`
       SELECT
-        i.id AS ingestion_id,
-        i.tenant_id,
-        i.status,
-        i.updated_at,
-        f.storage_key
-      FROM ingestions i
-      INNER JOIN ingestion_files f ON f.ingestion_id = i.id
+        ing.id AS ingestion_id,
+        ing.tenant_id,
+        ing.status,
+        ing.updated_at,
+        file.storage_key
+      FROM ingestions ing
+      INNER JOIN ingestion_files file ON file.ingestion_id = ing.id
       WHERE (
-        i.status = 'COMPLETED'
-        AND i.updated_at <= now() - (${params.completedRetentionDays}::int * interval '1 day')
+        ing.status = 'COMPLETED'
+        AND ing.updated_at <= now() - (${params.completedRetentionDays}::int * interval '1 day')
       )
       OR (
-        i.status IN ('FAILED', 'CANCELED')
-        AND i.updated_at <= now() - (${params.failedCanceledRetentionDays}::int * interval '1 day')
+        ing.status IN ('FAILED', 'CANCELED')
+        AND ing.updated_at <= now() - (${params.failedCanceledRetentionDays}::int * interval '1 day')
       )
     `;
   });

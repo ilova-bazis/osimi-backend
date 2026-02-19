@@ -212,8 +212,8 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
         `,
         [
           "10000000-0000-0000-0000-000000000002",
-          "operator@osimi.local",
-          "operator@osimi.local",
+          "archiver@osimi.local",
+          "archiver@osimi.local",
           operatorHash,
         ],
       );
@@ -227,7 +227,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
           "20000000-0000-0000-0000-000000000002",
           "00000000-0000-0000-0000-000000000001",
           "10000000-0000-0000-0000-000000000002",
-          "operator",
+          "archiver",
         ],
       );
     } finally {
@@ -242,7 +242,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          username: "operator@osimi.local",
+          username: "archiver@osimi.local",
           password: "operator123",
         }),
       }),

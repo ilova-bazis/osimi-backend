@@ -7,7 +7,7 @@ const summaryRoute: RouteDefinition = {
   method: "GET",
   path: "/api/dashboard/summary",
   handler: async (_request, context) => {
-    requireRole(context, ["viewer", "operator", "admin"]);
+    requireRole(context, ["viewer", "archiver", "admin"]);
     const tenantId = requireTenantScope(context);
     return jsonResponse(await getDashboardSummaryForTenant(tenantId));
   },
@@ -17,7 +17,7 @@ const activityRoute: RouteDefinition = {
   method: "GET",
   path: "/api/dashboard/activity",
   handler: async (request, context) => {
-    requireRole(context, ["viewer", "operator", "admin"]);
+    requireRole(context, ["viewer", "archiver", "admin"]);
     const tenantId = requireTenantScope(context);
     const url = new URL(request.url);
     return jsonResponse(await getDashboardActivityForTenant({ tenantId, url }));

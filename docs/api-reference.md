@@ -100,14 +100,14 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### GET `/api/dashboard/summary`
 
 - Auth: Bearer token
-- Roles: `viewer`, `operator`, `admin`
+- Roles: `viewer`, `archiver`, `admin`
 - 200 response:
   - `summary { total_ingestions, total_objects, processed_today, processed_week, failed_count }`
 
 ### GET `/api/dashboard/activity`
 
 - Auth: Bearer token
-- Roles: `viewer`, `operator`, `admin`
+- Roles: `viewer`, `archiver`, `admin`
 - Query params:
   - `limit` (optional int, default `50`, max `200`)
   - `cursor` (optional opaque base64url string)
@@ -121,7 +121,7 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### POST `/api/ingestions`
 
 - Auth: Bearer token
-- Roles: `operator`, `admin`
+- Roles: `archiver`, `admin`
 - Body:
   - `batch_label` (string)
 - 201 response:
@@ -130,7 +130,7 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### GET `/api/ingestions`
 
 - Auth: Bearer token
-- Roles: `viewer`, `operator`, `admin`
+- Roles: `viewer`, `archiver`, `admin`
 - Query params:
   - `limit` (optional)
   - `cursor` (optional)
@@ -141,7 +141,7 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### GET `/api/ingestions/:id`
 
 - Auth: Bearer token
-- Roles: `viewer`, `operator`, `admin`
+- Roles: `viewer`, `archiver`, `admin`
 - 200 response:
   - `ingestion`
   - `files[]`
@@ -149,7 +149,7 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### POST `/api/ingestions/:id/files/presign`
 
 - Auth: Bearer token
-- Roles: `operator`, `admin`
+- Roles: `archiver`, `admin`
 - Body (new file):
   - `filename`, `content_type`, `size_bytes`
 - Body (re-presign existing):
@@ -160,7 +160,7 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### POST `/api/ingestions/:id/files/commit`
 
 - Auth: Bearer token
-- Roles: `operator`, `admin`
+- Roles: `archiver`, `admin`
 - Body:
   - `file_id`, `checksum_sha256`
 - 200 response:
@@ -169,7 +169,7 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### POST `/api/ingestions/:id/submit`
 
 - Auth: Bearer token
-- Roles: `operator`, `admin`
+- Roles: `archiver`, `admin`
 - Preconditions:
   - at least one file exists
   - at least one file is committed (`UPLOADED` or `VALIDATED`)
@@ -179,14 +179,14 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### POST `/api/ingestions/:id/cancel`
 
 - Auth: Bearer token
-- Roles: `operator`, `admin`
+- Roles: `archiver`, `admin`
 - 200 response:
   - `ingestion`
 
 ### POST `/api/ingestions/:id/retry`
 
 - Auth: Bearer token
-- Roles: `operator`, `admin`
+- Roles: `archiver`, `admin`
 - 200 response:
   - `ingestion`
 
@@ -195,10 +195,17 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### GET `/api/objects`
 
 - Auth: Bearer token
-- Roles: `viewer`, `operator`, `admin`
+- Roles: `viewer`, `archiver`, `admin`
 - Query params:
-  - `limit` (optional)
-  - `cursor` (optional)
+  - `limit` (optional integer, default `50`, max `200`)
+  - `cursor` (optional opaque cursor from previous response)
+  - `sort` (optional)
+    - allowed: `created_at_desc` (default), `created_at_asc`, `updated_at_desc`, `updated_at_asc`, `title_asc`, `title_desc`
+  - `q` (optional text search, minimum guarantee: matches `title`, `object_id`)
+  - `availability_state` (optional: `AVAILABLE`, `ARCHIVED`, `RESTORE_PENDING`, `RESTORING`, `UNAVAILABLE`)
+  - `access_level` (optional: `private`, `family`, `public`)
+  - `language` (optional)
+  - `batch_label` (optional)
   - `type` (`GENERIC|IMAGE|AUDIO|VIDEO|DOCUMENT`, optional)
   - `from` (ISO timestamp, optional)
   - `to` (ISO timestamp, optional)
@@ -206,18 +213,93 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 - 200 response:
   - `objects[]` (does **not** include `ingest_manifest`)
   - `next_cursor` (string or `null`)
+  - `total_count` (total tenant-visible objects before filters)
+  - `filtered_count` (total matching current filters)
+
+List row guarantees (`objects[]`):
+
+- guaranteed keys:
+  - `id` (alias of `object_id`)
+  - `object_id`
+  - `title`
+  - `processing_state`
+  - `curation_state`
+  - `availability_state`
+  - `access_level`
+  - `type`
+  - `tenant_id`
+  - `source_ingestion_id` (`null` allowed)
+  - `source_batch_label` (`null` allowed)
+  - `metadata`
+  - `created_at`
+  - `updated_at`
+  - `embargo_until` (`null` allowed)
+  - `embargo_kind`
+  - `embargo_curation_state` (`null` allowed)
+  - `rights_note` (`null` allowed)
+  - `sensitivity_note` (`null` allowed)
+  - `can_download`
+  - `access_reason_code` (`OK`, `FORBIDDEN_POLICY`, `EMBARGO_ACTIVE`, `RESTORE_REQUIRED`, `RESTORE_IN_PROGRESS`, `TEMP_UNAVAILABLE`)
+- optional nullable keys:
+  - `language` (`null` if unknown)
+- excluded from list payload:
+  - `ingest_manifest` (detail-only)
+
+Sort semantics:
+
+- default sort: `created_at_desc`
+- sorting is deterministic
+- tie-breaker includes `object_id` for stable cursor paging
+- cursor is sort-aware and preserves ordering across pages
+
+Example response:
+
+```json
+{
+  "objects": [
+    {
+      "id": "OBJ-20260213-ABC123",
+      "object_id": "OBJ-20260213-ABC123",
+      "title": "Document title",
+      "processing_state": "queued",
+      "curation_state": "needs_review",
+      "availability_state": "AVAILABLE",
+      "access_level": "private",
+      "type": "DOCUMENT",
+      "language": "en",
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "source_ingestion_id": "13dd3927-17be-4211-9a77-fdea3104a028",
+      "source_batch_label": "batch-2026-02-13-001",
+      "metadata": {},
+      "embargo_until": null,
+      "rights_note": null,
+      "sensitivity_note": null,
+      "created_at": "2026-02-13T20:22:29.993Z",
+      "updated_at": "2026-02-14T08:01:00.000Z"
+    }
+  ],
+  "next_cursor": "...",
+  "total_count": 124,
+  "filtered_count": 37
+}
+```
 
 ### GET `/api/objects/:object_id`
 
 - Auth: Bearer token
-- Roles: `viewer`, `operator`, `admin`
+- Roles: `viewer`, `archiver`, `admin`
 - 200 response:
   - `object` including `ingest_manifest` (or `null`)
+  - access projection fields:
+    - `is_authorized`
+    - `is_deliverable`
+    - `can_download`
+    - `access_reason_code` (`OK`, `FORBIDDEN_POLICY`, `EMBARGO_ACTIVE`, `RESTORE_REQUIRED`, `RESTORE_IN_PROGRESS`, `TEMP_UNAVAILABLE`)
 
 ### PATCH `/api/objects/:object_id`
 
 - Auth: Bearer token
-- Roles: `operator`, `admin`
+- Roles: `archiver`, `admin`
 - Body:
   - `title` (required string, non-empty)
 - Notes:
@@ -228,7 +310,7 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### GET `/api/objects/:object_id/artifacts`
 
 - Auth: Bearer token
-- Roles: `viewer`, `operator`, `admin`
+- Roles: `viewer`, `archiver`, `admin`
 - 200 response:
   - `object_id`
   - `artifacts[]` (`id`, `kind`, `storage_key`, `content_type`, `size_bytes`, `created_at`)
@@ -236,10 +318,94 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### GET `/api/objects/:object_id/artifacts/:artifact_id/download`
 
 - Auth: Bearer token
-- Roles: `viewer`, `operator`, `admin`
+- Roles: `viewer`, `archiver`, `admin`
 - 200 response:
   - Binary file response
   - headers include `content-type`, `content-length`, `content-disposition`
+
+### PATCH `/api/objects/:object_id/access-policy`
+
+- Auth: Bearer token
+- Roles: `admin`
+- Body:
+  - `access_level` (`private|family|public`, required)
+  - `embargo_kind` (`none|timed|curation_state`, required)
+  - `embargo_until` (ISO timestamp, required when `embargo_kind=timed`)
+  - `embargo_curation_state` (`needs_review|review_in_progress|reviewed|curation_failed`, required when `embargo_kind=curation_state`)
+  - `rights_note` (optional string)
+  - `sensitivity_note` (optional string)
+- 200 response:
+  - `object` (updated policy + object fields)
+
+### POST `/api/objects/:object_id/access-requests`
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- Body:
+  - `requested_level` (`family|private`, required)
+  - `reason` (optional string)
+- 201 response:
+  - `request`
+- Conflict behavior:
+  - returns `409` when the same user already has a `PENDING` request for that object
+
+### GET `/api/objects/:object_id/access-requests`
+
+- Auth: Bearer token
+- Roles: `admin`
+- 200 response:
+  - `object_id`
+  - `requests[]` (`id`, `requester_user_id`, `requested_level`, `reason`, `status`, `reviewed_by`, `reviewed_at`, `decision_note`, `created_at`, `updated_at`)
+
+### POST `/api/objects/:object_id/access-requests/:request_id/approve`
+
+- Auth: Bearer token
+- Roles: `admin`
+- Body:
+  - `decision_note` (optional string)
+- 200 response:
+  - `request` (status becomes `APPROVED`)
+  - creates or updates assignment for requester
+- Conflict behavior:
+  - returns `409` if request status is not `PENDING`
+
+### POST `/api/objects/:object_id/access-requests/:request_id/reject`
+
+- Auth: Bearer token
+- Roles: `admin`
+- Body:
+  - `decision_note` (optional string)
+- 200 response:
+  - `request` (status becomes `REJECTED`)
+- Conflict behavior:
+  - returns `409` if request status is not `PENDING`
+
+### GET `/api/objects/:object_id/access-assignments`
+
+- Auth: Bearer token
+- Roles: `admin`
+- 200 response:
+  - `object_id`
+  - `assignments[]` (`user_id`, `granted_level`, `created_by`, `created_at`)
+
+### PUT `/api/objects/:object_id/access-assignments`
+
+- Auth: Bearer token
+- Roles: `admin`
+- Body:
+  - `user_id` (UUID, required)
+  - `granted_level` (`family|private`, required)
+- 200 response:
+  - `assignment`
+
+### DELETE `/api/objects/:object_id/access-assignments/:user_id`
+
+- Auth: Bearer token
+- Roles: `admin`
+- 200 response:
+  - `status` (`ok`)
+  - `object_id`
+  - `user_id`
 
 ---
 

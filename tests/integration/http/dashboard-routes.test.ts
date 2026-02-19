@@ -141,11 +141,11 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
 
       await sql.unsafe(
         `
-          INSERT INTO ${objectsTable} (object_id, tenant_id, type, title, metadata, source_ingestion_id, status)
+          INSERT INTO ${objectsTable} (object_id, tenant_id, type, title, metadata, source_ingestion_id, availability_state)
           VALUES
-            ($1, $2, 'DOCUMENT', $3, '{}'::jsonb, $4, 'ACTIVE'),
-            ($5, $6, 'IMAGE', $7, '{}'::jsonb, $8, 'ACTIVE'),
-            ($9, $10, 'AUDIO', $11, '{}'::jsonb, $12, 'ACTIVE')
+            ($1, $2, 'DOCUMENT', $3, '{}'::jsonb, $4, 'AVAILABLE'),
+            ($5, $6, 'IMAGE', $7, '{}'::jsonb, $8, 'AVAILABLE'),
+            ($9, $10, 'AUDIO', $11, '{}'::jsonb, $12, 'AVAILABLE')
         `,
         [
           "OBJ-20260210-AAA111",

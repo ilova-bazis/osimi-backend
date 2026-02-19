@@ -202,8 +202,8 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
         `,
         [
           "10000000-0000-0000-0000-000000000002",
-          "operator@osimi.local",
-          "operator@osimi.local",
+          "archiver@osimi.local",
+          "archiver@osimi.local",
           operatorHash,
         ],
       );
@@ -217,7 +217,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
           "20000000-0000-0000-0000-000000000002",
           "00000000-0000-0000-0000-000000000001",
           "10000000-0000-0000-0000-000000000002",
-          "operator",
+          "archiver",
         ],
       );
     } finally {
@@ -232,7 +232,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          username: "operator@osimi.local",
+          username: "archiver@osimi.local",
           password: "operator123",
         }),
       }),
@@ -363,14 +363,21 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
       const eventsTable = qualifiedTable(schema, "object_events");
 
       const objectRows = (await sql.unsafe(
-        `SELECT object_id, ingest_manifest FROM ${objectsTable} WHERE source_ingestion_id = $1`,
+        `SELECT object_id, ingest_manifest, processing_state, availability_state FROM ${objectsTable} WHERE source_ingestion_id = $1`,
         [ingestionId],
-      )) as Array<{ object_id: string; ingest_manifest: unknown }>;
+      )) as Array<{
+        object_id: string;
+        ingest_manifest: unknown;
+        processing_state: string;
+        availability_state: string;
+      }>;
 
       expect(objectRows.length).toBe(1);
       expect(objectRows[0]?.ingest_manifest).toMatchObject({
         schema_version: "1.0",
       });
+      expect(objectRows[0]?.processing_state).toBe("index_done");
+      expect(objectRows[0]?.availability_state).toBe("AVAILABLE");
 
       const eventRows = (await sql.unsafe(
         `SELECT id FROM ${eventsTable} WHERE ingestion_id = $1`,
@@ -664,15 +671,22 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
     try {
       const objectsTable = qualifiedTable(schema, "objects");
       const objects = (await sql.unsafe(
-        `SELECT object_id, ingest_manifest FROM ${objectsTable} WHERE source_ingestion_id = $1`,
+        `SELECT object_id, ingest_manifest, processing_state, availability_state FROM ${objectsTable} WHERE source_ingestion_id = $1`,
         [ingestionId],
-      )) as Array<{ object_id: string; ingest_manifest: unknown }>;
+      )) as Array<{
+        object_id: string;
+        ingest_manifest: unknown;
+        processing_state: string;
+        availability_state: string;
+      }>;
 
       expect(objects.length).toBe(1);
       expect(objects[0]?.ingest_manifest).toMatchObject({
         schema_version: "1.0",
         ingest: { ingest_id: "ING-repeat" },
       });
+      expect(objects[0]?.processing_state).toBe("index_done");
+      expect(objects[0]?.availability_state).toBe("AVAILABLE");
     } finally {
       await sql.close();
     }

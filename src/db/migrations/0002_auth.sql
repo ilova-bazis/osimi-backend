@@ -2,7 +2,7 @@ DO $$
 BEGIN
   CREATE TYPE user_role AS ENUM (
     'viewer',
-    'operator',
+    'archiver',
     'admin'
   );
 EXCEPTION

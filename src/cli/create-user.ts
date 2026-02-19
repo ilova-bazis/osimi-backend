@@ -174,7 +174,7 @@ async function promptPasswordWithoutConfirmation(): Promise<string> {
 async function selectRole(): Promise<UserRole> {
   const choices: Choice<UserRole>[] = [
     { value: "viewer", label: "viewer - Read-only access" },
-    { value: "operator", label: "operator - Can perform operations" },
+    { value: "archiver", label: "archiver - Can perform operations" },
     { value: "admin", label: "admin - Full administrative access" },
   ];
 

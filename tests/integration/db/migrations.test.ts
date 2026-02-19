@@ -43,6 +43,10 @@ describe("database migrations", () => {
             'ingestion_files',
             'ingestion_leases',
             'objects',
+            'tags',
+            'object_tags',
+            'object_access_assignments',
+            'object_access_requests',
             'object_artifacts',
             'object_events',
             'schema_migrations'
@@ -54,9 +58,23 @@ describe("database migrations", () => {
         expect(tableNames.has("ingestion_files")).toBe(true);
         expect(tableNames.has("ingestion_leases")).toBe(true);
         expect(tableNames.has("objects")).toBe(true);
+        expect(tableNames.has("tags")).toBe(true);
+        expect(tableNames.has("object_tags")).toBe(true);
+        expect(tableNames.has("object_access_assignments")).toBe(true);
+        expect(tableNames.has("object_access_requests")).toBe(true);
         expect(tableNames.has("object_artifacts")).toBe(true);
         expect(tableNames.has("object_events")).toBe(true);
         expect(tableNames.has("schema_migrations")).toBe(true);
+
+        const accessRequestIndexRows = (await sql.unsafe(`
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = ${asSqlLiteral(schema)}
+          AND tablename = 'object_access_requests'
+      `)) as Array<{ indexname: string }>;
+
+        const accessRequestIndexNames = accessRequestIndexRows.map((row) => row.indexname);
+        expect(accessRequestIndexNames.includes("object_access_requests_one_pending_per_user_idx")).toBe(true);
 
         const indexRows = (await sql.unsafe(`
         SELECT indexname
@@ -79,6 +97,10 @@ describe("database migrations", () => {
 
         const columnNames = new Set(columnRows.map((row) => row.column_name));
         expect(columnNames.has("ingest_manifest")).toBe(true);
+        expect(columnNames.has("language_code")).toBe(true);
+        expect(columnNames.has("updated_at")).toBe(true);
+        expect(columnNames.has("embargo_kind")).toBe(true);
+        expect(columnNames.has("embargo_curation_state")).toBe(true);
       } finally {
         await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
         await sql.close();

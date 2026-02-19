@@ -1,4 +1,4 @@
-export type UserRole = "viewer" | "operator" | "admin";
+export type UserRole = "viewer" | "archiver" | "admin";
 
 export interface AuthenticatedPrincipal {
   sessionToken: string;

@@ -39,13 +39,13 @@ describe("auth guards", () => {
     const context = createContext({
       authToken: "token-1234567890123456",
       userId: "10000000-0000-0000-0000-000000000002",
-      username: "operator@osimi.local",
+      username: "archiver@osimi.local",
       tenantId: "00000000-0000-0000-0000-000000000001",
-      role: "operator",
+      role: "archiver",
     });
 
-    const principal = requireRole(context, ["operator", "admin"]);
-    expect(principal.role).toBe("operator");
+    const principal = requireRole(context, ["archiver", "admin"]);
+    expect(principal.role).toBe("archiver");
   });
 
   test("requireRole rejects disallowed role", () => {

@@ -23,7 +23,7 @@ const createIngestionRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions",
   handler: async (request, context) => {
-    const auth = requireRole(context, ["operator", "admin"]);
+    const auth = requireRole(context, ["archiver", "admin"]);
     const body = requireObject(await parseJsonBody(request));
     const batchLabel = requireStringField(body, "batch_label");
 
@@ -44,7 +44,7 @@ const listIngestionsRoute: RouteDefinition = {
   method: "GET",
   path: "/api/ingestions",
   handler: async (request, context) => {
-    requireRole(context, ["viewer", "operator", "admin"]);
+    requireRole(context, ["viewer", "archiver", "admin"]);
     const tenantId = requireTenantScope(context);
     const url = new URL(request.url);
     const result = await getIngestionList({ tenantId, url });
@@ -60,7 +60,7 @@ const getIngestionRoute: RouteDefinition = {
   method: "GET",
   path: "/api/ingestions/:id",
   handler: async (request, context) => {
-    requireRole(context, ["viewer", "operator", "admin"]);
+    requireRole(context, ["viewer", "archiver", "admin"]);
     const tenantId = requireTenantScope(context);
     const pathname = new URL(request.url).pathname;
     const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)$/, "id");
@@ -72,7 +72,7 @@ const presignFileRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/files/presign",
   handler: async (request, context) => {
-    requireRole(context, ["operator", "admin"]);
+    requireRole(context, ["archiver", "admin"]);
     const tenantId = requireTenantScope(context);
     const pathname = new URL(request.url).pathname;
     const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/files\/presign$/, "id");
@@ -95,7 +95,7 @@ const commitFileRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/files/commit",
   handler: async (request, context) => {
-    requireRole(context, ["operator", "admin"]);
+    requireRole(context, ["archiver", "admin"]);
     const tenantId = requireTenantScope(context);
     const pathname = new URL(request.url).pathname;
     const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/files\/commit$/, "id");
@@ -115,7 +115,7 @@ const submitIngestionRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/submit",
   handler: async (request, context) => {
-    requireRole(context, ["operator", "admin"]);
+    requireRole(context, ["archiver", "admin"]);
     const tenantId = requireTenantScope(context);
     const pathname = new URL(request.url).pathname;
     const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/submit$/, "id");
@@ -128,7 +128,7 @@ const cancelIngestionRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/cancel",
   handler: async (request, context) => {
-    requireRole(context, ["operator", "admin"]);
+    requireRole(context, ["archiver", "admin"]);
     const tenantId = requireTenantScope(context);
     const pathname = new URL(request.url).pathname;
     const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/cancel$/, "id");
@@ -141,7 +141,7 @@ const retryIngestionRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/retry",
   handler: async (request, context) => {
-    requireRole(context, ["operator", "admin"]);
+    requireRole(context, ["archiver", "admin"]);
     const tenantId = requireTenantScope(context);
     const pathname = new URL(request.url).pathname;
     const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/retry$/, "id");
