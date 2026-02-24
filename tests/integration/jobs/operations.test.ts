@@ -61,12 +61,24 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
     try {
       await sql.unsafe(
         `
-          INSERT INTO ${ingestionsTable} (id, batch_label, tenant_id, status, created_by, updated_at)
+          INSERT INTO ${ingestionsTable} (
+            id,
+            batch_label,
+            tenant_id,
+            status,
+            created_by,
+            schema_version,
+            document_type,
+            language_code,
+            pipeline_preset,
+            access_level,
+            updated_at
+          )
           VALUES
-            ($1, 'b-keep', $2, 'UPLOADING', $3, now() - interval '1 day'),
-            ($4, 'b-completed', $2, 'COMPLETED', $3, now() - interval '8 day'),
-            ($5, 'b-failed', $2, 'FAILED', $3, now() - interval '15 day'),
-            ($6, 'b-canceled-fresh', $2, 'CANCELED', $3, now() - interval '10 day')
+            ($1, 'b-keep', $2, 'UPLOADING', $3, '1.0', 'document', 'en', 'auto', 'private', now() - interval '1 day'),
+            ($4, 'b-completed', $2, 'COMPLETED', $3, '1.0', 'document', 'en', 'auto', 'private', now() - interval '8 day'),
+            ($5, 'b-failed', $2, 'FAILED', $3, '1.0', 'document', 'en', 'auto', 'private', now() - interval '15 day'),
+            ($6, 'b-canceled-fresh', $2, 'CANCELED', $3, '1.0', 'document', 'en', 'auto', 'private', now() - interval '10 day')
         `,
         [
           "30000000-0000-0000-0000-000000000101",
@@ -87,12 +99,13 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
             content_type,
             size_bytes,
             storage_key,
-            status
+            status,
+            checksum_sha256
           )
           VALUES
-            ($1, $4, 'keep.txt', 'text/plain', 4, $7, 'UPLOADED'),
-            ($2, $5, 'completed.txt', 'text/plain', 4, $8, 'UPLOADED'),
-            ($3, $6, 'failed.txt', 'text/plain', 4, $9, 'UPLOADED')
+            ($1, $4, 'keep.txt', 'text/plain', 4, $7, 'UPLOADED', $10),
+            ($2, $5, 'completed.txt', 'text/plain', 4, $8, 'UPLOADED', $10),
+            ($3, $6, 'failed.txt', 'text/plain', 4, $9, 'UPLOADED', $10)
         `,
         [
           "40000000-0000-0000-0000-000000000101",
@@ -104,6 +117,7 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
           keepStorageKey,
           cleanupCompletedStorageKey,
           cleanupFailedStorageKey,
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ],
       );
 
@@ -155,11 +169,23 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
     try {
       await sql.unsafe(
         `
-          INSERT INTO ${ingestionsTable} (id, batch_label, tenant_id, status, created_by, updated_at)
+          INSERT INTO ${ingestionsTable} (
+            id,
+            batch_label,
+            tenant_id,
+            status,
+            created_by,
+            schema_version,
+            document_type,
+            language_code,
+            pipeline_preset,
+            access_level,
+            updated_at
+          )
           VALUES
-            ($1, 'b-stuck-upload', $4, 'UPLOADING', $5, now() - interval '90 minute'),
-            ($2, 'b-stuck-process', $4, 'PROCESSING', $5, now() - interval '120 minute'),
-            ($3, 'b-fresh-process', $4, 'PROCESSING', $5, now() - interval '10 minute')
+            ($1, 'b-stuck-upload', $4, 'UPLOADING', $5, '1.0', 'document', 'en', 'auto', 'private', now() - interval '90 minute'),
+            ($2, 'b-stuck-process', $4, 'PROCESSING', $5, '1.0', 'document', 'en', 'auto', 'private', now() - interval '120 minute'),
+            ($3, 'b-fresh-process', $4, 'PROCESSING', $5, '1.0', 'document', 'en', 'auto', 'private', now() - interval '10 minute')
         `,
         [
           "30000000-0000-0000-0000-000000000201",

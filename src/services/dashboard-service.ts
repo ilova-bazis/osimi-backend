@@ -1,14 +1,17 @@
-import { decodeCursor, encodeCursor, parsePaginationParams } from "../http/pagination.ts";
-import { ValidationError } from "../http/errors.ts";
+import { encodeCursor } from "../http/pagination.ts";
+import type { AuthenticatedContext } from "../auth/guards.ts";
 import { getDashboardSummary, listDashboardActivity } from "../repos/dashboard-repo.ts";
+import {
+  parseDashboardActivityPayload,
+  type DashboardActivityQuery,
+  type DashboardActivityResponse,
+  type DashboardSummaryResponse,
+} from "../validation/dashboard.ts";
 
-interface ActivityCursorPayload {
-  created_at: string;
-  id: string;
-}
-
-export async function getDashboardSummaryForTenant(tenantId: string): Promise<Record<string, unknown>> {
-  const summary = await getDashboardSummary(tenantId);
+export async function getDashboardSummaryForTenant(params: {
+  auth: AuthenticatedContext;
+}): Promise<DashboardSummaryResponse> {
+  const summary = await getDashboardSummary(params.auth.tenantId);
 
   return {
     summary: {
@@ -22,30 +25,16 @@ export async function getDashboardSummaryForTenant(tenantId: string): Promise<Re
 }
 
 export async function getDashboardActivityForTenant(params: {
-  tenantId: string;
-  url: URL;
-}): Promise<Record<string, unknown>> {
-  const pagination = parsePaginationParams(params.url);
-
-  let cursor: ActivityCursorPayload | undefined;
-  if (pagination.cursor) {
-    const decoded = decodeCursor<Record<string, unknown>>(pagination.cursor);
-
-    if (typeof decoded.created_at !== "string" || typeof decoded.id !== "string") {
-      throw new ValidationError("Query parameter 'cursor' is invalid.");
-    }
-
-    cursor = {
-      created_at: decoded.created_at,
-      id: decoded.id,
-    };
-  }
+  auth: AuthenticatedContext;
+  query: DashboardActivityQuery;
+}): Promise<DashboardActivityResponse> {
+  const pagination = params.query;
 
   const records = await listDashboardActivity({
-    tenantId: params.tenantId,
+    tenantId: params.auth.tenantId,
     limit: pagination.limit + 1,
-    cursorCreatedAt: cursor?.created_at,
-    cursorId: cursor?.id,
+    cursorCreatedAt: pagination.cursor?.created_at,
+    cursorId: pagination.cursor?.id,
   });
 
   const hasMore = records.length > pagination.limit;
@@ -53,21 +42,22 @@ export async function getDashboardActivityForTenant(params: {
   const lastItem = visible.at(-1);
 
   return {
-    activity: visible.map(item => ({
+    activity: visible.map((item) => ({
       id: item.id,
       event_id: item.eventId,
       type: item.type,
       ingestion_id: item.ingestionId ?? null,
       object_id: item.objectId ?? null,
-      payload: item.payload,
+      payload: parseDashboardActivityPayload(item.payload),
       actor_user_id: item.actorUserId ?? null,
       created_at: item.createdAt.toISOString(),
     })),
-    next_cursor: hasMore && lastItem
-      ? encodeCursor({
-          created_at: lastItem.createdAt.toISOString(),
-          id: lastItem.id,
-        })
-      : null,
+    next_cursor:
+      hasMore && lastItem
+        ? encodeCursor({
+            created_at: lastItem.createdAt.toISOString(),
+            id: lastItem.id,
+          })
+        : null,
   };
 }

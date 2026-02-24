@@ -6,10 +6,11 @@ import {
   createLeaseToken,
 } from "../auth/worker-lease.ts";
 import {
-  findIngestionById,
+  findIngestionWithCreator,
   listIngestionFiles,
   updateIngestionStatus,
 } from "../repos/ingestion-repo.ts";
+import { findObjectBySourceIngestion } from "../repos/object-repo.ts";
 import {
   extendLease,
   leaseNextQueuedIngestion,
@@ -28,8 +29,106 @@ import type {
   ReleaseLeaseResponse,
   WorkerDownloadUrl,
 } from "../types/lease.ts";
+import { parseIngestionSummary } from "../validation/catalog.ts";
 
 const DEFAULT_LEASE_TTL_SECONDS = 60 * 5;
+
+function buildCatalogJson(params: {
+  ingestion: Awaited<ReturnType<typeof findIngestionWithCreator>>;
+  object?: Awaited<ReturnType<typeof findObjectBySourceIngestion>>;
+}): Record<string, unknown> {
+  const ingestion = params.ingestion;
+  if (!ingestion) {
+    throw new ConflictError("Catalog metadata is required before leasing this ingestion.");
+  }
+
+  if (!ingestion.createdByUsername) {
+    throw new ConflictError("Catalog metadata requires a creator username.", {
+      ingestion_id: ingestion.id,
+    });
+  }
+
+  let summary: Record<string, unknown>;
+  try {
+    summary = parseIngestionSummary(ingestion.summary);
+  } catch {
+    throw new ConflictError("Catalog metadata is required before leasing this ingestion.", {
+      ingestion_id: ingestion.id,
+    });
+  }
+
+  const catalog: Record<string, unknown> = {
+    schema_version: ingestion.schemaVersion,
+    object_id: params.object?.objectId ?? null,
+    updated_at: ingestion.updatedAt.toISOString(),
+    updated_by: ingestion.createdByUsername,
+    access: {
+      level: ingestion.accessLevel,
+      embargo_until: ingestion.embargoUntil ?? null,
+      rights_note: ingestion.rightsNote ?? null,
+      sensitivity_note: ingestion.sensitivityNote ?? null,
+    },
+    title: summary.title,
+    classification: {
+      ...(summary.classification as Record<string, unknown>),
+      type: ingestion.documentType,
+      language: ingestion.languageCode,
+    },
+    dates: summary.dates,
+  };
+
+  if (summary.item_kind !== undefined) {
+    catalog.item_kind = summary.item_kind;
+  }
+
+  if (summary.processing !== undefined) {
+    catalog.processing = summary.processing;
+  }
+
+  if (summary.publication !== undefined) {
+    catalog.publication = summary.publication;
+  }
+
+  if (summary.people !== undefined) {
+    catalog.people = summary.people;
+  }
+
+  if (summary.links !== undefined) {
+    catalog.links = summary.links;
+  }
+
+  if (summary.notes !== undefined) {
+    catalog.notes = summary.notes;
+  }
+
+  if (params.object) {
+    const access = catalog.access as Record<string, unknown>;
+    access.level = params.object.accessLevel;
+    access.embargo_until = params.object.embargoUntil ?? null;
+    access.rights_note = params.object.rightsNote ?? null;
+    access.sensitivity_note = params.object.sensitivityNote ?? null;
+    catalog.access = access;
+
+    const title = (catalog.title ?? {}) as Record<string, unknown>;
+    if (params.object.title && params.object.title.trim().length > 0) {
+      title.primary = params.object.title;
+    }
+    catalog.title = title;
+
+    const classification = (catalog.classification ?? {}) as Record<string, unknown>;
+    if (params.object.languageCode) {
+      classification.language = params.object.languageCode;
+    }
+    if (params.object.tags.length > 0) {
+      classification.tags = params.object.tags;
+    }
+    catalog.classification = classification;
+
+    catalog.object_id = params.object.objectId;
+  }
+
+  return catalog;
+}
 
 function buildDownloadUrls(params: {
   tenantId: string;
@@ -39,6 +138,8 @@ function buildDownloadUrls(params: {
     storageKey: string;
     contentType: string;
     sizeBytes: number;
+    checksumSha256?: string;
+    processingOverrides: Record<string, unknown>;
     status: string;
   }>;
   expiresAt: Date;
@@ -61,6 +162,8 @@ function buildDownloadUrls(params: {
         storage_key: file.storageKey,
         content_type: file.contentType,
         size_bytes: file.sizeBytes,
+        checksum_sha256: file.checksumSha256 ?? null,
+        processing_overrides: file.processingOverrides,
         download_url: `/api/worker/downloads/${token}`,
       };
     });
@@ -91,6 +194,20 @@ export async function leaseNextIngestion(params: {
     ingestionId: leaseResult.ingestion.id,
   });
 
+  const ingestion = await findIngestionWithCreator({
+    tenantId: leaseResult.ingestion.tenantId,
+    ingestionId: leaseResult.ingestion.id,
+  });
+
+  if (!ingestion) {
+    throw new NotFoundError(`Ingestion '${leaseResult.ingestion.id}' was not found.`);
+  }
+
+  const object = await findObjectBySourceIngestion({
+    tenantId: leaseResult.ingestion.tenantId,
+    ingestionId: leaseResult.ingestion.id,
+  });
+
   const leaseToken = createLeaseToken({
     lease_id: leaseResult.lease.id,
     lease_token_id: leaseResult.lease.leaseTokenId,
@@ -114,6 +231,10 @@ export async function leaseNextIngestion(params: {
         files: ingestionFiles,
         expiresAt: leaseResult.lease.leaseExpiresAt,
       }),
+      catalog_json: buildCatalogJson({
+        ingestion,
+        object,
+      }),
     },
   };
 }
@@ -134,10 +255,10 @@ export async function heartbeatLease(
     throw new ConflictError("Lease is no longer active.");
   }
 
-  const ingestion = await findIngestionById(
-    authorizedLease.tenantId,
-    authorizedLease.ingestionId,
-  );
+  const ingestion = await findIngestionWithCreator({
+    tenantId: authorizedLease.tenantId,
+    ingestionId: authorizedLease.ingestionId,
+  });
 
   if (!ingestion) {
     throw new NotFoundError(
@@ -146,6 +267,11 @@ export async function heartbeatLease(
   }
 
   const ingestionFiles = await listIngestionFiles({
+    tenantId: authorizedLease.tenantId,
+    ingestionId: authorizedLease.ingestionId,
+  });
+
+  const object = await findObjectBySourceIngestion({
     tenantId: authorizedLease.tenantId,
     ingestionId: authorizedLease.ingestionId,
   });
@@ -173,6 +299,10 @@ export async function heartbeatLease(
         files: ingestionFiles,
         expiresAt: updatedLease.leaseExpiresAt,
       }),
+      catalog_json: buildCatalogJson({
+        ingestion,
+        object,
+      }),
     },
   };
 }
@@ -192,10 +322,10 @@ export async function releaseActiveLease(
     throw new ConflictError("Lease is no longer active.");
   }
 
-  const ingestion = await findIngestionById(
-    authorizedLease.tenantId,
-    authorizedLease.ingestionId,
-  );
+  const ingestion = await findIngestionWithCreator({
+    tenantId: authorizedLease.tenantId,
+    ingestionId: authorizedLease.ingestionId,
+  });
 
   if (!ingestion) {
     throw new NotFoundError(

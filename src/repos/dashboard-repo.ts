@@ -1,4 +1,5 @@
 import { withSchemaClient } from "../db/client.ts";
+import type { JsonObject } from "../validation/ingestion.ts";
 
 interface SummaryCountsRow {
   total_ingestions: number;
@@ -17,7 +18,7 @@ interface ActivityRow {
   type: string;
   ingestion_id: string | null;
   object_id: string | null;
-  payload: unknown;
+  payload: JsonObject;
   actor_user_id: string | null;
   created_at: Date;
 }
@@ -36,7 +37,7 @@ export interface ActivityRecord {
   type: string;
   ingestionId?: string;
   objectId?: string;
-  payload: unknown;
+  payload: JsonObject;
   actorUserId?: string;
   createdAt: Date;
 }

@@ -434,9 +434,12 @@ Purpose: allow the private worker to report ingestion progress and outcomes to t
 
 - `POST /api/ingestions`
 - `GET /api/ingestions`
+- `DELETE /api/ingestions/:id`
+- `GET /api/ingestions/capabilities`
 - `GET /api/ingestions/:id`
 - `POST /api/ingestions/:id/submit`
 - `POST /api/ingestions/:id/cancel`
+- `POST /api/ingestions/:id/restore`
 - `POST /api/ingestions/:id/retry`
 
 ---
@@ -446,7 +449,15 @@ Purpose: allow the private worker to report ingestion progress and outcomes to t
 **Presigned upload (recommended):**
 
 - `POST /api/ingestions/:id/files/presign`
+- `DELETE /api/ingestions/:id/files/:fileId`
 - `POST /api/ingestions/:id/files/commit`
+
+Ingestion batches must be homogeneous by media kind (`image`, `audio`, `video`, `document`). Image batches may mix `image/jpeg`, `image/png`, `image/tiff`, `image/webp`, `image/gif`, `image/bmp`, `image/heic`, `image/heif`, `image/svg+xml`.
+Client-side validation should use `GET /api/ingestions/capabilities` as the source of truth for supported types.
+Files may be deleted while an ingestion is in `DRAFT` or `UPLOADING`.
+Ingestions may be deleted while in `DRAFT`, `UPLOADING`, or `CANCELED` as long as processing has not started.
+Queued ingestions may be canceled back to `UPLOADING` if processing has not started.
+Canceled ingestions may be restored to `DRAFT` or `UPLOADING` depending on file presence.
 
 ---
 

@@ -212,3 +212,19 @@ export async function findActiveLeaseByToken(params: {
   const row = rows[0];
   return row ? mapLease(row) : undefined;
 }
+
+export async function hasActiveLease(ingestionId: string): Promise<boolean> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<Array<{ exists: boolean }>>`
+      SELECT EXISTS(
+        SELECT 1
+        FROM ingestion_leases
+        WHERE ingestion_id = ${ingestionId}
+          AND released_at IS NULL
+          AND lease_expires_at > now()
+      ) AS exists
+    `;
+  });
+
+  return Boolean(rows[0]?.exists ?? false);
+}

@@ -76,15 +76,17 @@ describe("database migrations", () => {
         const accessRequestIndexNames = accessRequestIndexRows.map((row) => row.indexname);
         expect(accessRequestIndexNames.includes("object_access_requests_one_pending_per_user_idx")).toBe(true);
 
-        const indexRows = (await sql.unsafe(`
-        SELECT indexname
-        FROM pg_indexes
-        WHERE schemaname = ${asSqlLiteral(schema)}
-          AND tablename = 'ingestion_leases'
-      `)) as Array<{ indexname: string }>;
+        const constraintRows = (await sql.unsafe(`
+        SELECT conname
+        FROM pg_constraint c
+        INNER JOIN pg_class t ON t.oid = c.conrelid
+        INNER JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE n.nspname = ${asSqlLiteral(schema)}
+          AND t.relname = 'ingestion_leases'
+      `)) as Array<{ conname: string }>;
 
-        const indexNames = indexRows.map((row) => row.indexname);
-        expect(indexNames.includes("ingestion_leases_one_active_idx")).toBe(
+        const constraintNames = constraintRows.map((row) => row.conname);
+        expect(constraintNames.includes("ingestion_leases_no_overlap")).toBe(
           true,
         );
 

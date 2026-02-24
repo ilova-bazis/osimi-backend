@@ -45,6 +45,8 @@ On non-2xx responses, JSON errors follow this shape:
 
 Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NOT_ALLOWED`, `CONFLICT`, `CONFIGURATION_ERROR`, `INTERNAL_SERVER_ERROR`.
 
+Planned addition: `LOCKED` (for HTTP `423` state-based non-deliverable conditions).
+
 ---
 
 ## Public / System
@@ -124,6 +126,15 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 - Roles: `archiver`, `admin`
 - Body:
   - `batch_label` (string)
+  - `schema_version` (string, must be `"1.0"`)
+  - `document_type` (string; one of `newspaper_article`, `magazine_article`, `book_chapter`, `book`, `photo`, `letter`, `speech`, `interview`, `document`, `other`)
+  - `language_code` (string, non-empty; unrestricted)
+  - `pipeline_preset` (string; one of `auto`, `none`, `ocr_text`, `audio_transcript`, `video_transcript`, `ocr_and_audio_transcript`, `ocr_and_video_transcript`)
+  - `access_level` (string; `private`, `family`, `public`)
+  - `embargo_until` (optional RFC3339 timestamp)
+  - `rights_note` (optional string)
+  - `sensitivity_note` (optional string)
+  - `summary` (object; ingestion-stage metadata, based on `catalog.json` fields)
 - 201 response:
   - `ingestion` (draft ingestion object)
 
@@ -146,6 +157,27 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
   - `ingestion`
   - `files[]`
 
+### DELETE `/api/ingestions/:id`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Preconditions:
+  - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
+  - ingestion has not started processing (no active lease)
+- 200 response:
+  - `status` = `deleted`
+  - `ingestion_id`
+
+### GET `/api/ingestions/capabilities`
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- 200 response:
+  - `media_kinds` (array)
+  - `extensions_by_kind` (object)
+  - `mime_by_kind` (object)
+  - `mime_aliases` (object)
+
 ### POST `/api/ingestions/:id/files/presign`
 
 - Auth: Bearer token
@@ -157,12 +189,36 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 - 201 response:
   - `file_id`, `storage_key`, `upload_url`, `expires_at`, `headers { content-type, content-length }`
 
+### DELETE `/api/ingestions/:id/files/:fileId`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Preconditions:
+  - ingestion is in `DRAFT` or `UPLOADING`
+- 200 response:
+  - `status` = `deleted`
+  - `file_id`
+
+### POST `/api/ingestions/:id/files/:fileId/overrides`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Body:
+  - `processing_overrides` (object; per-file processing intent overrides, unknown keys allowed)
+- Preconditions:
+  - ingestion is in `DRAFT` or `UPLOADING`
+- 200 response:
+  - `file` (updated ingestion file record)
+
 ### POST `/api/ingestions/:id/files/commit`
 
 - Auth: Bearer token
 - Roles: `archiver`, `admin`
 - Body:
   - `file_id`, `checksum_sha256`
+- Preconditions:
+  - all ingestion files must share a single media kind (`image`, `audio`, `video`, `document`)
+  - image batches may include: `image/jpeg`, `image/png`, `image/tiff`, `image/webp`, `image/gif`, `image/bmp`, `image/heic`, `image/heif`, `image/svg+xml`
 - 200 response:
   - `file` (updated ingestion file record)
 
@@ -180,8 +236,24 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 
 - Auth: Bearer token
 - Roles: `archiver`, `admin`
+- Preconditions:
+  - ingestion has not started processing (no active lease)
 - 200 response:
   - `ingestion`
+  - behavior:
+    - `QUEUED` transitions to `UPLOADING`
+    - `DRAFT` or `UPLOADING` transitions to `CANCELED`
+    - `CANCELED` is returned unchanged
+
+### POST `/api/ingestions/:id/restore`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Preconditions:
+  - ingestion status is `CANCELED`
+  - ingestion has not started processing (no active lease)
+- 200 response:
+  - `ingestion` (status transitions to draft or uploading based on files)
 
 ### POST `/api/ingestions/:id/retry`
 
@@ -206,6 +278,7 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
   - `access_level` (optional: `private`, `family`, `public`)
   - `language` (optional)
   - `batch_label` (optional)
+    - Filters by source ingestion batch label (same dimension returned as `source_batch_label` in list rows).
   - `type` (`GENERIC|IMAGE|AUDIO|VIDEO|DOCUMENT`, optional)
   - `from` (ISO timestamp, optional)
   - `to` (ISO timestamp, optional)
@@ -223,9 +296,13 @@ List row guarantees (`objects[]`):
   - `object_id`
   - `title`
   - `processing_state`
+    - allowed: `queued`, `ingesting`, `ingested`, `derivatives_running`, `derivatives_done`, `ocr_running`, `ocr_done`, `index_running`, `index_done`, `processing_failed`, `processing_skipped`
   - `curation_state`
+    - allowed: `needs_review`, `review_in_progress`, `reviewed`, `curation_failed`
   - `availability_state`
+    - allowed: `AVAILABLE`, `ARCHIVED`, `RESTORE_PENDING`, `RESTORING`, `UNAVAILABLE`
   - `access_level`
+    - allowed: `private`, `family`, `public`
   - `type`
   - `tenant_id`
   - `source_ingestion_id` (`null` allowed)
@@ -235,11 +312,14 @@ List row guarantees (`objects[]`):
   - `updated_at`
   - `embargo_until` (`null` allowed)
   - `embargo_kind`
+    - allowed: `none`, `timed`, `curation_state`
   - `embargo_curation_state` (`null` allowed)
+    - when non-null, allowed: `needs_review`, `review_in_progress`, `reviewed`, `curation_failed`
   - `rights_note` (`null` allowed)
   - `sensitivity_note` (`null` allowed)
   - `can_download`
   - `access_reason_code` (`OK`, `FORBIDDEN_POLICY`, `EMBARGO_ACTIVE`, `RESTORE_REQUIRED`, `RESTORE_IN_PROGRESS`, `TEMP_UNAVAILABLE`)
+    - computed per requester at read time from access policy + availability state
 - optional nullable keys:
   - `language` (`null` if unknown)
 - excluded from list payload:
@@ -271,9 +351,13 @@ Example response:
       "source_ingestion_id": "13dd3927-17be-4211-9a77-fdea3104a028",
       "source_batch_label": "batch-2026-02-13-001",
       "metadata": {},
+      "embargo_kind": "none",
+      "embargo_curation_state": null,
       "embargo_until": null,
       "rights_note": null,
       "sensitivity_note": null,
+      "can_download": false,
+      "access_reason_code": "FORBIDDEN_POLICY",
       "created_at": "2026-02-13T20:22:29.993Z",
       "updated_at": "2026-02-14T08:01:00.000Z"
     }
@@ -319,6 +403,19 @@ Example response:
 
 - Auth: Bearer token
 - Roles: `viewer`, `archiver`, `admin`
+- Access policy:
+  - Endpoint authorization is role-aware and object access-policy aware.
+  - A valid role alone does not guarantee download access.
+  - `admin` can override access policy restrictions in the current implementation.
+- Current behavior:
+  - Returns `400 BAD_REQUEST` when object exists but is not downloadable in current policy/deliverability state.
+  - Returns `404 NOT_FOUND` when object or artifact does not exist (or is outside tenant scope).
+  - Current non-2xx JSON `error.code` values remain from the standard set (for example `BAD_REQUEST`, `NOT_FOUND`).
+- Planned behavior (future refinement):
+  - Use `403 FORBIDDEN` for policy denial.
+  - Use `409 CONFLICT` / `423 LOCKED` for state-based non-deliverable conditions.
+  - Keep `404 NOT_FOUND` for missing/non-visible resources.
+  - Planned HTTP status refinement does not require changing request/response success payload shape.
 - 200 response:
   - Binary file response
   - headers include `content-type`, `content-length`, `content-disposition`
@@ -363,6 +460,7 @@ Example response:
 - Roles: `admin`
 - Body:
   - `decision_note` (optional string)
+  - Empty request body is allowed.
 - 200 response:
   - `request` (status becomes `APPROVED`)
   - creates or updates assignment for requester
@@ -375,6 +473,7 @@ Example response:
 - Roles: `admin`
 - Body:
   - `decision_note` (optional string)
+  - Empty request body is allowed.
 - 200 response:
   - `request` (status becomes `REJECTED`)
 - Conflict behavior:
@@ -413,6 +512,8 @@ Example response:
 
 Worker APIs are for ingestion workers, not UI clients.
 
+Integration guide for archive worker teams: `docs/archive-system-integration.md`.
+
 ## Lease lifecycle
 
 ### POST `/api/ingestions/lease`
@@ -421,7 +522,11 @@ Worker APIs are for ingestion workers, not UI clients.
 - Optional: `x-worker-id`
 - 200 response:
   - `lease: null` when no queued ingestion available
-  - or `lease { lease_id, lease_token, lease_expires_at, ingestion_id, batch_label, tenant_id, download_urls[] }`
+  - or `lease { lease_id, lease_token, lease_expires_at, ingestion_id, batch_label, tenant_id, download_urls[], catalog_json }`
+  - `catalog_json` is generated from ingestion first-class fields and `summary`
+- ingestion-stage leases may provide `catalog_json.object_id = null`
+- each `download_urls[]` item includes `checksum_sha256` for worker validation
+- each `download_urls[]` item includes `processing_overrides` (object; per-file overrides)
 
 ### POST `/api/ingestions/:id/lease/heartbeat`
 
@@ -431,7 +536,7 @@ Worker APIs are for ingestion workers, not UI clients.
 - Body:
   - `lease_token`
 - 200 response:
-  - refreshed `lease { ... }` including a refreshed `lease_token`
+  - refreshed `lease { ... }` including refreshed `lease_token`, `download_urls[]`, and `catalog_json`
 
 ### POST `/api/ingestions/:id/lease/release`
 
@@ -461,7 +566,24 @@ Worker APIs are for ingestion workers, not UI clients.
   - `lease_token`
   - `events[]` where each event includes:
     - `event_id` (UUID)
-    - `event_type` (supported ingestion/object pipeline event types)
+    - `event_type` (supported values)
+      - `INGESTION_SUBMITTED`
+      - `INGESTION_QUEUED`
+      - `INGESTION_PROCESSING`
+      - `INGESTION_COMPLETED`
+      - `INGESTION_FAILED`
+      - `INGESTION_CANCELED`
+      - `LEASE_GRANTED`
+      - `LEASE_RENEWED`
+      - `LEASE_EXPIRED`
+      - `LEASE_RELEASED`
+      - `FILE_VALIDATED`
+      - `FILE_FAILED`
+      - `PIPELINE_STEP_STARTED`
+      - `PIPELINE_STEP_COMPLETED`
+      - `PIPELINE_STEP_FAILED`
+      - `OBJECT_CREATED`
+      - `ARTIFACT_CREATED`
     - `timestamp` (ISO datetime)
     - `payload` (object)
     - `object_id` (required for completion/object/artifact event types)
@@ -469,6 +591,10 @@ Worker APIs are for ingestion workers, not UI clients.
   - idempotent by `event_id`
   - out-of-order tolerant
   - completion event creates or resolves object by source ingestion
+  - state projection rules (current phase):
+    - `INGESTION_COMPLETED` updates object projection to `processing_state = index_done` and `availability_state = AVAILABLE`
+    - `curation_state` is not currently projected from worker event stream in this phase
+    - other event types are stored for audit/activity; they do not currently mutate object projection fields directly
   - `payload.ingest_json` (when provided) updates `objects.ingest_manifest` (last-write-wins)
 - 200 response:
   - `status`, `ingestion_id`, `inserted_events`, `duplicate_events`, `object_id`

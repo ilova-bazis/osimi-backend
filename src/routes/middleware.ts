@@ -41,15 +41,19 @@ export function withWorkerIngestionJsonBody<TBody>(params: {
   pathPattern: RegExp;
   pathParamName: string;
   parseBody: (body: unknown) => TBody;
+  parseParam?: (value: string) => string;
   handler: WorkerIngestionBodyRouteHandler<TBody>;
 }): RouteDefinition["handler"] {
   return withWorkerAuth(async (request, context, worker) => {
     const pathname = new URL(request.url).pathname;
-    const ingestionId = extractPathParam(
+    const ingestionIdRaw = extractPathParam(
       pathname,
       params.pathPattern,
       params.pathParamName,
     );
+    const ingestionId = params.parseParam
+      ? params.parseParam(ingestionIdRaw)
+      : ingestionIdRaw;
     const rawBody = await parseJsonBody(request);
     const body = params.parseBody(rawBody);
 
@@ -77,6 +81,7 @@ export function withWorkerAuthorizedLease<TBody extends { lease_token: string }>
     pathPattern: RegExp;
     pathParamName: string;
     parseBody: (body: unknown) => TBody;
+    parseParam?: (value: string) => string;
     handler: WorkerAuthorizedLeaseRouteHandler<TBody>;
   },
 ): RouteDefinition["handler"] {
@@ -84,6 +89,7 @@ export function withWorkerAuthorizedLease<TBody extends { lease_token: string }>
     pathPattern: params.pathPattern,
     pathParamName: params.pathParamName,
     parseBody: params.parseBody,
+    parseParam: params.parseParam,
     handler: async (request, context, data) => {
       const authorizedLease = await authorizeWorkerLeaseForIngestion({
         ingestionId: data.ingestionId,

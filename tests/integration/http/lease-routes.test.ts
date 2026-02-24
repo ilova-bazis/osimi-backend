@@ -23,6 +23,50 @@ function sha256Hex(value: string): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 
+const LEASE_PAYLOAD = "lease flow";
+
+function buildSummary(overrides?: Record<string, unknown>): Record<string, unknown> {
+  return {
+    title: {
+      primary: "Lease catalog payload",
+      original_script: null,
+      translations: [],
+    },
+    classification: {
+      tags: ["source:test"],
+      summary: null,
+    },
+    dates: {
+      published: {
+        value: null,
+        approximate: true,
+        confidence: "low",
+        note: null,
+      },
+      created: {
+        value: null,
+        approximate: true,
+        confidence: "low",
+        note: null,
+      },
+    },
+    ...(overrides ?? {}),
+  };
+}
+
+function buildIngestionBody(overrides?: Record<string, unknown>): Record<string, unknown> {
+  return {
+    batch_label: `batch-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+    schema_version: "1.0",
+    document_type: "document",
+    language_code: "en",
+    pipeline_preset: "auto",
+    access_level: "private",
+    summary: buildSummary(),
+    ...(overrides ?? {}),
+  };
+}
+
 async function cancelQueuedIngestions(schema: string): Promise<void> {
   const sql = createSqlClient(TEST_DATABASE_URL!);
 
@@ -49,7 +93,8 @@ async function expireActiveLease(schema: string, ingestionId: string): Promise<v
     await sql.unsafe(
       `
         UPDATE ${leasesTable}
-        SET lease_expires_at = now() - interval '1 minute'
+        SET lease_started_at = now() - interval '2 minute',
+            lease_expires_at = now() - interval '1 minute'
         WHERE ingestion_id = $1
           AND released_at IS NULL
       `,
@@ -88,7 +133,12 @@ async function resetActiveIngestions(schema: string): Promise<void> {
   }
 }
 
-async function createQueuedIngestion(app: ReturnType<typeof createApp>, token: string): Promise<string> {
+async function createQueuedIngestion(
+  app: ReturnType<typeof createApp>,
+  token: string,
+  summary?: Record<string, unknown>,
+  processingOverrides?: Record<string, unknown>,
+): Promise<string> {
   const createResponse = await app.fetch(
     new Request("http://localhost/api/ingestions", {
       method: "POST",
@@ -97,7 +147,9 @@ async function createQueuedIngestion(app: ReturnType<typeof createApp>, token: s
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        batch_label: `batch-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+        ...buildIngestionBody({
+          summary: summary ?? buildSummary(),
+        }),
       }),
     }),
   );
@@ -105,7 +157,7 @@ async function createQueuedIngestion(app: ReturnType<typeof createApp>, token: s
   const created = (await createResponse.json()) as { ingestion: { id: string } };
   const ingestionId = created.ingestion.id;
 
-  const payload = "lease flow";
+  const payload = LEASE_PAYLOAD;
   const presignResponse = await app.fetch(
     new Request(`http://localhost/api/ingestions/${ingestionId}/files/presign`, {
       method: "POST",
@@ -125,6 +177,26 @@ async function createQueuedIngestion(app: ReturnType<typeof createApp>, token: s
     file_id: string;
     upload_url: string;
   };
+
+  if (processingOverrides) {
+    const overrideResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/ingestions/${ingestionId}/files/${presignBody.file_id}/overrides`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            processing_overrides: processingOverrides,
+          }),
+        },
+      ),
+    );
+
+    expect(overrideResponse.status).toBe(200);
+  }
 
   await app.fetch(
     new Request(`http://localhost${presignBody.upload_url}`, {
@@ -292,12 +364,17 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
       lease: {
         ingestion_id: string;
         lease_token: string;
-        download_urls: Array<{ download_url: string }>;
+        download_urls: Array<{ download_url: string; checksum_sha256: string | null }>;
+        catalog_json: Record<string, unknown>;
       };
     };
 
     expect(leaseBody.lease.ingestion_id).toBe(ingestionId);
     expect(leaseBody.lease.download_urls.length).toBe(1);
+    expect(leaseBody.lease.catalog_json).not.toBeNull();
+    expect(leaseBody.lease.download_urls[0]?.checksum_sha256).toBe(
+      sha256Hex(LEASE_PAYLOAD),
+    );
 
     const downloadResponse = await app.fetch(
       new Request(`http://localhost${leaseBody.lease.download_urls[0]!.download_url}`),
@@ -320,6 +397,12 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     );
 
     expect(heartbeatResponse.status).toBe(200);
+    const heartbeatBody = (await heartbeatResponse.json()) as {
+      lease: {
+        catalog_json: Record<string, unknown>;
+      };
+    };
+    expect(heartbeatBody.lease.catalog_json).not.toBeNull();
 
     const releaseResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/lease/release`, {
@@ -461,6 +544,115 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     };
 
     expect(secondBody.lease.ingestion_id).toBe(ingestionId);
+  });
+
+  test("includes catalog_json in lease and heartbeat when provided at ingestion creation", async () => {
+    const app = createTestApp();
+    const summary = buildSummary({
+      title: {
+        primary: "Lease catalog payload",
+        original_script: null,
+        translations: [],
+      },
+    });
+
+    const ingestionId = await createQueuedIngestion(app, authToken, summary);
+
+    const leaseResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-catalog",
+        },
+      }),
+    );
+
+    expect(leaseResponse.status).toBe(200);
+    const leaseBody = (await leaseResponse.json()) as {
+      lease: {
+        ingestion_id: string;
+        lease_token: string;
+        catalog_json: {
+          schema_version: string;
+          title: { primary: string };
+          object_id: string | null;
+        };
+      };
+    };
+
+    expect(leaseBody.lease.ingestion_id).toBe(ingestionId);
+    expect(leaseBody.lease.catalog_json).not.toBeNull();
+    expect(leaseBody.lease.catalog_json?.schema_version).toBe("1.0");
+    expect(leaseBody.lease.catalog_json?.title.primary).toBe("Lease catalog payload");
+    expect(leaseBody.lease.catalog_json?.object_id).toBeNull();
+
+    const heartbeatResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/lease/heartbeat`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          lease_token: leaseBody.lease.lease_token,
+        }),
+      }),
+    );
+
+    expect(heartbeatResponse.status).toBe(200);
+    const heartbeatBody = (await heartbeatResponse.json()) as {
+      lease: {
+        catalog_json: {
+          schema_version: string;
+          title: { primary: string };
+          object_id: string | null;
+        };
+      };
+    };
+
+    expect(heartbeatBody.lease.catalog_json).not.toBeNull();
+    expect(heartbeatBody.lease.catalog_json?.schema_version).toBe("1.0");
+    expect(heartbeatBody.lease.catalog_json?.title.primary).toBe("Lease catalog payload");
+    expect(heartbeatBody.lease.catalog_json?.object_id).toBeNull();
+  });
+
+  test("includes per-file processing overrides in lease payload", async () => {
+    const app = createTestApp();
+    const processingOverrides = {
+      ocr_text: { enabled: true, language: "tg" },
+      video_transcript: { enabled: false },
+    };
+
+    const ingestionId = await createQueuedIngestion(
+      app,
+      authToken,
+      undefined,
+      processingOverrides,
+    );
+
+    const leaseResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-overrides",
+        },
+      }),
+    );
+
+    expect(leaseResponse.status).toBe(200);
+    const leaseBody = (await leaseResponse.json()) as {
+      lease: {
+        ingestion_id: string;
+        download_urls: Array<{ processing_overrides: Record<string, unknown> }>;
+      };
+    };
+
+    expect(leaseBody.lease.ingestion_id).toBe(ingestionId);
+    expect(leaseBody.lease.download_urls[0]?.processing_overrides).toMatchObject(
+      processingOverrides,
+    );
   });
 
   test("rejects expired worker download token", async () => {

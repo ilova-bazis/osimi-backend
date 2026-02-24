@@ -131,8 +131,19 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
 
       await sql.unsafe(
         `
-          INSERT INTO ${ingestionsTable} (id, batch_label, tenant_id, status, created_by)
-          VALUES ($1, $2, $3, 'COMPLETED', $4)
+          INSERT INTO ${ingestionsTable} (
+            id,
+            batch_label,
+            tenant_id,
+            status,
+            created_by,
+            schema_version,
+            document_type,
+            language_code,
+            pipeline_preset,
+            access_level
+          )
+          VALUES ($1, $2, $3, 'COMPLETED', $4, '1.0', 'document', 'en', 'auto', 'private')
         `,
         [
           sourceIngestionId,

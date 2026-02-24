@@ -22,6 +22,48 @@ function sha256Hex(value: string): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 
+function buildSummary(overrides?: Record<string, unknown>): Record<string, unknown> {
+  return {
+    title: {
+      primary: "Event catalog payload",
+      original_script: null,
+      translations: [],
+    },
+    classification: {
+      tags: ["source:test"],
+      summary: null,
+    },
+    dates: {
+      published: {
+        value: null,
+        approximate: true,
+        confidence: "low",
+        note: null,
+      },
+      created: {
+        value: null,
+        approximate: true,
+        confidence: "low",
+        note: null,
+      },
+    },
+    ...(overrides ?? {}),
+  };
+}
+
+function buildIngestionBody(overrides?: Record<string, unknown>): Record<string, unknown> {
+  return {
+    batch_label: `batch-events-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+    schema_version: "1.0",
+    document_type: "document",
+    language_code: "en",
+    pipeline_preset: "auto",
+    access_level: "private",
+    summary: buildSummary(),
+    ...(overrides ?? {}),
+  };
+}
+
 async function createQueuedIngestion(app: ReturnType<typeof createApp>, token: string): Promise<string> {
   const createResponse = await app.fetch(
     new Request("http://localhost/api/ingestions", {
@@ -30,9 +72,7 @@ async function createQueuedIngestion(app: ReturnType<typeof createApp>, token: s
         authorization: `Bearer ${token}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        batch_label: `batch-events-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
-      }),
+      body: JSON.stringify(buildIngestionBody()),
     }),
   );
 

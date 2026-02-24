@@ -8,8 +8,10 @@ import {
 } from "../services/lease-service.ts";
 import { parseIngestWorkerEventsBody } from "../validation/event.ts";
 import { parseLeaseTokenBody } from "../validation/lease.ts";
+import { parseIngestionIdParam } from "../validation/ingestion.ts";
 import { withWorkerAuth, withWorkerAuthorizedLease } from "./middleware.ts";
 import { extractPathParam } from "./params.ts";
+import { parseUploadTokenParam } from "../validation/ingestion.ts";
 import type { RouteDefinition } from "./types.ts";
 
 const leaseRoute: RouteDefinition = {
@@ -30,6 +32,7 @@ const heartbeatRoute: RouteDefinition = {
   handler: withWorkerAuthorizedLease({
     pathPattern: /^\/api\/ingestions\/([^/]+)\/lease\/heartbeat$/,
     pathParamName: "id",
+    parseParam: parseIngestionIdParam,
     parseBody: parseLeaseTokenBody,
     handler: async (_request, _context, data) => {
       return jsonResponse(
@@ -47,6 +50,7 @@ const releaseRoute: RouteDefinition = {
   handler: withWorkerAuthorizedLease({
     pathPattern: /^\/api\/ingestions\/([^/]+)\/lease\/release$/,
     pathParamName: "id",
+    parseParam: parseIngestionIdParam,
     parseBody: parseLeaseTokenBody,
     handler: async (_request, _context, data) => {
       return jsonResponse(
@@ -63,7 +67,13 @@ const workerDownloadRoute: RouteDefinition = {
   path: "/api/worker/downloads/:token",
   handler: async (request, _context) => {
     const pathname = new URL(request.url).pathname;
-    const token = extractPathParam(pathname, /^\/api\/worker\/downloads\/([^/]+)$/, "token");
+    const token = parseUploadTokenParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/worker\/downloads\/([^/]+)$/,
+        "token",
+      ),
+    );
     return downloadStagedFileByToken({ token });
   },
 };
@@ -74,6 +84,7 @@ const workerEventsRoute: RouteDefinition = {
   handler: withWorkerAuthorizedLease({
     pathPattern: /^\/api\/ingestions\/([^/]+)\/events$/,
     pathParamName: "id",
+    parseParam: parseIngestionIdParam,
     parseBody: parseIngestWorkerEventsBody,
     handler: async (_request, _context, data) => {
       return jsonResponse(

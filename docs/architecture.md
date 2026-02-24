@@ -2,6 +2,8 @@
 
 This document describes how the Osimi backend control plane (VPS) interacts with the private home archive worker and storage.
 
+Detailed worker integration contract: `docs/archive-system-integration.md`.
+
 ## Overview
 
 - Public VPS hosts the web UI and REST API

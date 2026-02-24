@@ -1,19 +1,30 @@
-import { requireRole, requireTenantScope } from "../auth/guards.ts";
+import { requireRole } from "../auth/guards.ts";
 import { jsonResponse } from "../http/response.ts";
+import { parseJsonBody } from "../validation/common.ts";
 import {
-  parseJsonBody,
-  requireObject,
-  requireStringField,
-} from "../validation/common.ts";
+  parseCommitUploadedFileBody,
+  parseCreateIngestionBody,
+  parseCreatePresignedUploadBody,
+  parseIngestionFileIdParam,
+  parseIngestionIdParam,
+  parseIngestionListQuery,
+  parseUpdateIngestionFileOverridesBody,
+  parseUploadTokenParam,
+} from "../validation/ingestion.ts";
 import {
   cancelIngestion,
   commitUploadedFile,
   createIngestionDraft,
   createPresignedUpload,
+  deleteIngestionRecord,
+  getIngestionCapabilities,
   getIngestion,
   getIngestionList,
+  removeIngestionFile,
+  restoreIngestion,
   retryIngestion,
   submitIngestion,
+  updateIngestionFileOverrides,
   uploadFileBySignedToken,
 } from "../services/ingestion-service.ts";
 import { extractPathParam } from "./params.ts";
@@ -24,14 +35,11 @@ const createIngestionRoute: RouteDefinition = {
   path: "/api/ingestions",
   handler: async (request, context) => {
     const auth = requireRole(context, ["archiver", "admin"]);
-    const body = requireObject(await parseJsonBody(request));
-    const batchLabel = requireStringField(body, "batch_label");
-
+    const body = parseCreateIngestionBody(await parseJsonBody(request));
     return jsonResponse(
       await createIngestionDraft({
-        tenantId: auth.tenantId,
-        userId: auth.userId,
-        batchLabel,
+        auth,
+        body,
       }),
       {
         status: 201,
@@ -44,10 +52,10 @@ const listIngestionsRoute: RouteDefinition = {
   method: "GET",
   path: "/api/ingestions",
   handler: async (request, context) => {
-    requireRole(context, ["viewer", "archiver", "admin"]);
-    const tenantId = requireTenantScope(context);
+    const auth = requireRole(context, ["viewer", "archiver", "admin"]);
     const url = new URL(request.url);
-    const result = await getIngestionList({ tenantId, url });
+    const query = parseIngestionListQuery(url);
+    const result = await getIngestionList({ auth, query });
 
     return jsonResponse({
       ingestions: result.items,
@@ -60,11 +68,40 @@ const getIngestionRoute: RouteDefinition = {
   method: "GET",
   path: "/api/ingestions/:id",
   handler: async (request, context) => {
-    requireRole(context, ["viewer", "archiver", "admin"]);
-    const tenantId = requireTenantScope(context);
+    const auth = requireRole(context, ["viewer", "archiver", "admin"]);
     const pathname = new URL(request.url).pathname;
-    const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)$/, "id");
-    return jsonResponse(await getIngestion({ tenantId, ingestionId }));
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)$/, "id"),
+    );
+    return jsonResponse(await getIngestion({ auth, ingestionId }));
+  },
+};
+
+const deleteIngestionRoute: RouteDefinition = {
+  method: "DELETE",
+  path: "/api/ingestions/:id",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)$/, "id"),
+    );
+
+    return jsonResponse(
+      await deleteIngestionRecord({
+        auth,
+        ingestionId,
+      }),
+    );
+  },
+};
+
+const ingestionCapabilitiesRoute: RouteDefinition = {
+  method: "GET",
+  path: "/api/ingestions/capabilities",
+  handler: async (_request, context) => {
+    requireRole(context, ["viewer", "archiver", "admin"]);
+    return jsonResponse(getIngestionCapabilities());
   },
 };
 
@@ -72,15 +109,20 @@ const presignFileRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/files/presign",
   handler: async (request, context) => {
-    requireRole(context, ["archiver", "admin"]);
-    const tenantId = requireTenantScope(context);
+    const auth = requireRole(context, ["archiver", "admin"]);
     const pathname = new URL(request.url).pathname;
-    const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/files\/presign$/, "id");
-    const body = await parseJsonBody(request);
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/([^/]+)\/files\/presign$/,
+        "id",
+      ),
+    );
+    const body = parseCreatePresignedUploadBody(await parseJsonBody(request));
 
     return jsonResponse(
       await createPresignedUpload({
-        tenantId,
+        auth,
         ingestionId,
         body,
       }),
@@ -91,19 +133,90 @@ const presignFileRoute: RouteDefinition = {
   },
 };
 
+const removeFileRoute: RouteDefinition = {
+  method: "DELETE",
+  path: "/api/ingestions/:id/files/:fileId",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/([^/]+)\/files\/[^/]+$/,
+        "id",
+      ),
+    );
+    const fileId = parseIngestionFileIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/[^/]+\/files\/([^/]+)$/,
+        "fileId",
+      ),
+    );
+
+    return jsonResponse(
+      await removeIngestionFile({
+        auth,
+        ingestionId,
+        fileId,
+      }),
+    );
+  },
+};
+
+const updateFileOverridesRoute: RouteDefinition = {
+  method: "POST",
+  path: "/api/ingestions/:id/files/:fileId/overrides",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/([^/]+)\/files\/[^/]+\/overrides$/,
+        "id",
+      ),
+    );
+    const fileId = parseIngestionFileIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/[^/]+\/files\/([^/]+)\/overrides$/,
+        "fileId",
+      ),
+    );
+    const body = parseUpdateIngestionFileOverridesBody(
+      await parseJsonBody(request),
+    );
+
+    return jsonResponse(
+      await updateIngestionFileOverrides({
+        auth,
+        ingestionId,
+        fileId,
+        body,
+      }),
+    );
+  },
+};
+
 const commitFileRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/files/commit",
   handler: async (request, context) => {
-    requireRole(context, ["archiver", "admin"]);
-    const tenantId = requireTenantScope(context);
+    const auth = requireRole(context, ["archiver", "admin"]);
     const pathname = new URL(request.url).pathname;
-    const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/files\/commit$/, "id");
-    const body = await parseJsonBody(request);
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/([^/]+)\/files\/commit$/,
+        "id",
+      ),
+    );
+    const body = parseCommitUploadedFileBody(await parseJsonBody(request));
 
     return jsonResponse(
       await commitUploadedFile({
-        tenantId,
+        auth,
         ingestionId,
         body,
       }),
@@ -115,12 +228,37 @@ const submitIngestionRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/submit",
   handler: async (request, context) => {
-    requireRole(context, ["archiver", "admin"]);
-    const tenantId = requireTenantScope(context);
+    const auth = requireRole(context, ["archiver", "admin"]);
     const pathname = new URL(request.url).pathname;
-    const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/submit$/, "id");
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/submit$/, "id"),
+    );
 
-    return jsonResponse(await submitIngestion({ tenantId, ingestionId }));
+    return jsonResponse(
+      await submitIngestion({
+        auth,
+        ingestionId,
+      }),
+    );
+  },
+};
+
+const restoreIngestionRoute: RouteDefinition = {
+  method: "POST",
+  path: "/api/ingestions/:id/restore",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/restore$/, "id"),
+    );
+
+    return jsonResponse(
+      await restoreIngestion({
+        auth,
+        ingestionId,
+      }),
+    );
   },
 };
 
@@ -128,12 +266,18 @@ const cancelIngestionRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/cancel",
   handler: async (request, context) => {
-    requireRole(context, ["archiver", "admin"]);
-    const tenantId = requireTenantScope(context);
+    const auth = requireRole(context, ["archiver", "admin"]);
     const pathname = new URL(request.url).pathname;
-    const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/cancel$/, "id");
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/cancel$/, "id"),
+    );
 
-    return jsonResponse(await cancelIngestion({ tenantId, ingestionId }));
+    return jsonResponse(
+      await cancelIngestion({
+        auth,
+        ingestionId,
+      }),
+    );
   },
 };
 
@@ -141,12 +285,18 @@ const retryIngestionRoute: RouteDefinition = {
   method: "POST",
   path: "/api/ingestions/:id/retry",
   handler: async (request, context) => {
-    requireRole(context, ["archiver", "admin"]);
-    const tenantId = requireTenantScope(context);
+    const auth = requireRole(context, ["archiver", "admin"]);
     const pathname = new URL(request.url).pathname;
-    const ingestionId = extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/retry$/, "id");
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/retry$/, "id"),
+    );
 
-    return jsonResponse(await retryIngestion({ tenantId, ingestionId }));
+    return jsonResponse(
+      await retryIngestion({
+        auth,
+        ingestionId,
+      }),
+    );
   },
 };
 
@@ -155,7 +305,9 @@ const uploadBySignedUrlRoute: RouteDefinition = {
   path: "/api/uploads/:token",
   handler: async (request, _context) => {
     const pathname = new URL(request.url).pathname;
-    const uploadToken = extractPathParam(pathname, /^\/api\/uploads\/([^/]+)$/, "token");
+    const uploadToken = parseUploadTokenParam(
+      extractPathParam(pathname, /^\/api\/uploads\/([^/]+)$/, "token"),
+    );
     return jsonResponse(
       await uploadFileBySignedToken({
         uploadToken,
@@ -168,11 +320,16 @@ const uploadBySignedUrlRoute: RouteDefinition = {
 export const ingestionRoutes: RouteDefinition[] = [
   createIngestionRoute,
   listIngestionsRoute,
+  ingestionCapabilitiesRoute,
   getIngestionRoute,
+  deleteIngestionRoute,
   presignFileRoute,
+  removeFileRoute,
+  updateFileOverridesRoute,
   commitFileRoute,
   submitIngestionRoute,
   cancelIngestionRoute,
+  restoreIngestionRoute,
   retryIngestionRoute,
   uploadBySignedUrlRoute,
 ];

@@ -7,6 +7,8 @@ import { findIngestionById } from "../repos/ingestion-repo.ts";
 import { insertObjectEvent } from "../repos/event-repo.ts";
 import {
   createOrGetObjectBySourceIngestion,
+  findObjectById,
+  findObjectBySourceIngestion,
   updateObjectIngestManifest,
   updateObjectProjectionState,
 } from "../repos/object-repo.ts";
@@ -45,15 +47,47 @@ export async function ingestWorkerEvents(
       | undefined;
 
     if (event.event_type === "INGESTION_COMPLETED") {
-      completionObject = await createOrGetObjectBySourceIngestion({
-        objectId: event.object_id,
-        tenantId: ingestionRecord.tenantId,
-        sourceIngestionId: ingestionRecord.id,
-        type: "GENERIC",
-        title:
-          typeof event.payload.title === "string" ? event.payload.title : "",
-        metadata: event.payload,
-      });
+      try {
+        completionObject = await createOrGetObjectBySourceIngestion({
+          objectId: event.object_id,
+          tenantId: ingestionRecord.tenantId,
+          sourceIngestionId: ingestionRecord.id,
+          type: "GENERIC",
+          title:
+            typeof event.payload.title === "string" ? event.payload.title : "",
+          metadata: event.payload,
+        });
+      } catch (error) {
+        if (!isObjectConflictError(error)) {
+          throw error;
+        }
+
+        const existingByIngestion = await findObjectBySourceIngestion({
+          tenantId: ingestionRecord.tenantId,
+          ingestionId: ingestionRecord.id,
+        });
+
+        if (existingByIngestion) {
+          completionObject = existingByIngestion;
+        } else {
+          const existingById = await findObjectById({
+            tenantId: ingestionRecord.tenantId,
+            objectId: event.object_id,
+          });
+
+          if (
+            existingById &&
+            existingById.sourceIngestionId === ingestionRecord.id
+          ) {
+            completionObject = existingById;
+          } else {
+            throw new ConflictError("Conflicting object_id for this ingestion.", {
+              ingestion_id: ingestionRecord.id,
+              received_object_id: event.object_id,
+            });
+          }
+        }
+      }
 
       if (completionObject.objectId !== event.object_id) {
         throw new ConflictError("Conflicting object_id for this ingestion.", {
@@ -155,6 +189,22 @@ export async function ingestWorkerEvents(
     duplicate_events: duplicateCount,
     object_id: completedObjectId ?? null,
   };
+}
+
+function isObjectConflictError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const maybeError = error as { code?: unknown; errno?: unknown; constraint?: unknown };
+  if (maybeError.code !== "23505" && maybeError.errno !== "23505") {
+    return false;
+  }
+
+  return (
+    maybeError.constraint === "objects_pkey" ||
+    maybeError.constraint === "objects_source_ingestion_unique_idx"
+  );
 }
 
 export async function downloadStagedArtifactByStorageKey(

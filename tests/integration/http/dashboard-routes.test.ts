@@ -93,12 +93,25 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
 
       await sql.unsafe(
         `
-          INSERT INTO ${ingestionsTable} (id, batch_label, tenant_id, status, created_by, summary, error_summary)
+          INSERT INTO ${ingestionsTable} (
+            id,
+            batch_label,
+            tenant_id,
+            status,
+            created_by,
+            schema_version,
+            document_type,
+            language_code,
+            pipeline_preset,
+            access_level,
+            summary,
+            error_summary
+          )
           VALUES
-            ($1, $2, $3, 'COMPLETED', $4, '{}'::jsonb, '{}'::jsonb),
-            ($5, $6, $7, 'COMPLETED', $8, '{}'::jsonb, '{}'::jsonb),
-            ($9, $10, $11, 'FAILED', $12, '{}'::jsonb, '{}'::jsonb),
-            ($13, $14, $15, 'COMPLETED', $16, '{}'::jsonb, '{}'::jsonb)
+            ($1, $2, $3, 'COMPLETED', $4, '1.0', 'document', 'en', 'auto', 'private', '{}'::jsonb, '{}'::jsonb),
+            ($5, $6, $7, 'COMPLETED', $8, '1.0', 'document', 'en', 'auto', 'private', '{}'::jsonb, '{}'::jsonb),
+            ($9, $10, $11, 'FAILED', $12, '1.0', 'document', 'en', 'auto', 'private', '{}'::jsonb, '{}'::jsonb),
+            ($13, $14, $15, 'COMPLETED', $16, '1.0', 'document', 'en', 'auto', 'private', '{}'::jsonb, '{}'::jsonb)
         `,
         [
           "30000000-0000-0000-0000-000000000001",

@@ -15,6 +15,39 @@ END $$;
 
 DO $$
 BEGIN
+  CREATE TYPE ingestion_document_type AS ENUM (
+    'newspaper_article',
+    'magazine_article',
+    'book_chapter',
+    'book',
+    'photo',
+    'letter',
+    'speech',
+    'interview',
+    'document',
+    'other'
+  );
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$
+BEGIN
+  CREATE TYPE ingestion_pipeline_preset AS ENUM (
+    'auto',
+    'none',
+    'ocr_text',
+    'audio_transcript',
+    'video_transcript',
+    'ocr_and_audio_transcript',
+    'ocr_and_video_transcript'
+  );
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$
+BEGIN
   CREATE TYPE ingestion_file_status AS ENUM (
     'PENDING',
     'UPLOADED',
@@ -172,10 +205,24 @@ CREATE TABLE IF NOT EXISTS ingestions (
   tenant_id uuid NOT NULL,
   status ingestion_status NOT NULL DEFAULT 'DRAFT',
   created_by uuid NOT NULL,
+  schema_version text NOT NULL DEFAULT '1.0',
+  document_type ingestion_document_type NOT NULL,
+  language_code text NOT NULL,
+  pipeline_preset ingestion_pipeline_preset NOT NULL DEFAULT 'auto',
+  access_level object_access_level NOT NULL DEFAULT 'private',
+  embargo_until timestamptz,
+  rights_note text,
+  sensitivity_note text,
   summary jsonb NOT NULL DEFAULT '{}'::jsonb,
   error_summary jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
+  ,
+  CHECK (length(trim(batch_label)) > 0),
+  CHECK (length(trim(language_code)) > 0),
+  CHECK (length(trim(schema_version)) > 0),
+  CHECK (jsonb_typeof(summary) = 'object'),
+  CHECK (jsonb_typeof(error_summary) = 'object')
 );
 
 CREATE INDEX IF NOT EXISTS ingestions_tenant_created_idx
@@ -183,6 +230,12 @@ CREATE INDEX IF NOT EXISTS ingestions_tenant_created_idx
 
 CREATE INDEX IF NOT EXISTS ingestions_tenant_batch_label_idx
   ON ingestions (tenant_id, batch_label);
+
+CREATE INDEX IF NOT EXISTS ingestions_status_created_idx
+  ON ingestions (status, created_at ASC, id ASC);
+
+CREATE INDEX IF NOT EXISTS ingestions_status_updated_idx
+  ON ingestions (status, updated_at ASC, id ASC);
 
 CREATE TABLE IF NOT EXISTS ingestion_files (
   id uuid PRIMARY KEY,
@@ -193,9 +246,18 @@ CREATE TABLE IF NOT EXISTS ingestion_files (
   storage_key text NOT NULL,
   status ingestion_file_status NOT NULL DEFAULT 'PENDING',
   checksum_sha256 char(64),
+  processing_overrides jsonb NOT NULL DEFAULT '{}'::jsonb,
   error jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (jsonb_typeof(processing_overrides) = 'object'),
+  CHECK (jsonb_typeof(error) = 'object'),
+  CHECK (checksum_sha256 IS NULL OR checksum_sha256 ~ '^[a-f0-9]{64}$'),
+  CHECK (
+    (status = 'PENDING' AND checksum_sha256 IS NULL)
+    OR (status IN ('UPLOADED', 'VALIDATED') AND checksum_sha256 IS NOT NULL)
+    OR (status = 'FAILED')
+  ),
   UNIQUE (ingestion_id, storage_key)
 );
 
@@ -207,15 +269,23 @@ CREATE TABLE IF NOT EXISTS ingestion_leases (
   ingestion_id uuid NOT NULL REFERENCES ingestions(id) ON DELETE CASCADE,
   leased_by text,
   lease_token_id uuid NOT NULL,
+  lease_started_at timestamptz NOT NULL DEFAULT now(),
   lease_expires_at timestamptz NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   released_at timestamptz,
-  CHECK (released_at IS NULL OR released_at >= created_at)
+  CHECK (lease_expires_at > lease_started_at),
+  CHECK (released_at IS NULL OR released_at >= lease_started_at)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ingestion_leases_one_active_idx
-  ON ingestion_leases (ingestion_id)
-  WHERE released_at IS NULL;
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+ALTER TABLE ingestion_leases
+  ADD CONSTRAINT ingestion_leases_no_overlap
+  EXCLUDE USING gist (
+    ingestion_id WITH =,
+    tstzrange(lease_started_at, lease_expires_at, '[)') WITH &&
+  )
+  WHERE (released_at IS NULL);
 
 CREATE INDEX IF NOT EXISTS ingestion_leases_expiry_idx
   ON ingestion_leases (lease_expires_at);

@@ -2,16 +2,13 @@ import { withRequestContext } from "./http/context.ts";
 import { MethodNotAllowedError, NotFoundError } from "./http/errors.ts";
 import { routes as defaultRoutes } from "./routes/index.ts";
 import type { RouteDefinition } from "./routes/types.ts";
-import {
-  runWithRuntimeConfig,
-  type RuntimeConfig,
-} from "./runtime/config.ts";
+import { runWithRuntimeConfig, type RuntimeConfig } from "./runtime/config.ts";
 
 interface App {
   fetch: (request: Request) => Promise<Response>;
 }
 
-const ALLOWED_ORIGINS = new Set(["http://localhost:5173"]);
+const ALLOWED_ORIGINS = new Set(["http://localhost:4444"]);
 const ALLOWED_METHODS = "GET,POST,PATCH,PUT,DELETE,OPTIONS";
 const ALLOWED_HEADERS =
   "authorization,content-type,x-tenant-id,x-request-id,x-idempotency-key,x-worker-auth-token,x-worker-id";
@@ -82,7 +79,9 @@ interface DynamicRoute {
   handler: RouteDefinition["handler"];
 }
 
-export function createApp(routeDefinitions: RouteDefinition[] = defaultRoutes): App {
+export function createApp(
+  routeDefinitions: RouteDefinition[] = defaultRoutes,
+): App {
   return createAppWithOptions({ routeDefinitions });
 }
 
@@ -137,7 +136,7 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
           });
         }
 
-        return withRequestContext(request, async context => {
+        return withRequestContext(request, async (context) => {
           const url = new URL(request.url);
           const pathname = normalizePath(url.pathname);
           const method = request.method.toUpperCase();
@@ -146,7 +145,10 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
 
           if (!handler) {
             for (const route of dynamicRoutes) {
-              if (route.method === method && pathMatches(route.path, pathname)) {
+              if (
+                route.method === method &&
+                pathMatches(route.path, pathname)
+              ) {
                 handler = route.handler;
                 break;
               }
@@ -174,7 +176,9 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
               throw new MethodNotAllowedError(pathname, [...allowedMethods]);
             }
 
-            throw new NotFoundError(`Route '${method} ${pathname}' was not found.`);
+            throw new NotFoundError(
+              `Route '${method} ${pathname}' was not found.`,
+            );
           }
 
           const response = await handler(request, context);

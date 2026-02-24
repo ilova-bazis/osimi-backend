@@ -1,5 +1,13 @@
 import { withSchemaClient } from "../db/client.ts";
 import type { IngestionStatus } from "../domain/ingestions/state-machine.ts";
+import type {
+  AccessLevel,
+  IngestionDocumentType,
+  IngestionFileProcessingOverrides,
+  IngestionPipelinePreset,
+  JsonObject,
+} from "../validation/ingestion.ts";
+import type { IngestionSummary } from "../validation/catalog.ts";
 
 type IngestionFileStatus = "PENDING" | "UPLOADED" | "VALIDATED" | "FAILED";
 
@@ -9,8 +17,16 @@ interface IngestionRow {
   tenant_id: string;
   status: IngestionStatus;
   created_by: string;
-  summary: unknown;
-  error_summary: unknown;
+  schema_version: string;
+  document_type: IngestionDocumentType;
+  language_code: string;
+  pipeline_preset: IngestionPipelinePreset;
+  access_level: AccessLevel;
+  embargo_until: Date | null;
+  rights_note: string | null;
+  sensitivity_note: string | null;
+  summary: IngestionSummary;
+  error_summary: JsonObject;
   created_at: Date;
   updated_at: Date;
 }
@@ -24,7 +40,8 @@ interface IngestionFileRow {
   storage_key: string;
   status: IngestionFileStatus;
   checksum_sha256: string | null;
-  error: unknown;
+  processing_overrides: IngestionFileProcessingOverrides;
+  error: JsonObject;
   created_at: Date;
   updated_at: Date;
 }
@@ -35,10 +52,22 @@ export interface IngestionRecord {
   tenantId: string;
   status: IngestionStatus;
   createdBy: string;
-  summary: unknown;
-  errorSummary: unknown;
+  schemaVersion: string;
+  documentType: IngestionDocumentType;
+  languageCode: string;
+  pipelinePreset: IngestionPipelinePreset;
+  accessLevel: AccessLevel;
+  embargoUntil?: Date;
+  rightsNote?: string;
+  sensitivityNote?: string;
+  summary: IngestionSummary;
+  errorSummary: JsonObject;
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface IngestionWithCreatorRecord extends IngestionRecord {
+  createdByUsername?: string;
 }
 
 export interface IngestionFileRecord {
@@ -50,7 +79,8 @@ export interface IngestionFileRecord {
   storageKey: string;
   status: IngestionFileStatus;
   checksumSha256?: string;
-  error: unknown;
+  processingOverrides: IngestionFileProcessingOverrides;
+  error: JsonObject;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -78,10 +108,25 @@ function mapIngestion(row: IngestionRow): IngestionRecord {
     tenantId: row.tenant_id,
     status: row.status,
     createdBy: row.created_by,
+    schemaVersion: row.schema_version,
+    documentType: row.document_type,
+    languageCode: row.language_code,
+    pipelinePreset: row.pipeline_preset,
+    accessLevel: row.access_level,
+    embargoUntil: row.embargo_until ? new Date(row.embargo_until) : undefined,
+    rightsNote: row.rights_note ?? undefined,
+    sensitivityNote: row.sensitivity_note ?? undefined,
     summary: row.summary,
     errorSummary: row.error_summary,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
+  };
+}
+
+function mapIngestionWithCreator(row: IngestionRow & { created_by_username: string | null }): IngestionWithCreatorRecord {
+  return {
+    ...mapIngestion(row),
+    createdByUsername: row.created_by_username ?? undefined,
   };
 }
 
@@ -95,6 +140,7 @@ function mapIngestionFile(row: IngestionFileRow): IngestionFileRecord {
     storageKey: row.storage_key,
     status: row.status,
     checksumSha256: row.checksum_sha256 ?? undefined,
+    processingOverrides: row.processing_overrides,
     error: row.error,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
@@ -138,6 +184,15 @@ export async function createIngestion(params: {
   batchLabel: string;
   tenantId: string;
   createdBy: string;
+  schemaVersion: string;
+  documentType: IngestionDocumentType;
+  languageCode: string;
+  pipelinePreset: IngestionPipelinePreset;
+  accessLevel: AccessLevel;
+  embargoUntil?: Date;
+  rightsNote?: string;
+  sensitivityNote?: string;
+  summary?: IngestionSummary;
 }): Promise<IngestionRecord> {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<IngestionRow[]>`
@@ -146,10 +201,36 @@ export async function createIngestion(params: {
         batch_label,
         tenant_id,
         status,
-        created_by
+        created_by,
+        schema_version,
+        document_type,
+        language_code,
+        pipeline_preset,
+        access_level,
+        embargo_until,
+        rights_note,
+        sensitivity_note,
+        summary
       )
-      VALUES (${params.id}, ${params.batchLabel}, ${params.tenantId}, 'DRAFT', ${params.createdBy})
-      RETURNING id, batch_label, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
+      VALUES (
+        ${params.id},
+        ${params.batchLabel},
+        ${params.tenantId},
+        'DRAFT',
+        ${params.createdBy},
+        ${params.schemaVersion},
+        ${params.documentType},
+        ${params.languageCode},
+        ${params.pipelinePreset},
+        ${params.accessLevel},
+        ${params.embargoUntil ? params.embargoUntil.toISOString() : null},
+        ${params.rightsNote ?? null},
+        ${params.sensitivityNote ?? null},
+        ${params.summary ?? {}}
+      )
+      RETURNING id, batch_label, tenant_id, status, created_by, schema_version, document_type, language_code,
+        pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
+        created_at, updated_at
     `;
   });
 
@@ -162,7 +243,9 @@ export async function findIngestionById(
 ): Promise<IngestionRecord | undefined> {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<IngestionRow[]>`
-      SELECT id, batch_label, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
+      SELECT id, batch_label, tenant_id, status, created_by, schema_version, document_type, language_code,
+        pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
+        created_at, updated_at
       FROM ingestions
       WHERE id = ${ingestionId}
         AND tenant_id = ${tenantId}
@@ -183,7 +266,9 @@ export async function listIngestions(params: {
   const rows = await withSchemaClient(async (sql) => {
     if (params.cursorCreatedAt && params.cursorId) {
       return await sql<IngestionRow[]>`
-        SELECT id, batch_label, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
+        SELECT id, batch_label, tenant_id, status, created_by, schema_version, document_type, language_code,
+          pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
+          created_at, updated_at
         FROM ingestions
         WHERE tenant_id = ${params.tenantId}
           AND (created_at, id) < (${params.cursorCreatedAt}::timestamptz, ${params.cursorId}::uuid)
@@ -193,7 +278,9 @@ export async function listIngestions(params: {
     }
 
     return await sql<IngestionRow[]>`
-      SELECT id, batch_label, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
+      SELECT id, batch_label, tenant_id, status, created_by, schema_version, document_type, language_code,
+        pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
+        created_at, updated_at
       FROM ingestions
       WHERE tenant_id = ${params.tenantId}
       ORDER BY created_at DESC, id DESC
@@ -218,7 +305,9 @@ export async function updateIngestionStatus(params: {
       WHERE id = ${params.ingestionId}
         AND tenant_id = ${params.tenantId}
         AND status = ${params.fromStatus}
-      RETURNING id, batch_label, tenant_id, status, created_by, summary, error_summary, created_at, updated_at
+      RETURNING id, batch_label, tenant_id, status, created_by, schema_version, document_type, language_code,
+        pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
+        created_at, updated_at
     `;
   });
 
@@ -246,7 +335,8 @@ export async function createIngestionFile(params: {
         status
       )
       VALUES (${params.id}, ${params.ingestionId}, ${params.filename}, ${params.contentType}, ${params.sizeBytes}, ${params.storageKey}, 'PENDING')
-      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256, error, created_at, updated_at
+      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
+        processing_overrides, error, created_at, updated_at
     `;
   });
 
@@ -269,6 +359,7 @@ export async function findIngestionFileById(params: {
         file.storage_key,
         file.status,
         file.checksum_sha256,
+        file.processing_overrides,
         file.error,
         file.created_at,
         file.updated_at
@@ -300,6 +391,7 @@ export async function listIngestionFiles(params: {
         file.storage_key,
         file.status,
         file.checksum_sha256,
+        file.processing_overrides,
         file.error,
         file.created_at,
         file.updated_at
@@ -328,12 +420,75 @@ export async function markIngestionFileUploaded(params: {
       WHERE id = ${params.fileId}
         AND ingestion_id = ${params.ingestionId}
         AND status = 'PENDING'
-      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256, error, created_at, updated_at
+      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
+        processing_overrides, error, created_at, updated_at
     `;
   });
 
   const row = rows[0];
   return row ? mapIngestionFile(row) : undefined;
+}
+
+export async function deleteIngestionFile(params: {
+  tenantId: string;
+  ingestionId: string;
+  fileId: string;
+}): Promise<boolean> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<Array<{ id: string }>>`
+      DELETE FROM ingestion_files file
+      USING ingestions ing
+      WHERE file.id = ${params.fileId}
+        AND file.ingestion_id = ${params.ingestionId}
+        AND ing.id = file.ingestion_id
+        AND ing.tenant_id = ${params.tenantId}
+      RETURNING file.id
+    `;
+  });
+
+  return rows.length > 0;
+}
+
+export async function updateIngestionFileProcessingOverrides(params: {
+  tenantId: string;
+  ingestionId: string;
+  fileId: string;
+  processingOverrides: IngestionFileProcessingOverrides;
+}): Promise<IngestionFileRecord | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionFileRow[]>`
+      UPDATE ingestion_files file
+      SET processing_overrides = ${params.processingOverrides},
+          updated_at = now()
+      FROM ingestions ing
+      WHERE file.id = ${params.fileId}
+        AND file.ingestion_id = ${params.ingestionId}
+        AND ing.id = file.ingestion_id
+        AND ing.tenant_id = ${params.tenantId}
+      RETURNING file.id, file.ingestion_id, file.filename, file.content_type, file.size_bytes,
+        file.storage_key, file.status, file.checksum_sha256, file.processing_overrides,
+        file.error, file.created_at, file.updated_at
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapIngestionFile(row) : undefined;
+}
+
+export async function deleteIngestion(params: {
+  tenantId: string;
+  ingestionId: string;
+}): Promise<boolean> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<Array<{ id: string }>>`
+      DELETE FROM ingestions
+      WHERE id = ${params.ingestionId}
+        AND tenant_id = ${params.tenantId}
+      RETURNING id
+    `;
+  });
+
+  return rows.length > 0;
 }
 
 export async function listStagingCleanupCandidates(params: {
@@ -394,4 +549,43 @@ export async function listStuckIngestions(params: {
   });
 
   return rows.map(mapStuckIngestion);
+}
+
+export async function findIngestionWithCreator(params: {
+  tenantId: string;
+  ingestionId: string;
+}): Promise<IngestionWithCreatorRecord | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<
+      Array<IngestionRow & { created_by_username: string | null }>
+    >`
+      SELECT
+        ing.id,
+        ing.batch_label,
+        ing.tenant_id,
+        ing.status,
+        ing.created_by,
+        ing.schema_version,
+        ing.document_type,
+        ing.language_code,
+        ing.pipeline_preset,
+        ing.access_level,
+        ing.embargo_until,
+        ing.rights_note,
+        ing.sensitivity_note,
+        ing.summary,
+        ing.error_summary,
+        ing.created_at,
+        ing.updated_at,
+        usr.username AS created_by_username
+      FROM ingestions ing
+      LEFT JOIN users usr ON usr.id = ing.created_by
+      WHERE ing.id = ${params.ingestionId}
+        AND ing.tenant_id = ${params.tenantId}
+      LIMIT 1
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapIngestionWithCreator(row) : undefined;
 }

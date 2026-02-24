@@ -25,11 +25,11 @@ export class InvalidIngestionTransitionError extends Error {
 const ALLOWED_TRANSITIONS: Record<IngestionStatus, readonly IngestionStatus[]> = {
   DRAFT: ["UPLOADING", "CANCELED"],
   UPLOADING: ["QUEUED", "FAILED", "CANCELED"],
-  QUEUED: ["PROCESSING", "CANCELED"],
+  QUEUED: ["PROCESSING", "CANCELED", "UPLOADING"],
   PROCESSING: ["COMPLETED", "FAILED", "CANCELED", "QUEUED"],
   COMPLETED: [],
   FAILED: ["QUEUED"],
-  CANCELED: ["QUEUED"],
+  CANCELED: ["QUEUED", "UPLOADING", "DRAFT"],
 };
 
 const TERMINAL_STATUSES = new Set<IngestionStatus>(["COMPLETED", "FAILED", "CANCELED"]);

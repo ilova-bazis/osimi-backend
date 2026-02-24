@@ -5,6 +5,8 @@ export interface WorkerDownloadUrl {
   storage_key: string;
   content_type: string;
   size_bytes: number;
+  checksum_sha256: string | null;
+  processing_overrides: Record<string, unknown>;
   download_url: string;
 }
 
@@ -16,6 +18,7 @@ export interface LeaseDto {
   batch_label: string;
   tenant_id: string;
   download_urls: WorkerDownloadUrl[];
+  catalog_json: Record<string, unknown>;
 }
 
 export interface HeartbeatLeaseInput {
