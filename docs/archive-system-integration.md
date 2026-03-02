@@ -56,6 +56,11 @@ Nuance:
 8. Send heartbeat periodically via `POST /api/ingestions/:id/lease/heartbeat` until done.
 9. On graceful stop or abandonment, call `POST /api/ingestions/:id/lease/release`.
 
+Recovery nuance:
+
+- If your event notifier has pending events for a known ingestion but the token has expired, ask your lease-owning worker process to call `POST /api/ingestions/:id/lease` for deterministic reacquire.
+- `POST /api/ingestions/:id/lease` does not steal active leases; it returns conflict when another active lease exists.
+
 Catalog delivery contract:
 
 - VPS provides `catalog.json` content in worker lease payload as `lease.catalog_json`.
@@ -166,8 +171,39 @@ Nuances:
 - A redundancy sweep runs before lease assignment to recover expired processing leases.
 - `download_urls` may be empty if no file is currently eligible for worker download.
 - Recommended polling on `lease: null`: jittered backoff in the 2-10 second range.
+- `storage_key` is opaque and must not be used to infer source page/file order.
 
-## 5.2 Heartbeat lease
+Planned ordering contract (not yet implemented):
+
+- Upload presign will accept optional `source_order` for each file.
+- Lease `download_urls[]` will include `filename` and `source_order`.
+- VPS target ordering is: `source_order ASC NULLS LAST`, then `filename`, then `file_id`.
+- Worker guidance for migration period: prefer `source_order` when present, otherwise consume backend-provided array order.
+
+## 5.2 Lease a specific ingestion (targeted recovery)
+
+`POST /api/ingestions/:id/lease`
+
+Headers:
+
+- `x-worker-auth-token` (required)
+- `x-worker-id` (optional)
+
+Response `200`:
+
+- Same lease payload shape as `POST /api/ingestions/lease` when work is available.
+
+Failure semantics:
+
+- `404` if ingestion id does not exist.
+- `409` if ingestion exists but is not currently leasable (for example, active lease or non-`QUEUED` status).
+- No force takeover is supported.
+
+Use case:
+
+- Deterministic recovery when your system has buffered events for a specific ingestion and needs a fresh lease token.
+
+## 5.3 Heartbeat lease
 
 `POST /api/ingestions/:id/lease/heartbeat`
 
@@ -192,7 +228,7 @@ Worker rule:
 
 - Always replace your local token with the refreshed `lease_token` from heartbeat response.
 
-## 5.3 Release lease
+## 5.4 Release lease
 
 `POST /api/ingestions/:id/lease/release`
 
@@ -223,7 +259,7 @@ Behavior nuance:
 
 - If ingestion is still `PROCESSING` when released, VPS re-queues it to `QUEUED`.
 
-## 5.4 Download staged file
+## 5.5 Download staged file
 
 `GET /api/worker/downloads/:token`
 
@@ -241,7 +277,7 @@ Failure nuance:
 - Signed token expiry or invalid signature returns non-2xx JSON error.
 - Missing staged file returns `404`.
 
-## 5.5 Post worker events
+## 5.6 Post worker events
 
 `POST /api/ingestions/:id/events`
 

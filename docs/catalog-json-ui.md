@@ -86,10 +86,12 @@ OBJ-YYYYMMDD-XXXXXX/
 - `magazine_article`
 - `book_chapter`
 - `book`
-- `photo`
 - `letter`
 - `speech`
 - `interview`
+- `report`
+- `manuscript`
+- `image`
 - `document`
 - `other`
 

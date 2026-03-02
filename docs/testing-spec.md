@@ -29,6 +29,8 @@ This document defines the required tests for the Osimi backend control plane (VP
 - Lease exclusivity: only one worker can lease a batch at a time
 - Lease expiry: expired leases re-queue and can be leased again
 - Redundancy sweep: expired leases are re-queued even if automatic requeue fails
+- Targeted lease reacquire: `POST /api/ingestions/:id/lease` leases only the requested queued ingestion
+- Targeted lease conflict: requesting `POST /api/ingestions/:id/lease` for an actively leased ingestion returns conflict (no takeover)
 - Signed URL constraints: method/TTL/content-type/content-length enforced
 - Upload commit checksum validation (SHA-256)
 - Worker download checksum mismatch emits `FILE_FAILED`
@@ -38,11 +40,19 @@ This document defines the required tests for the Osimi backend control plane (VP
 - Stuck attention for `UPLOADING` and `PROCESSING`
 - Tenant scoping on all endpoints
 
+Planned future scenarios (file ordering contract):
+
+- Lease file ordering honors `source_order` when provided.
+- Lease file ordering falls back deterministically when `source_order` is absent.
+- Lease payload includes `filename` and `source_order` for each `download_urls[]` item.
+- `storage_key` lexical order is not used as a semantic ordering source.
+
 ## Fixtures
 
 - Seed tenants, users, ingestions, files, objects
 - Fake worker identity + lease token
 - Staging files with known checksums
+- Make sure to use UUID that is RFC 9562/4122 specification conformant. 
 - Auth fixtures: users, tenant memberships, hashed passwords, active/revoked/expired sessions
 
 ## Test Environment

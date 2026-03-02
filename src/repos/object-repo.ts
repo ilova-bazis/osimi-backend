@@ -1,5 +1,6 @@
 import { withSchemaClient } from "../db/client.ts";
 import type { DbClient } from "../db/client.ts";
+import type { JsonObject } from "../validation/ingestion.ts";
 
 interface ObjectRow {
   object_id: string;
@@ -7,8 +8,8 @@ interface ObjectRow {
   type: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
   title: string;
   language_code: string | null;
-  metadata: unknown;
-  ingest_manifest: unknown;
+  metadata: JsonObject;
+  ingest_manifest: JsonObject | null;
   source_ingestion_id: string | null;
   source_batch_label: string | null;
   processing_state:
@@ -48,7 +49,7 @@ interface ObjectRow {
 interface ObjectArtifactRow {
   id: string;
   object_id: string;
-  kind: string;
+  kind: ArtifactKind;
   storage_key: string;
   content_type: string;
   size_bytes: number;
@@ -62,8 +63,8 @@ export interface ObjectRecord {
   title: string;
   languageCode?: string;
   tags: string[];
-  metadata: unknown;
-  ingestManifest?: Record<string, unknown>;
+  metadata: JsonObject;
+  ingestManifest: JsonObject | null;
   sourceIngestionId?: string;
   sourceBatchLabel?: string;
   processingState: ObjectRow["processing_state"];
@@ -82,12 +83,25 @@ export interface ObjectRecord {
 export interface ObjectArtifactRecord {
   id: string;
   objectId: string;
-  kind: string;
+  kind: ArtifactKind;
   storageKey: string;
   contentType: string;
   sizeBytes: number;
   createdAt: Date;
 }
+
+export type ArtifactKind =
+  | "ingest_json"
+  | "original"
+  | "preview"
+  | "ocr"
+  | "transcript"
+  | "metadata"
+  | "pdf"
+  | "ocr_text"
+  | "thumbnail"
+  | "web_version"
+  | "other";
 
 export interface ListObjectsParams {
   tenantId: string;
@@ -203,12 +217,7 @@ function mapObject(row: ObjectRow): ObjectRecord {
     languageCode: row.language_code ?? undefined,
     tags: Array.isArray(row.tags) ? row.tags : [],
     metadata: row.metadata,
-    ingestManifest:
-      row.ingest_manifest &&
-      typeof row.ingest_manifest === "object" &&
-      !Array.isArray(row.ingest_manifest)
-        ? (row.ingest_manifest as Record<string, unknown>)
-        : undefined,
+    ingestManifest: row.ingest_manifest ?? null,
     sourceIngestionId: row.source_ingestion_id ?? undefined,
     sourceBatchLabel: row.source_batch_label ?? undefined,
     processingState: row.processing_state,
@@ -290,7 +299,7 @@ export async function createObject(params: {
   type?: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
   title?: string;
   languageCode?: string;
-  metadata?: Record<string, unknown>;
+  metadata?: JsonObject;
   tags?: string[];
 }): Promise<ObjectRecord> {
   return await withSchemaClient(async (sql) => {
@@ -362,7 +371,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
   type?: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
   title?: string;
   languageCode?: string;
-  metadata?: Record<string, unknown>;
+  metadata?: JsonObject;
   tags?: string[];
 }): Promise<ObjectRecord> {
   return await withSchemaClient(async (sql) => {
@@ -477,14 +486,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
 
 export async function createObjectArtifact(params: {
   objectId: string;
-  kind:
-    | "ingest_json"
-    | "original"
-    | "preview"
-    | "ocr"
-    | "transcript"
-    | "metadata"
-    | "other";
+  kind: ArtifactKind;
   storageKey: string;
   contentType: string;
   sizeBytes: number;
@@ -512,6 +514,32 @@ export async function createObjectArtifact(params: {
   });
 
   return mapArtifact(rows[0]!);
+}
+
+export async function findLatestArtifactByKind(params: {
+  tenantId: string;
+  objectId: string;
+  kinds: ArtifactKind[];
+}): Promise<ObjectArtifactRecord | undefined> {
+  if (params.kinds.length === 0) {
+    return undefined;
+  }
+
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<ObjectArtifactRow[]>`
+      SELECT art.id, art.object_id, art.kind, art.storage_key, art.content_type, art.size_bytes, art.created_at
+      FROM object_artifacts art
+      INNER JOIN objects obj ON obj.object_id = art.object_id
+      WHERE obj.tenant_id = ${params.tenantId}
+        AND obj.object_id = ${params.objectId}
+        AND art.kind = ANY(${params.kinds}::artifact_kind[])
+      ORDER BY art.created_at DESC, art.id DESC
+      LIMIT 1
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapArtifact(row) : undefined;
 }
 
 export async function listObjects(
@@ -999,7 +1027,7 @@ export async function updateObjectTitle(params: {
 export async function updateObjectIngestManifest(params: {
   tenantId: string;
   objectId: string;
-  ingestManifest: Record<string, unknown>;
+  ingestManifest: JsonObject;
 }): Promise<ObjectRecord | undefined> {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<ObjectRow[]>`

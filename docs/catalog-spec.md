@@ -76,10 +76,12 @@ Use it to ensure the UI writes the correct structure for the Osimi Archive.
 - `magazine_article`
 - `book_chapter`
 - `book`
-- `photo`
 - `letter`
 - `speech`
 - `interview`
+- `report`
+- `manuscript`
+- `image`
 - `document`
 - `other`
 

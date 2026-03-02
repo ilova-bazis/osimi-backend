@@ -98,6 +98,7 @@ export async function listDashboardActivity(params: {
   limit: number;
   cursorCreatedAt?: string;
   cursorId?: string;
+  ingestionId?: string;
 }): Promise<ActivityRecord[]> {
   const rows = await withSchemaClient(async (sql) => {
     if (params.cursorCreatedAt && params.cursorId) {
@@ -105,6 +106,7 @@ export async function listDashboardActivity(params: {
         SELECT id, event_id, type, ingestion_id, object_id, payload, actor_user_id, created_at
         FROM object_events
         WHERE tenant_id = ${params.tenantId}
+          AND (${params.ingestionId ?? null}::uuid IS NULL OR ingestion_id = ${params.ingestionId ?? null}::uuid)
           AND (created_at, id) < (${params.cursorCreatedAt}::timestamptz, ${params.cursorId}::uuid)
         ORDER BY created_at DESC, id DESC
         LIMIT ${params.limit}
@@ -115,6 +117,7 @@ export async function listDashboardActivity(params: {
       SELECT id, event_id, type, ingestion_id, object_id, payload, actor_user_id, created_at
       FROM object_events
       WHERE tenant_id = ${params.tenantId}
+        AND (${params.ingestionId ?? null}::uuid IS NULL OR ingestion_id = ${params.ingestionId ?? null}::uuid)
       ORDER BY created_at DESC, id DESC
       LIMIT ${params.limit}
     `;

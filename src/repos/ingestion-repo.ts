@@ -2,7 +2,8 @@ import { withSchemaClient } from "../db/client.ts";
 import type { IngestionStatus } from "../domain/ingestions/state-machine.ts";
 import type {
   AccessLevel,
-  IngestionDocumentType,
+  IngestionClassificationType,
+  IngestItemKind,
   IngestionFileProcessingOverrides,
   IngestionPipelinePreset,
   JsonObject,
@@ -18,7 +19,8 @@ interface IngestionRow {
   status: IngestionStatus;
   created_by: string;
   schema_version: string;
-  document_type: IngestionDocumentType;
+  classification_type: IngestionClassificationType;
+  item_kind: IngestItemKind;
   language_code: string;
   pipeline_preset: IngestionPipelinePreset;
   access_level: AccessLevel;
@@ -53,7 +55,8 @@ export interface IngestionRecord {
   status: IngestionStatus;
   createdBy: string;
   schemaVersion: string;
-  documentType: IngestionDocumentType;
+  classificationType: IngestionClassificationType;
+  itemKind: IngestItemKind;
   languageCode: string;
   pipelinePreset: IngestionPipelinePreset;
   accessLevel: AccessLevel;
@@ -109,7 +112,8 @@ function mapIngestion(row: IngestionRow): IngestionRecord {
     status: row.status,
     createdBy: row.created_by,
     schemaVersion: row.schema_version,
-    documentType: row.document_type,
+    classificationType: row.classification_type,
+    itemKind: row.item_kind,
     languageCode: row.language_code,
     pipelinePreset: row.pipeline_preset,
     accessLevel: row.access_level,
@@ -185,7 +189,8 @@ export async function createIngestion(params: {
   tenantId: string;
   createdBy: string;
   schemaVersion: string;
-  documentType: IngestionDocumentType;
+  classificationType: IngestionClassificationType;
+  itemKind: IngestItemKind;
   languageCode: string;
   pipelinePreset: IngestionPipelinePreset;
   accessLevel: AccessLevel;
@@ -203,7 +208,8 @@ export async function createIngestion(params: {
         status,
         created_by,
         schema_version,
-        document_type,
+        classification_type,
+        item_kind,
         language_code,
         pipeline_preset,
         access_level,
@@ -219,7 +225,8 @@ export async function createIngestion(params: {
         'DRAFT',
         ${params.createdBy},
         ${params.schemaVersion},
-        ${params.documentType},
+        ${params.classificationType},
+        ${params.itemKind},
         ${params.languageCode},
         ${params.pipelinePreset},
         ${params.accessLevel},
@@ -228,7 +235,7 @@ export async function createIngestion(params: {
         ${params.sensitivityNote ?? null},
         ${params.summary ?? {}}
       )
-      RETURNING id, batch_label, tenant_id, status, created_by, schema_version, document_type, language_code,
+      RETURNING id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
         pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
         created_at, updated_at
     `;
@@ -243,7 +250,7 @@ export async function findIngestionById(
 ): Promise<IngestionRecord | undefined> {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<IngestionRow[]>`
-      SELECT id, batch_label, tenant_id, status, created_by, schema_version, document_type, language_code,
+      SELECT id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
         pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
         created_at, updated_at
       FROM ingestions
@@ -266,7 +273,7 @@ export async function listIngestions(params: {
   const rows = await withSchemaClient(async (sql) => {
     if (params.cursorCreatedAt && params.cursorId) {
       return await sql<IngestionRow[]>`
-        SELECT id, batch_label, tenant_id, status, created_by, schema_version, document_type, language_code,
+        SELECT id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
           pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
           created_at, updated_at
         FROM ingestions
@@ -278,7 +285,7 @@ export async function listIngestions(params: {
     }
 
     return await sql<IngestionRow[]>`
-      SELECT id, batch_label, tenant_id, status, created_by, schema_version, document_type, language_code,
+      SELECT id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
         pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
         created_at, updated_at
       FROM ingestions
@@ -305,7 +312,92 @@ export async function updateIngestionStatus(params: {
       WHERE id = ${params.ingestionId}
         AND tenant_id = ${params.tenantId}
         AND status = ${params.fromStatus}
-      RETURNING id, batch_label, tenant_id, status, created_by, schema_version, document_type, language_code,
+      RETURNING id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
+        pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
+        created_at, updated_at
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapIngestion(row) : undefined;
+}
+
+export async function updateIngestionDetails(params: {
+  ingestionId: string;
+  tenantId: string;
+  batchLabel?: string;
+  classificationType?: IngestionClassificationType;
+  itemKind?: IngestItemKind;
+  languageCode?: string;
+  pipelinePreset?: IngestionPipelinePreset;
+  accessLevel?: AccessLevel;
+  summary?: IngestionSummary;
+  embargoUntil?: string | null;
+  rightsNote?: string | null;
+  sensitivityNote?: string | null;
+  hasBatchLabel: boolean;
+  hasClassificationType: boolean;
+  hasItemKind: boolean;
+  hasLanguageCode: boolean;
+  hasPipelinePreset: boolean;
+  hasAccessLevel: boolean;
+  hasSummary: boolean;
+  hasEmbargoUntil: boolean;
+  hasRightsNote: boolean;
+  hasSensitivityNote: boolean;
+}): Promise<IngestionRecord | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionRow[]>`
+      UPDATE ingestions
+      SET
+        batch_label = CASE
+          WHEN ${params.hasBatchLabel} THEN ${params.batchLabel ?? null}::text
+          ELSE batch_label
+        END,
+        classification_type = CASE
+          WHEN ${params.hasClassificationType}
+            THEN ${params.classificationType ?? null}::ingestion_classification_type
+          ELSE classification_type
+        END,
+        item_kind = CASE
+          WHEN ${params.hasItemKind}
+            THEN ${params.itemKind ?? null}::ingest_item_kind
+          ELSE item_kind
+        END,
+        language_code = CASE
+          WHEN ${params.hasLanguageCode} THEN ${params.languageCode ?? null}::text
+          ELSE language_code
+        END,
+        pipeline_preset = CASE
+          WHEN ${params.hasPipelinePreset}
+            THEN ${params.pipelinePreset ?? null}::ingestion_pipeline_preset
+          ELSE pipeline_preset
+        END,
+        access_level = CASE
+          WHEN ${params.hasAccessLevel}
+            THEN ${params.accessLevel ?? null}::object_access_level
+          ELSE access_level
+        END,
+        summary = CASE
+          WHEN ${params.hasSummary} THEN ${params.summary ?? {}}
+          ELSE summary
+        END,
+        embargo_until = CASE
+          WHEN ${params.hasEmbargoUntil} THEN ${params.embargoUntil ?? null}::timestamptz
+          ELSE embargo_until
+        END,
+        rights_note = CASE
+          WHEN ${params.hasRightsNote} THEN ${params.rightsNote ?? null}::text
+          ELSE rights_note
+        END,
+        sensitivity_note = CASE
+          WHEN ${params.hasSensitivityNote} THEN ${params.sensitivityNote ?? null}::text
+          ELSE sensitivity_note
+        END,
+        updated_at = now()
+      WHERE id = ${params.ingestionId}
+        AND tenant_id = ${params.tenantId}
+      RETURNING id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
         pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
         created_at, updated_at
     `;
@@ -566,7 +658,8 @@ export async function findIngestionWithCreator(params: {
         ing.status,
         ing.created_by,
         ing.schema_version,
-        ing.document_type,
+        ing.classification_type,
+        ing.item_kind,
         ing.language_code,
         ing.pipeline_preset,
         ing.access_level,

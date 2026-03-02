@@ -35,6 +35,7 @@ export async function getDashboardActivityForTenant(params: {
     limit: pagination.limit + 1,
     cursorCreatedAt: pagination.cursor?.created_at,
     cursorId: pagination.cursor?.id,
+    ingestionId: pagination.ingestionId,
   });
 
   const hasMore = records.length > pagination.limit;

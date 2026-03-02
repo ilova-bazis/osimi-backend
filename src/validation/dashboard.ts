@@ -13,6 +13,7 @@ export const dashboardCursorPayloadSchema = z.strictObject({
 export const dashboardActivityQuerySchema = z.strictObject({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().trim().min(1).optional(),
+  ingestion_id: z.uuid().optional(),
 });
 
 export const dashboardSummaryResponseSchema = z.strictObject({
@@ -45,6 +46,7 @@ export type DashboardCursorPayload = z.infer<typeof dashboardCursorPayloadSchema
 export interface DashboardActivityQuery {
   limit: number;
   cursor?: DashboardCursorPayload;
+  ingestionId?: string;
 }
 export type DashboardSummaryResponse = z.infer<typeof dashboardSummaryResponseSchema>;
 export type DashboardActivityItem = z.infer<typeof dashboardActivityItemSchema>;
@@ -54,6 +56,7 @@ export function parseDashboardActivityQuery(url: URL): DashboardActivityQuery {
   const parsed = dashboardActivityQuerySchema.safeParse({
     limit: url.searchParams.get("limit") ?? undefined,
     cursor: url.searchParams.get("cursor") ?? undefined,
+    ingestion_id: url.searchParams.get("ingestion_id") ?? undefined,
   });
 
   if (!parsed.success) {
@@ -69,6 +72,7 @@ export function parseDashboardActivityQuery(url: URL): DashboardActivityQuery {
   return {
     limit: parsed.data.limit,
     cursor,
+    ingestionId: parsed.data.ingestion_id,
   };
 }
 

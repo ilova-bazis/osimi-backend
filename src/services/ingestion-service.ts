@@ -17,6 +17,7 @@ import {
   listIngestionFiles,
   listIngestions,
   markIngestionFileUploaded,
+  updateIngestionDetails,
   updateIngestionFileProcessingOverrides,
   updateIngestionStatus,
   type IngestionFileRecord,
@@ -68,6 +69,8 @@ import {
   type UpdateIngestionFileOverridesResponse,
   type UpdateIngestionFileOverridesBody,
   type UploadFileBySignedTokenResponse,
+  type UpdateIngestionBody,
+  type UpdateIngestionResponse,
   parseIngestionCursorPayload,
   parseIngestionFileProcessingOverrides,
   parseJsonObject,
@@ -138,7 +141,8 @@ function serializeIngestion(record: IngestionRecord): IngestionDto {
     status: record.status,
     created_by: record.createdBy,
     schema_version: record.schemaVersion,
-    document_type: record.documentType,
+    classification_type: record.classificationType,
+    item_kind: record.itemKind,
     language_code: record.languageCode,
     pipeline_preset: record.pipelinePreset,
     access_level: record.accessLevel,
@@ -183,7 +187,8 @@ export async function createIngestionDraft(params: {
     tenantId: params.auth.tenantId,
     createdBy: params.auth.userId,
     schemaVersion: params.body.schema_version,
-    documentType: params.body.document_type,
+    classificationType: params.body.classification_type,
+    itemKind: params.body.item_kind,
     languageCode: params.body.language_code,
     pipelinePreset: params.body.pipeline_preset,
     accessLevel: params.body.access_level,
@@ -216,6 +221,127 @@ export async function getIngestion(params: {
   return {
     ingestion: serializeIngestion(ingestion),
     files: files.map(serializeFile),
+  };
+}
+
+export async function updateIngestion(params: {
+  auth: AuthenticatedContext;
+  ingestionId: string;
+  body: UpdateIngestionBody;
+}): Promise<UpdateIngestionResponse> {
+  const ingestion = requireIngestion(
+    await findIngestionById(params.auth.tenantId, params.ingestionId),
+    params.ingestionId,
+  );
+
+  if (
+    ingestion.status !== "DRAFT" &&
+    ingestion.status !== "UPLOADING" &&
+    ingestion.status !== "CANCELED"
+  ) {
+    throw new ConflictError(
+      "Ingestion cannot be updated in its current state.",
+      {
+        ingestion_id: ingestion.id,
+        status: ingestion.status,
+      },
+    );
+  }
+
+  if (await hasActiveLease(ingestion.id)) {
+    throw new ConflictError(
+      "Ingestion cannot be modified after lease assignment.",
+      {
+        ingestion_id: ingestion.id,
+      },
+    );
+  }
+
+  const hasBatchLabel = Object.prototype.hasOwnProperty.call(
+    params.body,
+    "batch_label",
+  );
+  const hasClassificationType = Object.prototype.hasOwnProperty.call(
+    params.body,
+    "classification_type",
+  );
+  const hasItemKind = Object.prototype.hasOwnProperty.call(
+    params.body,
+    "item_kind",
+  );
+  const hasLanguageCode = Object.prototype.hasOwnProperty.call(
+    params.body,
+    "language_code",
+  );
+  const hasPipelinePreset = Object.prototype.hasOwnProperty.call(
+    params.body,
+    "pipeline_preset",
+  );
+  const hasAccessLevel = Object.prototype.hasOwnProperty.call(
+    params.body,
+    "access_level",
+  );
+  const hasSummary = Object.prototype.hasOwnProperty.call(
+    params.body,
+    "summary",
+  );
+  const hasEmbargoUntil = Object.prototype.hasOwnProperty.call(
+    params.body,
+    "embargo_until",
+  );
+  const hasRightsNote = Object.prototype.hasOwnProperty.call(
+    params.body,
+    "rights_note",
+  );
+  const hasSensitivityNote = Object.prototype.hasOwnProperty.call(
+    params.body,
+    "sensitivity_note",
+  );
+
+  if (
+    !hasBatchLabel &&
+    !hasClassificationType &&
+    !hasItemKind &&
+    !hasLanguageCode &&
+    !hasPipelinePreset &&
+    !hasAccessLevel &&
+    !hasSummary &&
+    !hasEmbargoUntil &&
+    !hasRightsNote &&
+    !hasSensitivityNote
+  ) {
+    throw new ValidationError("Request body must include at least one field.");
+  }
+
+  const updated = await updateIngestionDetails({
+    ingestionId: ingestion.id,
+    tenantId: params.auth.tenantId,
+    batchLabel: params.body.batch_label,
+    classificationType: params.body.classification_type,
+    itemKind: params.body.item_kind,
+    languageCode: params.body.language_code,
+    pipelinePreset: params.body.pipeline_preset,
+    accessLevel: params.body.access_level,
+    summary: params.body.summary,
+    embargoUntil: params.body.embargo_until,
+    rightsNote: params.body.rights_note,
+    sensitivityNote: params.body.sensitivity_note,
+    hasBatchLabel,
+    hasClassificationType,
+    hasItemKind,
+    hasLanguageCode,
+    hasPipelinePreset,
+    hasAccessLevel,
+    hasSummary,
+    hasEmbargoUntil,
+    hasRightsNote,
+    hasSensitivityNote,
+  });
+
+  return {
+    ingestion: serializeIngestion(
+      requireIngestion(updated, params.ingestionId),
+    ),
   };
 }
 

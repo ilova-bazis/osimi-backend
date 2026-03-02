@@ -3,6 +3,7 @@ import { ingestWorkerEvents } from "../services/event-service.ts";
 import {
   downloadStagedFileByToken,
   heartbeatLease,
+  leaseIngestionById,
   leaseNextIngestion,
   releaseActiveLease,
 } from "../services/lease-service.ts";
@@ -41,6 +42,24 @@ const heartbeatRoute: RouteDefinition = {
         }),
       );
     },
+  }),
+};
+
+const leaseByIdRoute: RouteDefinition = {
+  method: "POST",
+  path: "/api/ingestions/:id/lease",
+  handler: withWorkerAuth(async (request, _context, worker) => {
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/lease$/, "id"),
+    );
+
+    return jsonResponse(
+      await leaseIngestionById({
+        ingestionId,
+        workerId: worker.workerId,
+      }),
+    );
   }),
 };
 
@@ -99,6 +118,7 @@ const workerEventsRoute: RouteDefinition = {
 
 export const leaseRoutes: RouteDefinition[] = [
   leaseRoute,
+  leaseByIdRoute,
   heartbeatRoute,
   releaseRoute,
   workerDownloadRoute,

@@ -107,10 +107,12 @@ Supports primary title plus translations without forcing them.
 - `magazine_article`
 - `book_chapter`
 - `book`
-- `photo`
 - `letter`
 - `speech`
 - `interview`
+- `report`
+- `manuscript`
+- `image`
 - `document`
 - `other`
 
@@ -183,6 +185,8 @@ Suggested values:
 - `scanned_document`
 - `photo`
 - `audio`
+- `video`
+- `document`
 - `other`
 
 ### `processing` (intent)

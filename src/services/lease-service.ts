@@ -13,6 +13,7 @@ import {
 import { findObjectBySourceIngestion } from "../repos/object-repo.ts";
 import {
   extendLease,
+  leaseQueuedIngestionById,
   leaseNextQueuedIngestion,
   releaseLease,
   sweepExpiredLeases,
@@ -25,6 +26,7 @@ import {
 import type {
   HeartbeatLeaseInput,
   HeartbeatLeaseResponse,
+  LeaseDto,
   ReleaseLeaseInput,
   ReleaseLeaseResponse,
   WorkerDownloadUrl,
@@ -71,15 +73,13 @@ function buildCatalogJson(params: {
     title: summary.title,
     classification: {
       ...(summary.classification as Record<string, unknown>),
-      type: ingestion.documentType,
+      type: ingestion.classificationType,
       language: ingestion.languageCode,
     },
     dates: summary.dates,
   };
 
-  if (summary.item_kind !== undefined) {
-    catalog.item_kind = summary.item_kind;
-  }
+  catalog.item_kind = ingestion.itemKind;
 
   if (summary.processing !== undefined) {
     catalog.processing = summary.processing;
@@ -173,6 +173,63 @@ function leaseTtlSeconds(): number {
   return DEFAULT_LEASE_TTL_SECONDS;
 }
 
+async function buildLeasePayload(params: {
+  leaseId: string;
+  leaseTokenId: string;
+  leaseExpiresAt: Date;
+  ingestionId: string;
+  batchLabel: string;
+  tenantId: string;
+  workerId?: string;
+}): Promise<LeaseDto> {
+  const ingestionFiles = await listIngestionFiles({
+    tenantId: params.tenantId,
+    ingestionId: params.ingestionId,
+  });
+
+  const ingestion = await findIngestionWithCreator({
+    tenantId: params.tenantId,
+    ingestionId: params.ingestionId,
+  });
+
+  if (!ingestion) {
+    throw new NotFoundError(`Ingestion '${params.ingestionId}' was not found.`);
+  }
+
+  const object = await findObjectBySourceIngestion({
+    tenantId: params.tenantId,
+    ingestionId: params.ingestionId,
+  });
+
+  const leaseToken = createLeaseToken({
+    lease_id: params.leaseId,
+    lease_token_id: params.leaseTokenId,
+    ingestion_id: params.ingestionId,
+    tenant_id: params.tenantId,
+    worker_id: params.workerId,
+    exp: params.leaseExpiresAt.toISOString(),
+  });
+
+  return {
+    lease_id: params.leaseId,
+    lease_token: leaseToken,
+    lease_expires_at: params.leaseExpiresAt.toISOString(),
+    ingestion_id: params.ingestionId,
+    batch_label: params.batchLabel,
+    tenant_id: params.tenantId,
+    download_urls: buildDownloadUrls({
+      tenantId: params.tenantId,
+      ingestionId: params.ingestionId,
+      files: ingestionFiles,
+      expiresAt: params.leaseExpiresAt,
+    }),
+    catalog_json: buildCatalogJson({
+      ingestion,
+      object,
+    }),
+  };
+}
+
 export async function leaseNextIngestion(params: {
   workerId?: string;
 }): Promise<Record<string, unknown>> {
@@ -189,53 +246,51 @@ export async function leaseNextIngestion(params: {
     };
   }
 
-  const ingestionFiles = await listIngestionFiles({
-    tenantId: leaseResult.ingestion.tenantId,
-    ingestionId: leaseResult.ingestion.id,
+  return {
+    lease: await buildLeasePayload({
+      leaseId: leaseResult.lease.id,
+      leaseTokenId: leaseResult.lease.leaseTokenId,
+      leaseExpiresAt: leaseResult.lease.leaseExpiresAt,
+      ingestionId: leaseResult.ingestion.id,
+      batchLabel: leaseResult.ingestion.batchLabel,
+      tenantId: leaseResult.ingestion.tenantId,
+      workerId: params.workerId,
+    }),
+  };
+}
+
+export async function leaseIngestionById(params: {
+  ingestionId: string;
+  workerId?: string;
+}): Promise<Record<string, unknown>> {
+  await sweepExpiredLeases();
+
+  const leaseResult = await leaseQueuedIngestionById({
+    ingestionId: params.ingestionId,
+    workerId: params.workerId,
+    leaseDurationSeconds: leaseTtlSeconds(),
   });
 
-  const ingestion = await findIngestionWithCreator({
-    tenantId: leaseResult.ingestion.tenantId,
-    ingestionId: leaseResult.ingestion.id,
-  });
-
-  if (!ingestion) {
-    throw new NotFoundError(`Ingestion '${leaseResult.ingestion.id}' was not found.`);
+  if (leaseResult.status === "not_found") {
+    throw new NotFoundError(`Ingestion '${params.ingestionId}' was not found.`);
   }
 
-  const object = await findObjectBySourceIngestion({
-    tenantId: leaseResult.ingestion.tenantId,
-    ingestionId: leaseResult.ingestion.id,
-  });
-
-  const leaseToken = createLeaseToken({
-    lease_id: leaseResult.lease.id,
-    lease_token_id: leaseResult.lease.leaseTokenId,
-    ingestion_id: leaseResult.ingestion.id,
-    tenant_id: leaseResult.ingestion.tenantId,
-    worker_id: params.workerId,
-    exp: leaseResult.lease.leaseExpiresAt.toISOString(),
-  });
+  if (leaseResult.status === "not_leasable") {
+    throw new ConflictError("Ingestion is not available for leasing.", {
+      ingestion_id: params.ingestionId,
+    });
+  }
 
   return {
-    lease: {
-      lease_id: leaseResult.lease.id,
-      lease_token: leaseToken,
-      lease_expires_at: leaseResult.lease.leaseExpiresAt.toISOString(),
-      ingestion_id: leaseResult.ingestion.id,
-      batch_label: leaseResult.ingestion.batchLabel,
-      tenant_id: leaseResult.ingestion.tenantId,
-      download_urls: buildDownloadUrls({
-        tenantId: leaseResult.ingestion.tenantId,
-        ingestionId: leaseResult.ingestion.id,
-        files: ingestionFiles,
-        expiresAt: leaseResult.lease.leaseExpiresAt,
-      }),
-      catalog_json: buildCatalogJson({
-        ingestion,
-        object,
-      }),
-    },
+    lease: await buildLeasePayload({
+      leaseId: leaseResult.lease.id,
+      leaseTokenId: leaseResult.lease.leaseTokenId,
+      leaseExpiresAt: leaseResult.lease.leaseExpiresAt,
+      ingestionId: leaseResult.ingestion.id,
+      batchLabel: leaseResult.ingestion.batchLabel,
+      tenantId: leaseResult.ingestion.tenantId,
+      workerId: params.workerId,
+    }),
   };
 }
 

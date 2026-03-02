@@ -113,6 +113,7 @@ Planned addition: `LOCKED` (for HTTP `423` state-based non-deliverable condition
 - Query params:
   - `limit` (optional int, default `50`, max `200`)
   - `cursor` (optional opaque base64url string)
+  - `ingestion_id` (optional UUID; filters activity to a single ingestion)
 - 200 response:
   - `activity[]` where each item includes:
     - `id`, `event_id`, `type`, `ingestion_id`, `object_id`, `payload`, `actor_user_id`, `created_at`
@@ -127,7 +128,8 @@ Planned addition: `LOCKED` (for HTTP `423` state-based non-deliverable condition
 - Body:
   - `batch_label` (string)
   - `schema_version` (string, must be `"1.0"`)
-  - `document_type` (string; one of `newspaper_article`, `magazine_article`, `book_chapter`, `book`, `photo`, `letter`, `speech`, `interview`, `document`, `other`)
+  - `classification_type` (string; one of `newspaper_article`, `magazine_article`, `book_chapter`, `book`, `letter`, `speech`, `interview`, `report`, `manuscript`, `image`, `document`, `other`)
+  - `item_kind` (string; one of `photo`, `audio`, `video`, `scanned_document`, `document`, `other`)
   - `language_code` (string, non-empty; unrestricted)
   - `pipeline_preset` (string; one of `auto`, `none`, `ocr_text`, `audio_transcript`, `video_transcript`, `ocr_and_audio_transcript`, `ocr_and_video_transcript`)
   - `access_level` (string; `private`, `family`, `public`)
@@ -135,6 +137,27 @@ Planned addition: `LOCKED` (for HTTP `423` state-based non-deliverable condition
   - `rights_note` (optional string)
   - `sensitivity_note` (optional string)
   - `summary` (object; ingestion-stage metadata, based on `catalog.json` fields)
+    - required shape (strict, unknown keys rejected):
+      - `title`
+        - `primary` (string, non-empty)
+        - `original_script` (string or `null`)
+        - `translations` (array of `{ lang, text }`)
+      - `classification`
+        - `tags` (string array, unique values)
+        - `summary` (string or `null`)
+      - `dates`
+        - `published` and `created`
+          - `value` (YYYY, YYYY-MM, YYYY-MM-DD, or `null`)
+          - `approximate` (boolean)
+          - `confidence` (`low`, `medium`, `high`)
+          - `note` (string or `null`)
+    - optional fields:
+      - `processing`
+        - `ocr_text`, `audio_transcript`, `video_transcript` (each optional `{ enabled, language? }`)
+      - `publication` (`name`, `issue`, `volume`, `pages`, `place`)
+      - `people` (`subjects`, `authors`, `contributors`, `mentioned`)
+      - `links` (`related_object_ids`, `external_urls`)
+      - `notes` (`internal`, `public`)
 - 201 response:
   - `ingestion` (draft ingestion object)
 
@@ -156,6 +179,29 @@ Planned addition: `LOCKED` (for HTTP `423` state-based non-deliverable condition
 - 200 response:
   - `ingestion`
   - `files[]`
+
+### PATCH `/api/ingestions/:id`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Body (partial update, optional fields):
+  - `batch_label` (string)
+  - `classification_type` (string; one of `newspaper_article`, `magazine_article`, `book_chapter`, `book`, `letter`, `speech`, `interview`, `report`, `manuscript`, `image`, `document`, `other`)
+  - `item_kind` (string; one of `photo`, `audio`, `video`, `scanned_document`, `document`, `other`)
+  - `language_code` (string, non-empty; unrestricted)
+  - `pipeline_preset` (string; one of `auto`, `none`, `ocr_text`, `audio_transcript`, `video_transcript`, `ocr_and_audio_transcript`, `ocr_and_video_transcript`)
+  - `access_level` (string; `private`, `family`, `public`)
+  - `embargo_until` (optional RFC3339 timestamp, nullable)
+  - `rights_note` (optional string, nullable)
+  - `sensitivity_note` (optional string, nullable)
+  - `summary` (object; ingestion-stage metadata, based on `catalog.json` fields)
+    - full object replacement (same strict schema as `POST /api/ingestions`)
+    - partial nested updates are not supported; send the complete summary block
+- Preconditions:
+  - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
+  - ingestion has not started processing (no active lease)
+- 200 response:
+  - `ingestion` (updated ingestion object)
 
 ### DELETE `/api/ingestions/:id`
 
@@ -184,6 +230,8 @@ Planned addition: `LOCKED` (for HTTP `423` state-based non-deliverable condition
 - Roles: `archiver`, `admin`
 - Body (new file):
   - `filename`, `content_type`, `size_bytes`
+- Planned (not yet implemented):
+  - optional `source_order` (integer `>= 0`) to persist client-intended page/file sequence
 - Body (re-presign existing):
   - `file_id`
 - 201 response:
@@ -399,6 +447,29 @@ Example response:
   - `object_id`
   - `artifacts[]` (`id`, `kind`, `storage_key`, `content_type`, `size_bytes`, `created_at`)
 
+### POST `/api/objects/:object_id/download-requests`
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- Body:
+  - `artifact_kind` (`original`, `pdf`, `ocr_text`, `thumbnail`, `transcript`, `web_version`, `other`)
+- Behavior:
+  - If matching artifact already exists on backend, request is not queued and response returns `status = available` with artifact payload.
+  - If artifact is missing, backend queues (or reuses existing active) request and returns `status = queued` with request payload.
+- 200 response:
+  - when artifact already exists: `status: "available"`, `object_id`, `artifact`
+  - when an active request already exists: `status: "queued"`, `object_id`, `request`
+- 201 response:
+  - when a new queue request is created: `status: "queued"`, `object_id`, `request`
+
+### GET `/api/objects/:object_id/download-requests`
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- 200 response:
+  - `object_id`
+  - `requests[]` (`id`, `requested_by`, `artifact_kind`, `status`, `failure_reason`, `created_at`, `updated_at`, `completed_at`)
+
 ### GET `/api/objects/:object_id/artifacts/:artifact_id/download`
 
 - Auth: Bearer token
@@ -527,6 +598,20 @@ Integration guide for archive worker teams: `docs/archive-system-integration.md`
 - ingestion-stage leases may provide `catalog_json.object_id = null`
 - each `download_urls[]` item includes `checksum_sha256` for worker validation
 - each `download_urls[]` item includes `processing_overrides` (object; per-file overrides)
+- Planned (not yet implemented): each `download_urls[]` item will also include `filename` and `source_order`
+- Ordering rule target (planned): `source_order ASC NULLS LAST`, then `filename`, then `file_id`
+
+### POST `/api/ingestions/:id/lease`
+
+- Auth: `x-worker-auth-token` header
+- Optional: `x-worker-id`
+- Path:
+  - `:id` ingestion UUID
+- 200 response:
+  - `lease { lease_id, lease_token, lease_expires_at, ingestion_id, batch_label, tenant_id, download_urls[], catalog_json }`
+- 404 when ingestion does not exist
+- 409 when ingestion exists but is not currently leasable (for example, active lease, not in `QUEUED`, or terminal state)
+- no active-lease takeover is allowed; this endpoint is for deterministic reacquire/recovery
 
 ### POST `/api/ingestions/:id/lease/heartbeat`
 

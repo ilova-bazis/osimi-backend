@@ -12,6 +12,7 @@ import {
   updateObjectIngestManifest,
   updateObjectProjectionState,
 } from "../repos/object-repo.ts";
+import { jsonObjectSchema } from "../validation/ingestion.ts";
 import type {
   IngestWorkerEventsInput,
   IngestWorkerEventsResponse,
@@ -48,6 +49,7 @@ export async function ingestWorkerEvents(
 
     if (event.event_type === "INGESTION_COMPLETED") {
       try {
+        const parsedMetadata = jsonObjectSchema.safeParse(event.payload);
         completionObject = await createOrGetObjectBySourceIngestion({
           objectId: event.object_id,
           tenantId: ingestionRecord.tenantId,
@@ -55,7 +57,7 @@ export async function ingestWorkerEvents(
           type: "GENERIC",
           title:
             typeof event.payload.title === "string" ? event.payload.title : "",
-          metadata: event.payload,
+          metadata: parsedMetadata.success ? parsedMetadata.data : {},
         });
       } catch (error) {
         if (!isObjectConflictError(error)) {
@@ -161,15 +163,12 @@ export async function ingestWorkerEvents(
       completedObjectId = completionObject.objectId;
 
       const ingestJson = event.payload.ingest_json;
-      if (
-        ingestJson &&
-        typeof ingestJson === "object" &&
-        !Array.isArray(ingestJson)
-      ) {
+      const parsedIngestJson = jsonObjectSchema.safeParse(ingestJson);
+      if (parsedIngestJson.success) {
         await updateObjectIngestManifest({
           tenantId: ingestionRecord.tenantId,
           objectId: completionObject.objectId,
-          ingestManifest: ingestJson as Record<string, unknown>,
+          ingestManifest: parsedIngestJson.data,
         });
       }
 

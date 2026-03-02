@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { sql as sqlIdentifier } from "bun";
 
 import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
@@ -10,14 +11,6 @@ import { runMigrations } from "../../../src/db/migrate.ts";
 import { createDownloadToken } from "../../../src/storage/staging.ts";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
-
-function quoteIdentifier(identifier: string): string {
-  return `"${identifier}"`;
-}
-
-function qualifiedTable(schema: string, table: string): string {
-  return `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
-}
 
 function sha256Hex(value: string): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
@@ -58,7 +51,8 @@ function buildIngestionBody(overrides?: Record<string, unknown>): Record<string,
   return {
     batch_label: `batch-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
     schema_version: "1.0",
-    document_type: "document",
+    classification_type: "document",
+    item_kind: "document",
     language_code: "en",
     pipeline_preset: "auto",
     access_level: "private",
@@ -71,15 +65,13 @@ async function cancelQueuedIngestions(schema: string): Promise<void> {
   const sql = createSqlClient(TEST_DATABASE_URL!);
 
   try {
-    const ingestionsTable = qualifiedTable(schema, "ingestions");
-    await sql.unsafe(
-      `
-        UPDATE ${ingestionsTable}
-        SET status = 'CANCELED',
-            updated_at = now()
-        WHERE status = 'QUEUED'
-      `,
-    );
+    await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+    await sql`
+      UPDATE ingestions
+      SET status = ${"CANCELED"}::ingestion_status,
+          updated_at = now()
+      WHERE status = ${"QUEUED"}::ingestion_status
+    `;
   } finally {
     await sql.close();
   }
@@ -89,17 +81,14 @@ async function expireActiveLease(schema: string, ingestionId: string): Promise<v
   const sql = createSqlClient(TEST_DATABASE_URL!);
 
   try {
-    const leasesTable = qualifiedTable(schema, "ingestion_leases");
-    await sql.unsafe(
-      `
-        UPDATE ${leasesTable}
-        SET lease_started_at = now() - interval '2 minute',
-            lease_expires_at = now() - interval '1 minute'
-        WHERE ingestion_id = $1
-          AND released_at IS NULL
-      `,
-      [ingestionId],
-    );
+    await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+    await sql`
+      UPDATE ingestion_leases
+      SET lease_started_at = now() - interval '2 minute',
+          lease_expires_at = now() - interval '1 minute'
+      WHERE ingestion_id = ${ingestionId}
+        AND released_at IS NULL
+    `;
   } finally {
     await sql.close();
   }
@@ -109,25 +98,25 @@ async function resetActiveIngestions(schema: string): Promise<void> {
   const sql = createSqlClient(TEST_DATABASE_URL!);
 
   try {
-    const ingestionsTable = qualifiedTable(schema, "ingestions");
-    const leasesTable = qualifiedTable(schema, "ingestion_leases");
+    await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
 
-    await sql.unsafe(
-      `
-        UPDATE ${ingestionsTable}
-        SET status = 'CANCELED',
-            updated_at = now()
-        WHERE status IN ('DRAFT', 'UPLOADING', 'QUEUED', 'PROCESSING')
-      `,
-    );
+    await sql`
+      UPDATE ingestions
+      SET status = ${"CANCELED"}::ingestion_status,
+          updated_at = now()
+      WHERE status IN (
+        ${"DRAFT"}::ingestion_status,
+        ${"UPLOADING"}::ingestion_status,
+        ${"QUEUED"}::ingestion_status,
+        ${"PROCESSING"}::ingestion_status
+      )
+    `;
 
-    await sql.unsafe(
-      `
-        UPDATE ${leasesTable}
-        SET released_at = now()
-        WHERE released_at IS NULL
-      `,
-    );
+    await sql`
+      UPDATE ingestion_leases
+      SET released_at = now()
+      WHERE released_at IS NULL
+    `;
   } finally {
     await sql.close();
   }
@@ -263,45 +252,23 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     const sql = createSqlClient(TEST_DATABASE_URL);
 
     try {
-      const tenantsTable = qualifiedTable(schema, "tenants");
-      const usersTable = qualifiedTable(schema, "users");
-      const membershipsTable = qualifiedTable(schema, "tenant_memberships");
-
       const operatorHash = await Bun.password.hash("operator123");
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${tenantsTable} (id, slug, name)
-          VALUES ($1, $2, $3)
-        `,
-        ["00000000-0000-0000-0000-000000000001", "tenant-one", "Tenant One"],
-      );
+      await sql`
+        INSERT INTO tenants (id, slug, name)
+        VALUES (${"00000000-0000-4000-8000-000000000001"}, ${"tenant-one"}, ${"Tenant One"})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${usersTable} (id, username, username_normalized, password_hash)
-          VALUES ($1, $2, $3, $4)
-        `,
-        [
-          "10000000-0000-0000-0000-000000000002",
-          "archiver@osimi.local",
-          "archiver@osimi.local",
-          operatorHash,
-        ],
-      );
+      await sql`
+        INSERT INTO users (id, username, username_normalized, password_hash)
+        VALUES (${"10000000-0000-4000-8000-000000000002"}, ${"archiver@osimi.local"}, ${"archiver@osimi.local"}, ${operatorHash})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${membershipsTable} (id, tenant_id, user_id, role)
-          VALUES ($1, $2, $3, $4)
-        `,
-        [
-          "20000000-0000-0000-0000-000000000002",
-          "00000000-0000-0000-0000-000000000001",
-          "10000000-0000-0000-0000-000000000002",
-          "archiver",
-        ],
-      );
+      await sql`
+        INSERT INTO tenant_memberships (id, tenant_id, user_id, role)
+        VALUES (${"20000000-0000-4000-8000-000000000002"}, ${"00000000-0000-4000-8000-000000000001"}, ${"10000000-0000-4000-8000-000000000002"}, ${"archiver"})
+      `;
     } finally {
       await sql.close();
     }
@@ -329,7 +296,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
       const sql = createSqlClient(TEST_DATABASE_URL);
 
       try {
-        await sql.unsafe(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+        await sql`DROP SCHEMA IF EXISTS ${sqlIdentifier(schema)} CASCADE`;
       } finally {
         await sql.close();
       }
@@ -466,6 +433,115 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
 
     const winnerCount = Number(firstBody.lease != null) + Number(secondBody.lease != null);
     expect(winnerCount).toBe(1);
+  });
+
+  test("leases a specific queued ingestion by id", async () => {
+    const app = createTestApp();
+    await cancelQueuedIngestions(schema);
+    await createQueuedIngestion(app, authToken);
+    const targetIngestionId = await createQueuedIngestion(app, authToken);
+
+    const response = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${targetIngestionId}/lease`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-targeted",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      lease: {
+        ingestion_id: string;
+      };
+    };
+
+    expect(body.lease.ingestion_id).toBe(targetIngestionId);
+  });
+
+  test("rejects specific lease request when ingestion already has an active lease", async () => {
+    const app = createTestApp();
+    await cancelQueuedIngestions(schema);
+    const ingestionId = await createQueuedIngestion(app, authToken);
+
+    const firstLeaseResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-primary",
+        },
+      }),
+    );
+    expect(firstLeaseResponse.status).toBe(200);
+
+    const secondResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/lease`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-targeted",
+        },
+      }),
+    );
+
+    expect(secondResponse.status).toBe(409);
+  });
+
+  test("reacquires specific ingestion after lease expiry", async () => {
+    const app = createTestApp();
+    await cancelQueuedIngestions(schema);
+    const ingestionId = await createQueuedIngestion(app, authToken);
+
+    const firstLease = await app.fetch(
+      new Request("http://localhost/api/ingestions/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-expire-a",
+        },
+      }),
+    );
+
+    expect(firstLease.status).toBe(200);
+    await expireActiveLease(schema, ingestionId);
+
+    const specificLease = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/lease`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-expire-b",
+        },
+      }),
+    );
+
+    expect(specificLease.status).toBe(200);
+    const specificBody = (await specificLease.json()) as {
+      lease: {
+        ingestion_id: string;
+      };
+    };
+
+    expect(specificBody.lease.ingestion_id).toBe(ingestionId);
+  });
+
+  test("returns not found when requesting lease for unknown ingestion id", async () => {
+    const app = createTestApp();
+
+    const response = await app.fetch(
+      new Request("http://localhost/api/ingestions/00000000-0000-4000-8000-000000000099/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-targeted",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(404);
   });
 
   test("rejects heartbeat when ingestion id does not match lease token", async () => {
@@ -681,7 +757,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     const expiredToken = createDownloadToken({
       ingestion_id: ingestionId,
       file_id: file!.file_id,
-      tenant_id: "00000000-0000-0000-0000-000000000001",
+      tenant_id: "00000000-0000-4000-8000-000000000001",
       storage_key: file!.storage_key,
       content_type: file!.content_type,
       size_bytes: file!.size_bytes,

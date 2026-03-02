@@ -118,6 +118,8 @@ To support outbound-only workers and avoid race conditions, ingestion processing
 - A periodic redundancy sweep must re-queue any `PROCESSING` ingestion with an expired lease
 - Lease ownership is enforced using a signed `lease_token` issued by the VPS at grant time
 - `worker_id` is optional metadata provided by the worker; it may be dynamic per process run
+- VPS may issue a targeted lease for a specific ingestion via `POST /api/ingestions/:id/lease` for deterministic recovery
+- Targeted lease requests must not steal active leases; active lease conflicts return non-success
 
 ### Lease Model
 
@@ -125,6 +127,43 @@ To support outbound-only workers and avoid race conditions, ingestion processing
 - At most one active lease per ingestion (`released_at` is null and `lease_expires_at` > now)
 - Lease ownership is validated by signature + matching lease row
 - Leases are created on grant and marked released on completion/cancel
+
+### File Ordering for Ingestion Processing (Planned)
+
+Problem statement:
+
+- Archive workers may build a single derivative (for example PDF) from many uploaded pages.
+- Page sequence must be deterministic and user-intent-preserving.
+- `storage_key` is UUID-prefixed and must be treated as opaque; lexical sort on `storage_key` is not a valid ordering strategy.
+
+Contract goals:
+
+- Preserve explicit page order from the ingesting client when provided.
+- Provide stable fallback ordering when explicit order is absent.
+- Keep ordering independent from upload timing and internal storage key format.
+
+Planned model changes:
+
+- Add nullable `source_order` to `ingestion_files` (integer, `>= 0`).
+- Recommended invariant: unique non-null order per ingestion (`UNIQUE (ingestion_id, source_order) WHERE source_order IS NOT NULL`).
+- Keep `filename` as submitted display/source name.
+
+Planned worker lease payload additions (`download_urls[]`):
+
+- `filename` (string)
+- `source_order` (integer or `null`)
+
+Planned backend ordering rule for lease file lists:
+
+1. `source_order ASC NULLS LAST`
+2. `filename` natural lexical tie-break
+3. `file_id` final deterministic tie-break
+
+Compatibility expectations:
+
+- Existing clients remain valid without `source_order`.
+- Workers must not infer order from `storage_key`.
+- During migration, workers should prefer explicit `source_order` when present, otherwise consume backend-provided array order.
 
 ### Staging Cleanup & Retention
 
@@ -191,6 +230,8 @@ Backend must provide:
 | tenant_id | UUID |
 | status | enum |
 | created_by | user_id |
+| classification_type | enum |
+| item_kind | enum |
 | summary | JSON |
 | error_summary | JSON |
 | created_at | timestamp |
@@ -208,6 +249,7 @@ Backend must provide:
 | content_type | string |
 | size_bytes | int |
 | storage_key | string |
+| source_order | int (nullable, planned) |
 | status | enum |
 | error | JSON |
 
@@ -437,6 +479,7 @@ Purpose: allow the private worker to report ingestion progress and outcomes to t
 - `DELETE /api/ingestions/:id`
 - `GET /api/ingestions/capabilities`
 - `GET /api/ingestions/:id`
+- `PATCH /api/ingestions/:id`
 - `POST /api/ingestions/:id/submit`
 - `POST /api/ingestions/:id/cancel`
 - `POST /api/ingestions/:id/restore`

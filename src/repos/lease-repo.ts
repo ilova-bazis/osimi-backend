@@ -17,6 +17,13 @@ interface QueuedIngestionRow {
   status: "QUEUED" | "PROCESSING";
 }
 
+interface IngestionLeaseCandidateRow {
+  id: string;
+  batch_label: string;
+  tenant_id: string;
+  status: "DRAFT" | "UPLOADING" | "QUEUED" | "PROCESSING" | "COMPLETED" | "FAILED" | "CANCELED";
+}
+
 export interface LeaseRecord {
   id: string;
   ingestionId: string;
@@ -33,6 +40,11 @@ export interface LeasedIngestionRecord {
   tenantId: string;
   status: "QUEUED" | "PROCESSING";
 }
+
+export type LeaseByIdResult =
+  | { status: "leased"; ingestion: LeasedIngestionRecord; lease: LeaseRecord }
+  | { status: "not_found" }
+  | { status: "not_leasable" };
 
 function mapLease(row: LeaseRow): LeaseRecord {
   return {
@@ -139,6 +151,92 @@ export async function leaseNextQueuedIngestion(params: {
       return {
         ingestion: {
           ...mapLeasedIngestion(candidate),
+          status: "PROCESSING",
+        },
+        lease: mapLease(leaseRows[0]!),
+      };
+    });
+  });
+}
+
+export async function leaseQueuedIngestionById(params: {
+  ingestionId: string;
+  workerId?: string;
+  leaseDurationSeconds: number;
+}): Promise<LeaseByIdResult> {
+  return withSchemaClient(async (sql) => {
+    return sql.begin(async (transaction) => {
+      const candidates = await transaction<IngestionLeaseCandidateRow[]>`
+        SELECT ing.id, ing.batch_label, ing.tenant_id, ing.status
+        FROM ingestions ing
+        WHERE ing.id = ${params.ingestionId}
+        FOR UPDATE
+      `;
+
+      const candidate = candidates[0];
+
+      if (!candidate) {
+        return { status: "not_found" };
+      }
+
+      const activeLeaseRows = await transaction<Array<{ exists: boolean }>>`
+        SELECT EXISTS(
+          SELECT 1
+          FROM ingestion_leases lease
+          WHERE lease.ingestion_id = ${candidate.id}
+            AND lease.released_at IS NULL
+            AND lease.lease_expires_at > now()
+        ) AS exists
+      `;
+
+      if (activeLeaseRows[0]?.exists) {
+        return { status: "not_leasable" };
+      }
+
+      if (candidate.status !== "QUEUED") {
+        return { status: "not_leasable" };
+      }
+
+      const leaseId = crypto.randomUUID();
+      const leaseTokenId = crypto.randomUUID();
+      const leaseRows = await transaction<LeaseRow[]>`
+        INSERT INTO ingestion_leases (
+          id,
+          ingestion_id,
+          leased_by,
+          lease_token_id,
+          lease_expires_at
+        )
+        VALUES (
+          ${leaseId},
+          ${candidate.id},
+          ${params.workerId ?? null},
+          ${leaseTokenId},
+          now() + (${params.leaseDurationSeconds}::int * interval '1 second')
+        )
+        RETURNING id, ingestion_id, leased_by, lease_token_id, lease_expires_at, created_at, released_at
+      `;
+
+      const updatedRows = await transaction<Array<{ id: string }>>`
+        UPDATE ingestions
+        SET status = 'PROCESSING',
+            updated_at = now()
+        WHERE id = ${candidate.id}
+          AND status = 'QUEUED'
+        RETURNING id
+      `;
+
+      if (updatedRows.length === 0) {
+        return { status: "not_leasable" };
+      }
+
+      return {
+        status: "leased",
+        ingestion: {
+          ...mapLeasedIngestion({
+            ...candidate,
+            status: "QUEUED",
+          }),
           status: "PROCESSING",
         },
         lease: mapLease(leaseRows[0]!),

@@ -3,20 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { sql as sqlIdentifier } from "bun";
 
 import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
-
-function quoteIdentifier(identifier: string): string {
-  return `"${identifier}"`;
-}
-
-function qualifiedTable(schema: string, table: string): string {
-  return `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
-}
 
 function sha256Hex(value: string): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
@@ -55,7 +48,8 @@ function buildIngestionBody(overrides?: Record<string, unknown>): Record<string,
   return {
     batch_label: `batch-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
     schema_version: "1.0",
-    document_type: "document",
+    classification_type: "document",
+    item_kind: "document",
     language_code: "en",
     pipeline_preset: "auto",
     access_level: "private",
@@ -91,45 +85,23 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
     const sql = createSqlClient(TEST_DATABASE_URL);
 
     try {
-      const tenantsTable = qualifiedTable(schema, "tenants");
-      const usersTable = qualifiedTable(schema, "users");
-      const membershipsTable = qualifiedTable(schema, "tenant_memberships");
-
       const operatorHash = await Bun.password.hash("operator123");
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${tenantsTable} (id, slug, name)
-          VALUES ($1, $2, $3)
-        `,
-        ["00000000-0000-0000-0000-000000000001", "tenant-one", "Tenant One"],
-      );
+      await sql`
+        INSERT INTO tenants (id, slug, name)
+        VALUES (${"00000000-0000-0000-0000-000000000001"}, ${"tenant-one"}, ${"Tenant One"})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${usersTable} (id, username, username_normalized, password_hash)
-          VALUES ($1, $2, $3, $4)
-        `,
-        [
-          "10000000-0000-0000-0000-000000000002",
-          "archiver@osimi.local",
-          "archiver@osimi.local",
-          operatorHash,
-        ],
-      );
+      await sql`
+        INSERT INTO users (id, username, username_normalized, password_hash)
+        VALUES (${"10000000-0000-0000-0000-000000000002"}, ${"archiver@osimi.local"}, ${"archiver@osimi.local"}, ${operatorHash})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${membershipsTable} (id, tenant_id, user_id, role)
-          VALUES ($1, $2, $3, $4)
-        `,
-        [
-          "20000000-0000-0000-0000-000000000002",
-          "00000000-0000-0000-0000-000000000001",
-          "10000000-0000-0000-0000-000000000002",
-          "archiver",
-        ],
-      );
+      await sql`
+        INSERT INTO tenant_memberships (id, tenant_id, user_id, role)
+        VALUES (${"20000000-0000-0000-0000-000000000002"}, ${"00000000-0000-0000-0000-000000000001"}, ${"10000000-0000-0000-0000-000000000002"}, ${"archiver"})
+      `;
     } finally {
       await sql.close();
     }
@@ -157,7 +129,7 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
       const sql = createSqlClient(TEST_DATABASE_URL);
 
       try {
-        await sql.unsafe(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+        await sql`DROP SCHEMA IF EXISTS ${sqlIdentifier(schema)} CASCADE`;
       } finally {
         await sql.close();
       }
@@ -279,6 +251,121 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
     expect(detailBody.ingestion.status).toBe("QUEUED");
     expect(detailBody.files.length).toBe(1);
     expect(detailBody.files[0]?.status).toBe("UPLOADED");
+  });
+
+  test("updates ingestion metadata while draft", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-update-001" })),
+      }),
+    );
+
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as {
+      ingestion: { id: string };
+    };
+    const ingestionId = createBody.ingestion.id;
+
+    const patchResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          batch_label: "batch-update-002",
+          rights_note: "Updated rights",
+          sensitivity_note: null,
+          embargo_until: "2026-02-21T10:00:00.000Z",
+          summary: buildSummary({
+            classification: {
+              tags: ["updated"],
+              summary: null,
+            },
+          }),
+        }),
+      }),
+    );
+
+    expect(patchResponse.status).toBe(200);
+    const patchBody = (await patchResponse.json()) as {
+      ingestion: {
+        batch_label: string;
+        rights_note: string | null;
+        sensitivity_note: string | null;
+        embargo_until: string | null;
+        summary: { classification: { tags: string[] } };
+      };
+    };
+    expect(patchBody.ingestion.batch_label).toBe("batch-update-002");
+    expect(patchBody.ingestion.rights_note).toBe("Updated rights");
+    expect(patchBody.ingestion.sensitivity_note).toBeNull();
+    expect(patchBody.ingestion.embargo_until).toBe("2026-02-21T10:00:00.000Z");
+    expect(patchBody.ingestion.summary.classification.tags).toEqual(["updated"]);
+
+    const getResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+
+    expect(getResponse.status).toBe(200);
+    const getBody = (await getResponse.json()) as {
+      ingestion: {
+        batch_label: string;
+        rights_note: string | null;
+        sensitivity_note: string | null;
+        embargo_until: string | null;
+      };
+    };
+    expect(getBody.ingestion.batch_label).toBe("batch-update-002");
+    expect(getBody.ingestion.rights_note).toBe("Updated rights");
+    expect(getBody.ingestion.sensitivity_note).toBeNull();
+    expect(getBody.ingestion.embargo_until).toBe("2026-02-21T10:00:00.000Z");
+  });
+
+  test("rejects empty ingestion update payload", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-update-empty-001" })),
+      }),
+    );
+
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as {
+      ingestion: { id: string };
+    };
+
+    const patchResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      }),
+    );
+
+    expect(patchResponse.status).toBe(400);
   });
 
   test("returns ingestion capabilities", async () => {

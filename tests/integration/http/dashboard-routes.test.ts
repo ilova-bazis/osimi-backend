@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { sql as sqlIdentifier } from "bun";
 
 import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
@@ -6,14 +7,6 @@ import { runMigrations } from "../../../src/db/migrate.ts";
 
 const TEST_DATABASE_URL =
   process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
-
-function quoteIdentifier(identifier: string): string {
-  return `"${identifier}"`;
-}
-
-function qualifiedTable(schema: string, table: string): string {
-  return `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
-}
 
 describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
   let schema = "";
@@ -39,176 +32,201 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
     const sql = createSqlClient(TEST_DATABASE_URL!);
 
     try {
-      const tenantsTable = qualifiedTable(schema, "tenants");
-      const usersTable = qualifiedTable(schema, "users");
-      const membershipsTable = qualifiedTable(schema, "tenant_memberships");
-      const ingestionsTable = qualifiedTable(schema, "ingestions");
-      const objectsTable = qualifiedTable(schema, "objects");
-      const eventsTable = qualifiedTable(schema, "object_events");
-
       const viewerHash = await Bun.password.hash("viewer123");
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${tenantsTable} (id, slug, name)
-          VALUES
-            ($1, $2, $3),
-            ($4, $5, $6)
-        `,
-        [
-          "00000000-0000-0000-0000-000000000001",
-          "tenant-one",
-          "Tenant One",
-          "00000000-0000-0000-0000-000000000002",
-          "tenant-two",
-          "Tenant Two",
-        ],
-      );
+      await sql`
+        INSERT INTO tenants (id, slug, name)
+        VALUES
+          (${"00000000-0000-4000-8000-000000000001"}, ${"tenant-one"}, ${"Tenant One"}),
+          (${"00000000-0000-4000-8000-000000000002"}, ${"tenant-two"}, ${"Tenant Two"})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${usersTable} (id, username, username_normalized, password_hash)
-          VALUES ($1, $2, $3, $4)
-        `,
-        [
-          "10000000-0000-0000-0000-000000000001",
-          "viewer@osimi.local",
-          "viewer@osimi.local",
-          viewerHash,
-        ],
-      );
+      await sql`
+        INSERT INTO users (id, username, username_normalized, password_hash)
+        VALUES (${"10000000-0000-4000-8000-000000000001"}, ${"viewer@osimi.local"}, ${"viewer@osimi.local"}, ${viewerHash})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${membershipsTable} (id, tenant_id, user_id, role)
-          VALUES ($1, $2, $3, $4)
-        `,
-        [
-          "20000000-0000-0000-0000-000000000001",
-          "00000000-0000-0000-0000-000000000001",
-          "10000000-0000-0000-0000-000000000001",
-          "viewer",
-        ],
-      );
+      await sql`
+        INSERT INTO tenant_memberships (id, tenant_id, user_id, role)
+        VALUES (${"20000000-0000-4000-8000-000000000001"}, ${"00000000-0000-4000-8000-000000000001"}, ${"10000000-0000-4000-8000-000000000001"}, ${"viewer"})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${ingestionsTable} (
-            id,
-            batch_label,
-            tenant_id,
-            status,
-            created_by,
-            schema_version,
-            document_type,
-            language_code,
-            pipeline_preset,
-            access_level,
-            summary,
-            error_summary
+      await sql`
+        INSERT INTO ingestions (
+          id,
+          batch_label,
+          tenant_id,
+          status,
+          created_by,
+          schema_version,
+          classification_type,
+          item_kind,
+          language_code,
+          pipeline_preset,
+          access_level,
+          summary,
+          error_summary
+        )
+        VALUES
+          (
+            ${"30000000-0000-4000-8000-000000000001"},
+            ${"batch-1"},
+            ${"00000000-0000-4000-8000-000000000001"},
+            ${"COMPLETED"}::ingestion_status,
+            ${"10000000-0000-4000-8000-000000000001"},
+            ${"1.0"},
+            ${"document"}::ingestion_classification_type,
+            ${"document"}::ingest_item_kind,
+            ${"en"},
+            ${"auto"}::ingestion_pipeline_preset,
+            ${"private"}::object_access_level,
+            ${{}},
+            ${{}}
+          ),
+          (
+            ${"30000000-0000-4000-8000-000000000002"},
+            ${"batch-2"},
+            ${"00000000-0000-4000-8000-000000000001"},
+            ${"COMPLETED"}::ingestion_status,
+            ${"10000000-0000-4000-8000-000000000001"},
+            ${"1.0"},
+            ${"document"}::ingestion_classification_type,
+            ${"document"}::ingest_item_kind,
+            ${"en"},
+            ${"auto"}::ingestion_pipeline_preset,
+            ${"private"}::object_access_level,
+            ${{}},
+            ${{}}
+          ),
+          (
+            ${"30000000-0000-4000-8000-000000000003"},
+            ${"batch-3"},
+            ${"00000000-0000-4000-8000-000000000001"},
+            ${"FAILED"}::ingestion_status,
+            ${"10000000-0000-4000-8000-000000000001"},
+            ${"1.0"},
+            ${"document"}::ingestion_classification_type,
+            ${"document"}::ingest_item_kind,
+            ${"en"},
+            ${"auto"}::ingestion_pipeline_preset,
+            ${"private"}::object_access_level,
+            ${{}},
+            ${{}}
+          ),
+          (
+            ${"30000000-0000-4000-8000-000000000004"},
+            ${"batch-4"},
+            ${"00000000-0000-4000-8000-000000000002"},
+            ${"COMPLETED"}::ingestion_status,
+            ${"10000000-0000-4000-8000-000000000001"},
+            ${"1.0"},
+            ${"document"}::ingestion_classification_type,
+            ${"document"}::ingest_item_kind,
+            ${"en"},
+            ${"auto"}::ingestion_pipeline_preset,
+            ${"private"}::object_access_level,
+            ${{}},
+            ${{}}
           )
-          VALUES
-            ($1, $2, $3, 'COMPLETED', $4, '1.0', 'document', 'en', 'auto', 'private', '{}'::jsonb, '{}'::jsonb),
-            ($5, $6, $7, 'COMPLETED', $8, '1.0', 'document', 'en', 'auto', 'private', '{}'::jsonb, '{}'::jsonb),
-            ($9, $10, $11, 'FAILED', $12, '1.0', 'document', 'en', 'auto', 'private', '{}'::jsonb, '{}'::jsonb),
-            ($13, $14, $15, 'COMPLETED', $16, '1.0', 'document', 'en', 'auto', 'private', '{}'::jsonb, '{}'::jsonb)
-        `,
-        [
-          "30000000-0000-0000-0000-000000000001",
-          "batch-1",
-          "00000000-0000-0000-0000-000000000001",
-          "10000000-0000-0000-0000-000000000001",
-          "30000000-0000-0000-0000-000000000002",
-          "batch-2",
-          "00000000-0000-0000-0000-000000000001",
-          "10000000-0000-0000-0000-000000000001",
-          "30000000-0000-0000-0000-000000000003",
-          "batch-3",
-          "00000000-0000-0000-0000-000000000001",
-          "10000000-0000-0000-0000-000000000001",
-          "30000000-0000-0000-0000-000000000004",
-          "batch-4",
-          "00000000-0000-0000-0000-000000000002",
-          "10000000-0000-0000-0000-000000000001",
-        ],
-      );
+      `;
 
-      await sql.unsafe(
-        `
-          UPDATE ${ingestionsTable}
-          SET updated_at = CASE id
-            WHEN $1 THEN now()
-            WHEN $2 THEN date_trunc('week', now()) + interval '1 hour'
-            WHEN $3 THEN now()
-            WHEN $4 THEN now()
-          END
-          WHERE id IN ($1, $2, $3, $4)
-        `,
-        [
-          "30000000-0000-0000-0000-000000000001",
-          "30000000-0000-0000-0000-000000000002",
-          "30000000-0000-0000-0000-000000000003",
-          "30000000-0000-0000-0000-000000000004",
-        ],
-      );
+      await sql`
+        UPDATE ingestions
+        SET updated_at = CASE id
+          WHEN ${"30000000-0000-4000-8000-000000000001"} THEN now()
+          WHEN ${"30000000-0000-4000-8000-000000000002"} THEN date_trunc('week', now()) + interval '1 hour'
+          WHEN ${"30000000-0000-4000-8000-000000000003"} THEN now()
+          WHEN ${"30000000-0000-4000-8000-000000000004"} THEN now()
+        END
+        WHERE id IN (
+          ${"30000000-0000-4000-8000-000000000001"},
+          ${"30000000-0000-4000-8000-000000000002"},
+          ${"30000000-0000-4000-8000-000000000003"},
+          ${"30000000-0000-4000-8000-000000000004"}
+        )
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${objectsTable} (object_id, tenant_id, type, title, metadata, source_ingestion_id, availability_state)
-          VALUES
-            ($1, $2, 'DOCUMENT', $3, '{}'::jsonb, $4, 'AVAILABLE'),
-            ($5, $6, 'IMAGE', $7, '{}'::jsonb, $8, 'AVAILABLE'),
-            ($9, $10, 'AUDIO', $11, '{}'::jsonb, $12, 'AVAILABLE')
-        `,
-        [
-          "OBJ-20260210-AAA111",
-          "00000000-0000-0000-0000-000000000001",
-          "Object A",
-          "30000000-0000-0000-0000-000000000001",
-          "OBJ-20260210-BBB222",
-          "00000000-0000-0000-0000-000000000001",
-          "Object B",
-          "30000000-0000-0000-0000-000000000002",
-          "OBJ-20260210-CCC333",
-          "00000000-0000-0000-0000-000000000002",
-          "Object C",
-          "30000000-0000-0000-0000-000000000004",
-        ],
-      );
+      await sql`
+        INSERT INTO objects (object_id, tenant_id, type, title, metadata, source_ingestion_id, availability_state)
+        VALUES
+          (
+            ${"OBJ-20260210-AAA111"},
+            ${"00000000-0000-4000-8000-000000000001"},
+            ${"DOCUMENT"}::object_type,
+            ${"Object A"},
+            ${{}},
+            ${"30000000-0000-4000-8000-000000000001"},
+            ${"AVAILABLE"}::object_availability_state
+          ),
+          (
+            ${"OBJ-20260210-BBB222"},
+            ${"00000000-0000-4000-8000-000000000001"},
+            ${"IMAGE"}::object_type,
+            ${"Object B"},
+            ${{}},
+            ${"30000000-0000-4000-8000-000000000002"},
+            ${"AVAILABLE"}::object_availability_state
+          ),
+          (
+            ${"OBJ-20260210-CCC333"},
+            ${"00000000-0000-4000-8000-000000000002"},
+            ${"AUDIO"}::object_type,
+            ${"Object C"},
+            ${{}},
+            ${"30000000-0000-4000-8000-000000000004"},
+            ${"AVAILABLE"}::object_availability_state
+          )
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${eventsTable} (id, event_id, tenant_id, type, ingestion_id, object_id, payload, actor_user_id, created_at)
-          VALUES
-            ($1, $2, $3, 'INGESTION_COMPLETED', $4, NULL, '{}'::jsonb, $5, now()),
-            ($6, $7, $8, 'OBJECT_CREATED', $9, $10, '{}'::jsonb, $11, now() - interval '1 minute'),
-            ($12, $13, $14, 'FILE_VALIDATED', $15, NULL, '{}'::jsonb, $16, now() - interval '2 minute'),
-            ($17, $18, $19, 'INGESTION_COMPLETED', $20, NULL, '{}'::jsonb, $21, now())
-        `,
-        [
-          "40000000-0000-0000-0000-000000000001",
-          "41000000-0000-0000-0000-000000000001",
-          "00000000-0000-0000-0000-000000000001",
-          "30000000-0000-0000-0000-000000000001",
-          "10000000-0000-0000-0000-000000000001",
-          "40000000-0000-0000-0000-000000000002",
-          "41000000-0000-0000-0000-000000000002",
-          "00000000-0000-0000-0000-000000000001",
-          "30000000-0000-0000-0000-000000000002",
-          "OBJ-20260210-BBB222",
-          "10000000-0000-0000-0000-000000000001",
-          "40000000-0000-0000-0000-000000000003",
-          "41000000-0000-0000-0000-000000000003",
-          "00000000-0000-0000-0000-000000000001",
-          "30000000-0000-0000-0000-000000000003",
-          "10000000-0000-0000-0000-000000000001",
-          "40000000-0000-0000-0000-000000000004",
-          "41000000-0000-0000-0000-000000000004",
-          "00000000-0000-0000-0000-000000000002",
-          "30000000-0000-0000-0000-000000000004",
-          "10000000-0000-0000-0000-000000000001",
-        ],
-      );
+      await sql`
+        INSERT INTO object_events (id, event_id, tenant_id, type, ingestion_id, object_id, payload, actor_user_id, created_at)
+        VALUES
+          (
+            ${"40000000-0000-4000-8000-000000000001"},
+            ${"41000000-0000-4000-8000-000000000001"},
+            ${"00000000-0000-4000-8000-000000000001"},
+            ${"INGESTION_COMPLETED"}::object_event_type,
+            ${"30000000-0000-4000-8000-000000000001"},
+            NULL,
+            ${{}},
+            ${"10000000-0000-4000-8000-000000000001"},
+            now()
+          ),
+          (
+            ${"40000000-0000-4000-8000-000000000002"},
+            ${"41000000-0000-4000-8000-000000000002"},
+            ${"00000000-0000-4000-8000-000000000001"},
+            ${"OBJECT_CREATED"}::object_event_type,
+            ${"30000000-0000-4000-8000-000000000002"},
+            ${"OBJ-20260210-BBB222"},
+            ${{}},
+            ${"10000000-0000-4000-8000-000000000001"},
+            now() - interval '1 minute'
+          ),
+          (
+            ${"40000000-0000-4000-8000-000000000003"},
+            ${"41000000-0000-4000-8000-000000000003"},
+            ${"00000000-0000-4000-8000-000000000001"},
+            ${"FILE_VALIDATED"}::object_event_type,
+            ${"30000000-0000-4000-8000-000000000003"},
+            NULL,
+            ${{}},
+            ${"10000000-0000-4000-8000-000000000001"},
+            now() - interval '2 minute'
+          ),
+          (
+            ${"40000000-0000-4000-8000-000000000004"},
+            ${"41000000-0000-4000-8000-000000000004"},
+            ${"00000000-0000-4000-8000-000000000002"},
+            ${"INGESTION_COMPLETED"}::object_event_type,
+            ${"30000000-0000-4000-8000-000000000004"},
+            NULL,
+            ${{}},
+            ${"10000000-0000-4000-8000-000000000001"},
+            now()
+          )
+      `;
     } finally {
       await sql.close();
     }
@@ -235,9 +253,7 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
       const sql = createSqlClient(TEST_DATABASE_URL!);
 
       try {
-        await sql.unsafe(
-          `DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`,
-        );
+        await sql`DROP SCHEMA IF EXISTS ${sqlIdentifier(schema)} CASCADE`;
       } finally {
         await sql.close();
       }
@@ -323,5 +339,49 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
 
     expect(secondPage.activity.length).toBe(1);
     expect(secondPage.next_cursor).toBeNull();
+  });
+
+  test("filters activity by ingestion id", async () => {
+    const app = createTestApp();
+
+    const response = await app.fetch(
+      new Request(
+        "http://localhost/api/dashboard/activity?ingestion_id=30000000-0000-4000-8000-000000000002",
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${viewerToken}`,
+          },
+        },
+      ),
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      activity: Array<{ ingestion_id: string | null; event_id: string }>;
+      next_cursor: string | null;
+    };
+
+    expect(body.activity.length).toBe(1);
+    expect(body.activity[0]?.ingestion_id).toBe(
+      "30000000-0000-4000-8000-000000000002",
+    );
+    expect(body.activity[0]?.event_id).toBe("41000000-0000-4000-8000-000000000002");
+    expect(body.next_cursor).toBeNull();
+  });
+
+  test("rejects invalid activity cursor", async () => {
+    const app = createTestApp();
+
+    const response = await app.fetch(
+      new Request("http://localhost/api/dashboard/activity?cursor=not-base64", {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${viewerToken}`,
+        },
+      }),
+    );
+
+    expect(response.status).toBe(400);
   });
 });

@@ -9,6 +9,7 @@ import {
   parseIngestionIdParam,
   parseIngestionListQuery,
   parseUpdateIngestionFileOverridesBody,
+  parseUpdateIngestionBody,
   parseUploadTokenParam,
 } from "../validation/ingestion.ts";
 import {
@@ -24,6 +25,7 @@ import {
   restoreIngestion,
   retryIngestion,
   submitIngestion,
+  updateIngestion,
   updateIngestionFileOverrides,
   uploadFileBySignedToken,
 } from "../services/ingestion-service.ts";
@@ -74,6 +76,27 @@ const getIngestionRoute: RouteDefinition = {
       extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)$/, "id"),
     );
     return jsonResponse(await getIngestion({ auth, ingestionId }));
+  },
+};
+
+const updateIngestionRoute: RouteDefinition = {
+  method: "PATCH",
+  path: "/api/ingestions/:id",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)$/, "id"),
+    );
+    const body = parseUpdateIngestionBody(await parseJsonBody(request));
+
+    return jsonResponse(
+      await updateIngestion({
+        auth,
+        ingestionId,
+        body,
+      }),
+    );
   },
 };
 
@@ -322,6 +345,7 @@ export const ingestionRoutes: RouteDefinition[] = [
   listIngestionsRoute,
   ingestionCapabilitiesRoute,
   getIngestionRoute,
+  updateIngestionRoute,
   deleteIngestionRoute,
   presignFileRoute,
   removeFileRoute,

@@ -15,15 +15,31 @@ END $$;
 
 DO $$
 BEGIN
-  CREATE TYPE ingestion_document_type AS ENUM (
+  CREATE TYPE ingestion_classification_type AS ENUM (
     'newspaper_article',
     'magazine_article',
     'book_chapter',
     'book',
-    'photo',
     'letter',
     'speech',
     'interview',
+    'report',
+    'manuscript',
+    'image',
+    'document',
+    'other'
+  );
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$
+BEGIN
+  CREATE TYPE ingest_item_kind AS ENUM (
+    'photo',
+    'audio',
+    'video',
+    'scanned_document',
     'document',
     'other'
   );
@@ -168,7 +184,39 @@ BEGIN
     'ocr',
     'transcript',
     'metadata',
+    'pdf',
+    'ocr_text',
+    'thumbnail',
+    'web_version',
     'other'
+  );
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$
+BEGIN
+  CREATE TYPE requested_artifact_kind AS ENUM (
+    'original',
+    'pdf',
+    'ocr_text',
+    'thumbnail',
+    'transcript',
+    'web_version',
+    'other'
+  );
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$
+BEGIN
+  CREATE TYPE object_download_request_status AS ENUM (
+    'PENDING',
+    'PROCESSING',
+    'COMPLETED',
+    'FAILED',
+    'CANCELED'
   );
 EXCEPTION
   WHEN duplicate_object THEN NULL;
@@ -206,7 +254,8 @@ CREATE TABLE IF NOT EXISTS ingestions (
   status ingestion_status NOT NULL DEFAULT 'DRAFT',
   created_by uuid NOT NULL,
   schema_version text NOT NULL DEFAULT '1.0',
-  document_type ingestion_document_type NOT NULL,
+  classification_type ingestion_classification_type NOT NULL,
+  item_kind ingest_item_kind NOT NULL,
   language_code text NOT NULL,
   pipeline_preset ingestion_pipeline_preset NOT NULL DEFAULT 'auto',
   access_level object_access_level NOT NULL DEFAULT 'private',
@@ -397,6 +446,29 @@ CREATE INDEX IF NOT EXISTS object_access_requests_requester_idx
 CREATE UNIQUE INDEX IF NOT EXISTS object_access_requests_one_pending_per_user_idx
   ON object_access_requests (object_id, requester_user_id)
   WHERE status = 'PENDING';
+
+CREATE TABLE IF NOT EXISTS object_download_requests (
+  id uuid PRIMARY KEY,
+  object_id text NOT NULL REFERENCES objects(object_id) ON DELETE CASCADE,
+  tenant_id uuid NOT NULL,
+  requested_by uuid NOT NULL,
+  artifact_kind requested_artifact_kind NOT NULL,
+  status object_download_request_status NOT NULL DEFAULT 'PENDING',
+  failure_reason text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS object_download_requests_object_status_idx
+  ON object_download_requests (object_id, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS object_download_requests_tenant_created_idx
+  ON object_download_requests (tenant_id, created_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS object_download_requests_one_active_kind_idx
+  ON object_download_requests (tenant_id, object_id, artifact_kind)
+  WHERE status IN ('PENDING', 'PROCESSING');
 
 CREATE TABLE IF NOT EXISTS object_artifacts (
   id uuid PRIMARY KEY,

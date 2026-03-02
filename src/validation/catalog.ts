@@ -38,16 +38,6 @@ export const ingestionSummarySchema = z
       published: dateBlockSchema,
       created: dateBlockSchema,
     }),
-    item_kind: z
-      .enum([
-        "scanned_document",
-        "photo",
-        "audio",
-        "video",
-        "document",
-        "other",
-      ])
-      .optional(),
     processing: z
       .strictObject({
         ocr_text: z

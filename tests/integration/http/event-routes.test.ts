@@ -3,20 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { sql as sqlIdentifier } from "bun";
 
 import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
-
-function quoteIdentifier(identifier: string): string {
-  return `"${identifier}"`;
-}
-
-function qualifiedTable(schema: string, table: string): string {
-  return `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
-}
 
 function sha256Hex(value: string): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
@@ -55,7 +48,8 @@ function buildIngestionBody(overrides?: Record<string, unknown>): Record<string,
   return {
     batch_label: `batch-events-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
     schema_version: "1.0",
-    document_type: "document",
+    classification_type: "document",
+    item_kind: "document",
     language_code: "en",
     pipeline_preset: "auto",
     access_level: "private",
@@ -169,25 +163,25 @@ async function resetActiveIngestions(schema: string): Promise<void> {
   const sql = createSqlClient(TEST_DATABASE_URL!);
 
   try {
-    const ingestionsTable = qualifiedTable(schema, "ingestions");
-    const leasesTable = qualifiedTable(schema, "ingestion_leases");
+    await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
 
-    await sql.unsafe(
-      `
-        UPDATE ${ingestionsTable}
-        SET status = 'CANCELED',
-            updated_at = now()
-        WHERE status IN ('DRAFT', 'UPLOADING', 'QUEUED', 'PROCESSING')
-      `,
-    );
+    await sql`
+      UPDATE ingestions
+      SET status = ${"CANCELED"}::ingestion_status,
+          updated_at = now()
+      WHERE status IN (
+        ${"DRAFT"}::ingestion_status,
+        ${"UPLOADING"}::ingestion_status,
+        ${"QUEUED"}::ingestion_status,
+        ${"PROCESSING"}::ingestion_status
+      )
+    `;
 
-    await sql.unsafe(
-      `
-        UPDATE ${leasesTable}
-        SET released_at = now()
-        WHERE released_at IS NULL
-      `,
-    );
+    await sql`
+      UPDATE ingestion_leases
+      SET released_at = now()
+      WHERE released_at IS NULL
+    `;
   } finally {
     await sql.close();
   }
@@ -221,45 +215,23 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
     const sql = createSqlClient(TEST_DATABASE_URL);
 
     try {
-      const tenantsTable = qualifiedTable(schema, "tenants");
-      const usersTable = qualifiedTable(schema, "users");
-      const membershipsTable = qualifiedTable(schema, "tenant_memberships");
-
       const operatorHash = await Bun.password.hash("operator123");
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${tenantsTable} (id, slug, name)
-          VALUES ($1, $2, $3)
-        `,
-        ["00000000-0000-0000-0000-000000000001", "tenant-one", "Tenant One"],
-      );
+      await sql`
+        INSERT INTO tenants (id, slug, name)
+        VALUES (${"00000000-0000-0000-0000-000000000001"}, ${"tenant-one"}, ${"Tenant One"})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${usersTable} (id, username, username_normalized, password_hash)
-          VALUES ($1, $2, $3, $4)
-        `,
-        [
-          "10000000-0000-0000-0000-000000000002",
-          "archiver@osimi.local",
-          "archiver@osimi.local",
-          operatorHash,
-        ],
-      );
+      await sql`
+        INSERT INTO users (id, username, username_normalized, password_hash)
+        VALUES (${"10000000-0000-0000-0000-000000000002"}, ${"archiver@osimi.local"}, ${"archiver@osimi.local"}, ${operatorHash})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${membershipsTable} (id, tenant_id, user_id, role)
-          VALUES ($1, $2, $3, $4)
-        `,
-        [
-          "20000000-0000-0000-0000-000000000002",
-          "00000000-0000-0000-0000-000000000001",
-          "10000000-0000-0000-0000-000000000002",
-          "archiver",
-        ],
-      );
+      await sql`
+        INSERT INTO tenant_memberships (id, tenant_id, user_id, role)
+        VALUES (${"20000000-0000-0000-0000-000000000002"}, ${"00000000-0000-0000-0000-000000000001"}, ${"10000000-0000-0000-0000-000000000002"}, ${"archiver"})
+      `;
     } finally {
       await sql.close();
     }
@@ -287,7 +259,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
       const sql = createSqlClient(TEST_DATABASE_URL);
 
       try {
-        await sql.unsafe(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+        await sql`DROP SCHEMA IF EXISTS ${sqlIdentifier(schema)} CASCADE`;
       } finally {
         await sql.close();
       }
@@ -399,18 +371,19 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
 
     const sql = createSqlClient(TEST_DATABASE_URL!);
     try {
-      const objectsTable = qualifiedTable(schema, "objects");
-      const eventsTable = qualifiedTable(schema, "object_events");
-
-      const objectRows = (await sql.unsafe(
-        `SELECT object_id, ingest_manifest, processing_state, availability_state FROM ${objectsTable} WHERE source_ingestion_id = $1`,
-        [ingestionId],
-      )) as Array<{
-        object_id: string;
-        ingest_manifest: unknown;
-        processing_state: string;
-        availability_state: string;
-      }>;
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      const objectRows = await sql<
+        {
+          object_id: string;
+          ingest_manifest: unknown;
+          processing_state: string;
+          availability_state: string;
+        }[]
+      >`
+        SELECT object_id, ingest_manifest, processing_state, availability_state
+        FROM objects
+        WHERE source_ingestion_id = ${ingestionId}
+      `;
 
       expect(objectRows.length).toBe(1);
       expect(objectRows[0]?.ingest_manifest).toMatchObject({
@@ -419,10 +392,11 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
       expect(objectRows[0]?.processing_state).toBe("index_done");
       expect(objectRows[0]?.availability_state).toBe("AVAILABLE");
 
-      const eventRows = (await sql.unsafe(
-        `SELECT id FROM ${eventsTable} WHERE ingestion_id = $1`,
-        [ingestionId],
-      )) as Array<{ id: string }>;
+      const eventRows = await sql<{ id: string }[]>`
+        SELECT id
+        FROM object_events
+        WHERE ingestion_id = ${ingestionId}
+      `;
 
       expect(eventRows.length).toBe(2);
     } finally {
@@ -709,16 +683,19 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
 
     const sql = createSqlClient(TEST_DATABASE_URL!);
     try {
-      const objectsTable = qualifiedTable(schema, "objects");
-      const objects = (await sql.unsafe(
-        `SELECT object_id, ingest_manifest, processing_state, availability_state FROM ${objectsTable} WHERE source_ingestion_id = $1`,
-        [ingestionId],
-      )) as Array<{
-        object_id: string;
-        ingest_manifest: unknown;
-        processing_state: string;
-        availability_state: string;
-      }>;
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      const objects = await sql<
+        {
+          object_id: string;
+          ingest_manifest: unknown;
+          processing_state: string;
+          availability_state: string;
+        }[]
+      >`
+        SELECT object_id, ingest_manifest, processing_state, availability_state
+        FROM objects
+        WHERE source_ingestion_id = ${ingestionId}
+      `;
 
       expect(objects.length).toBe(1);
       expect(objects[0]?.ingest_manifest).toMatchObject({
@@ -796,11 +773,12 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
 
     const sql = createSqlClient(TEST_DATABASE_URL!);
     try {
-      const objectsTable = qualifiedTable(schema, "objects");
-      const objects = (await sql.unsafe(
-        `SELECT object_id FROM ${objectsTable} WHERE source_ingestion_id = $1`,
-        [ingestionId],
-      )) as Array<{ object_id: string }>;
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      const objects = await sql<{ object_id: string }[]>`
+        SELECT object_id
+        FROM objects
+        WHERE source_ingestion_id = ${ingestionId}
+      `;
 
       expect(objects.length).toBe(1);
     } finally {

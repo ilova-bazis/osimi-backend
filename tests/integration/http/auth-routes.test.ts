@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { sql as sqlIdentifier } from "bun";
 
 import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
@@ -8,14 +9,6 @@ const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_
 
 function getJson(response: Response): Promise<any> {
   return response.json() as Promise<any>;
-}
-
-function quoteIdentifier(identifier: string): string {
-  return `"${identifier}"`;
-}
-
-function qualifiedTable(schema: string, table: string): string {
-  return `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
 }
 
 describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
@@ -41,78 +34,33 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
     const sql = createSqlClient(TEST_DATABASE_URL);
 
     try {
-      const tenantsTable = qualifiedTable(schema, "tenants");
-      const usersTable = qualifiedTable(schema, "users");
-      const membershipsTable = qualifiedTable(schema, "tenant_memberships");
-
       const adminHash = await Bun.password.hash("admin123");
       const operatorHash = await Bun.password.hash("operator123");
       const viewerHash = await Bun.password.hash("viewer123");
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${tenantsTable} (id, slug, name)
-          VALUES
-            ($1, $2, $3),
-            ($4, $5, $6)
-        `,
-        [
-          "00000000-0000-0000-0000-000000000001",
-          "tenant-one",
-          "Tenant One",
-          "00000000-0000-0000-0000-000000000002",
-          "tenant-two",
-          "Tenant Two",
-        ],
-      );
+      await sql`
+        INSERT INTO tenants (id, slug, name)
+        VALUES
+          (${"00000000-0000-0000-0000-000000000001"}, ${"tenant-one"}, ${"Tenant One"}),
+          (${"00000000-0000-0000-0000-000000000002"}, ${"tenant-two"}, ${"Tenant Two"})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${usersTable} (id, username, username_normalized, password_hash)
-          VALUES
-            ($1, $2, $3, $4),
-            ($5, $6, $7, $8),
-            ($9, $10, $11, $12)
-        `,
-        [
-          "10000000-0000-0000-0000-000000000001",
-          "admin@osimi.local",
-          "admin@osimi.local",
-          adminHash,
-          "10000000-0000-0000-0000-000000000002",
-          "archiver@osimi.local",
-          "archiver@osimi.local",
-          operatorHash,
-          "10000000-0000-0000-0000-000000000003",
-          "viewer@osimi.local",
-          "viewer@osimi.local",
-          viewerHash,
-        ],
-      );
+      await sql`
+        INSERT INTO users (id, username, username_normalized, password_hash)
+        VALUES
+          (${"10000000-0000-0000-0000-000000000001"}, ${"admin@osimi.local"}, ${"admin@osimi.local"}, ${adminHash}),
+          (${"10000000-0000-0000-0000-000000000002"}, ${"archiver@osimi.local"}, ${"archiver@osimi.local"}, ${operatorHash}),
+          (${"10000000-0000-0000-0000-000000000003"}, ${"viewer@osimi.local"}, ${"viewer@osimi.local"}, ${viewerHash})
+      `;
 
-      await sql.unsafe(
-        `
-          INSERT INTO ${membershipsTable} (id, tenant_id, user_id, role)
-          VALUES
-            ($1, $2, $3, $4),
-            ($5, $6, $7, $8),
-            ($9, $10, $11, $12)
-        `,
-        [
-          "20000000-0000-0000-0000-000000000001",
-          "00000000-0000-0000-0000-000000000001",
-          "10000000-0000-0000-0000-000000000001",
-          "admin",
-          "20000000-0000-0000-0000-000000000002",
-          "00000000-0000-0000-0000-000000000001",
-          "10000000-0000-0000-0000-000000000002",
-          "archiver",
-          "20000000-0000-0000-0000-000000000003",
-          "00000000-0000-0000-0000-000000000002",
-          "10000000-0000-0000-0000-000000000003",
-          "viewer",
-        ],
-      );
+      await sql`
+        INSERT INTO tenant_memberships (id, tenant_id, user_id, role)
+        VALUES
+          (${"20000000-0000-0000-0000-000000000001"}, ${"00000000-0000-0000-0000-000000000001"}, ${"10000000-0000-0000-0000-000000000001"}, ${"admin"}),
+          (${"20000000-0000-0000-0000-000000000002"}, ${"00000000-0000-0000-0000-000000000001"}, ${"10000000-0000-0000-0000-000000000002"}, ${"archiver"}),
+          (${"20000000-0000-0000-0000-000000000003"}, ${"00000000-0000-0000-0000-000000000002"}, ${"10000000-0000-0000-0000-000000000003"}, ${"viewer"})
+      `;
     } finally {
       await sql.close();
     }
@@ -123,7 +71,7 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
       const sql = createSqlClient(TEST_DATABASE_URL);
 
       try {
-        await sql.unsafe(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`);
+        await sql`DROP SCHEMA IF EXISTS ${sqlIdentifier(schema)} CASCADE`;
       } finally {
         await sql.close();
       }
@@ -312,16 +260,13 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
     const sql = createSqlClient(TEST_DATABASE_URL!);
 
     try {
-      const auditTable = qualifiedTable(schema, "auth_audit_events");
-      const rows = (await sql.unsafe(
-        `
-          SELECT request_id, event_type, success
-          FROM ${auditTable}
-          WHERE request_id IN ($1, $2)
-          ORDER BY created_at ASC
-        `,
-        ["audit_login_req_123", "audit_logout_req_456"],
-      )) as Array<{ request_id: string; event_type: string; success: boolean }>;
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      const rows = await sql<{ request_id: string; event_type: string; success: boolean }[]>`
+        SELECT request_id, event_type, success
+        FROM auth_audit_events
+        WHERE request_id IN (${"audit_login_req_123"}, ${"audit_logout_req_456"})
+        ORDER BY created_at ASC
+      `;
 
       expect(rows.length).toBe(2);
       expect(rows[0]).toEqual({
