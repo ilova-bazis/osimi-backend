@@ -16,6 +16,11 @@ type ObjectEventType =
     | "PIPELINE_STEP_STARTED"
     | "PIPELINE_STEP_COMPLETED"
     | "PIPELINE_STEP_FAILED"
+    | "INGESTION_ITEM_CREATED"
+    | "INGESTION_ITEM_UPDATED"
+    | "INGESTION_ITEM_PROCESSING"
+    | "INGESTION_ITEM_COMPLETED"
+    | "INGESTION_ITEM_FAILED"
     | "OBJECT_CREATED"
     | "ARTIFACT_CREATED";
 
@@ -28,6 +33,7 @@ export async function insertObjectEvent(params: {
     tenantId: string;
     type: ObjectEventType;
     ingestionId?: string;
+    ingestionItemId?: string;
     objectId?: string;
     payload: Record<string, unknown>;
     actorUserId?: string;
@@ -41,6 +47,7 @@ export async function insertObjectEvent(params: {
         tenant_id,
         type,
         ingestion_id,
+        ingestion_item_id,
         object_id,
         payload,
         actor_user_id,
@@ -52,6 +59,7 @@ export async function insertObjectEvent(params: {
         ${params.tenantId},
         ${params.type},
         ${params.ingestionId ?? null},
+        ${params.ingestionItemId ?? null},
         ${params.objectId ?? null},
         ${params.payload ?? {}},
         ${params.actorUserId ?? null},

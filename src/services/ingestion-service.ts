@@ -406,7 +406,11 @@ function canMutateIngestionFiles(status: IngestionStatus): boolean {
 async function ensureIngestionNotProcessing(
   ingestion: IngestionRecord,
 ): Promise<void> {
-  if (ingestion.status === "PROCESSING" || ingestion.status === "COMPLETED") {
+  if (
+    ingestion.status === "PROCESSING" ||
+    ingestion.status === "COMPLETED" ||
+    ingestion.status === "COMPLETED_WITH_ERRORS"
+  ) {
     throw new ConflictError(
       "Ingestion cannot be modified after processing starts.",
       {
@@ -812,7 +816,11 @@ export async function deleteIngestionRecord(params: {
 
   await ensureIngestionNotProcessing(ingestion);
 
-  if (ingestion.status === "QUEUED" || ingestion.status === "COMPLETED") {
+  if (
+    ingestion.status === "QUEUED" ||
+    ingestion.status === "COMPLETED" ||
+    ingestion.status === "COMPLETED_WITH_ERRORS"
+  ) {
     throw new ConflictError(
       "Ingestion cannot be deleted in its current state.",
       {

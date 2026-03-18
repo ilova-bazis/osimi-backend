@@ -27,6 +27,18 @@ interface DownloadTokenPayload {
   expires_at: string;
 }
 
+interface ObjectArtifactUploadTokenPayload {
+  request_id: string;
+  object_id: string;
+  tenant_id: string;
+  artifact_kind: string;
+  variant: string | null;
+  storage_key: string;
+  content_type: string;
+  size_bytes: number;
+  expires_at: string;
+}
+
 function getSigningSecret(): string {
   const runtimeSigningSecret = getRuntimeConfig().uploadSigningSecret;
   return runtimeSigningSecret?.trim() || process.env.UPLOAD_SIGNING_SECRET?.trim() || DEFAULT_SIGNING_SECRET;
@@ -60,6 +72,19 @@ export function buildStagingStorageKey(params: {
   filename: string;
 }): string {
   return `tenants/${params.tenantId}/ingestions/${params.ingestionId}/original/${params.fileId}-${safeStorageKeySegment(params.filename)}`;
+}
+
+export function buildObjectArtifactStorageKey(params: {
+  tenantId: string;
+  objectId: string;
+  requestId: string;
+  artifactKind: string;
+  variant: string | null;
+  extension: string;
+}): string {
+  const safeVariant = params.variant ? `-${safeStorageKeySegment(params.variant)}` : "";
+  const safeExtension = safeStorageKeySegment(params.extension).replace(/^\./, "");
+  return `tenants/${params.tenantId}/objects/${params.objectId}/artifacts/${params.requestId}-${safeStorageKeySegment(params.artifactKind)}${safeVariant}.${safeExtension || "bin"}`;
 }
 
 export function createUploadToken(payload: UploadTokenPayload): string {
@@ -179,6 +204,79 @@ export function parseDownloadToken(token: string): DownloadTokenPayload {
     ingestion_id: candidate.ingestion_id,
     file_id: candidate.file_id,
     tenant_id: candidate.tenant_id,
+    storage_key: candidate.storage_key,
+    content_type: candidate.content_type,
+    size_bytes: candidate.size_bytes,
+    expires_at: candidate.expires_at,
+  };
+}
+
+export function createObjectArtifactUploadToken(
+  payload: ObjectArtifactUploadTokenPayload,
+): string {
+  const encodedPayload = toBase64Url(JSON.stringify(payload));
+  const signature = sign(encodedPayload);
+  return `${encodedPayload}.${signature}`;
+}
+
+export function parseObjectArtifactUploadToken(
+  token: string,
+): ObjectArtifactUploadTokenPayload {
+  const [encodedPayload, providedSignature, ...rest] = token.split(".");
+
+  if (!encodedPayload || !providedSignature || rest.length > 0) {
+    throw new UnauthorizedError("Upload token is invalid.");
+  }
+
+  const expectedSignature = sign(encodedPayload);
+
+  if (providedSignature !== expectedSignature) {
+    throw new UnauthorizedError("Upload token signature is invalid.");
+  }
+
+  let payload: unknown;
+
+  try {
+    payload = JSON.parse(fromBase64Url(encodedPayload));
+  } catch {
+    throw new UnauthorizedError("Upload token payload is invalid.");
+  }
+
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new UnauthorizedError("Upload token payload is invalid.");
+  }
+
+  const candidate = payload as Partial<ObjectArtifactUploadTokenPayload>;
+
+  if (
+    typeof candidate.request_id !== "string" ||
+    typeof candidate.object_id !== "string" ||
+    typeof candidate.tenant_id !== "string" ||
+    typeof candidate.artifact_kind !== "string" ||
+    typeof candidate.storage_key !== "string" ||
+    typeof candidate.content_type !== "string" ||
+    typeof candidate.size_bytes !== "number" ||
+    typeof candidate.expires_at !== "string"
+  ) {
+    throw new UnauthorizedError("Upload token payload is invalid.");
+  }
+
+  if (candidate.variant !== null && candidate.variant !== undefined && typeof candidate.variant !== "string") {
+    throw new UnauthorizedError("Upload token payload is invalid.");
+  }
+
+  const expiresAt = new Date(candidate.expires_at);
+
+  if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) {
+    throw new UnauthorizedError("Upload token has expired.");
+  }
+
+  return {
+    request_id: candidate.request_id,
+    object_id: candidate.object_id,
+    tenant_id: candidate.tenant_id,
+    artifact_kind: candidate.artifact_kind,
+    variant: candidate.variant ?? null,
     storage_key: candidate.storage_key,
     content_type: candidate.content_type,
     size_bytes: candidate.size_bytes,

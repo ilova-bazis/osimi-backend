@@ -19,7 +19,9 @@ export function resolveDatabaseUrl(override?: string): string {
 }
 
 export function createSqlClient(databaseUrl?: string): SQL {
-  return new SQL(resolveDatabaseUrl(databaseUrl));
+  return new SQL(resolveDatabaseUrl(databaseUrl), {
+    bigint: true,
+  });
 }
 
 export async function withSchemaClient<T>(

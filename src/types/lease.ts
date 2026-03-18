@@ -1,13 +1,22 @@
 import type { AuthorizedWorkerLease } from "../auth/worker-lease.ts";
 
-export interface WorkerDownloadUrl {
+export interface WorkerLeasedItemFile {
   file_id: string;
+  filename: string;
+  sort_order: number;
   storage_key: string;
   content_type: string;
   size_bytes: number;
   checksum_sha256: string | null;
   processing_overrides: Record<string, unknown>;
   download_url: string;
+}
+
+export interface WorkerLeasedItem {
+  ingestion_item_id: string;
+  item_index: number;
+  catalog_json: Record<string, unknown>;
+  files: WorkerLeasedItemFile[];
 }
 
 export interface LeaseDto {
@@ -17,8 +26,7 @@ export interface LeaseDto {
   ingestion_id: string;
   batch_label: string;
   tenant_id: string;
-  download_urls: WorkerDownloadUrl[];
-  catalog_json: Record<string, unknown>;
+  items: WorkerLeasedItem[];
 }
 
 export interface HeartbeatLeaseInput {

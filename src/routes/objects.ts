@@ -2,32 +2,65 @@ import { requireRole } from "../auth/guards.ts";
 import { ValidationError } from "../http/errors.ts";
 import { jsonResponse } from "../http/response.ts";
 import { parseJsonBody } from "../validation/common.ts";
+import { withWorkerAuth } from "./middleware.ts";
 import {
     parseAccessRequestIdParam,
+    parseArchiveRequestIdParam,
+    parseArchiveRequestListQuery,
     parseArtifactIdParam,
     parseCreateAccessRequestBody,
     parseCreateObjectDownloadRequestBody,
+    parseCreateObjectResyncBody,
+    parseObjectDownloadRequestIdParam,
     parseObjectIdParam,
     parseObjectListQuery,
     parsePatchObjectTitleBody,
     parseResolveAccessRequestBody,
+    parseReplaceObjectAvailableFilesBody,
+    parseWorkerCompleteArchiveRequestBody,
+    parseWorkerFailArchiveRequestBody,
+    parseWorkerLeaseArchiveRequestBody,
+    parseWorkerCompleteObjectDownloadRequestBody,
+    parseWorkerFailObjectDownloadRequestBody,
+    parseWorkerPresignObjectArtifactUploadBody,
     parseUpdateAccessPolicyBody,
     parseUpsertAccessAssignmentBody,
     parseUserIdParam,
 } from "../validation/object.ts";
+import { parseLeaseTokenBody } from "../validation/lease.ts";
+import { parseUploadTokenParam } from "../validation/ingestion.ts";
 import {
+    completeArchiveRequestByWorker,
+    failArchiveRequestByWorker,
+    heartbeatArchiveRequestLease,
+    leaseNextArchiveRequest,
+    releaseArchiveRequestLeaseByToken,
+} from "../services/archive-request-service.ts";
+import {
+    completeObjectDownloadRequestByWorker,
     createObjectDownloadRequestForTenant,
     createObjectAccessRequestForTenant,
     deleteObjectAccessAssignmentForTenant,
     downloadObjectArtifactForTenant,
+    failObjectDownloadRequestByWorker,
     getObjectDetail,
+    heartbeatObjectDownloadRequestLease,
+    leaseNextObjectDownloadRequest,
     listObjectAccessAssignmentsForTenant,
     listObjectAccessRequestsForTenant,
+    listArchiveRequestsForTenant,
+    listObjectAvailableFilesForTenant,
     listObjectArtifactsForTenant,
     listObjectDownloadRequestsForTenant,
+    listObjectResyncRequestsForTenant,
     listObjectsForTenant,
     patchObjectTitleForTenant,
+    presignObjectArtifactUpload,
+    releaseObjectDownloadRequestLeaseByToken,
+    requestObjectResyncForTenant,
     resolveObjectAccessRequestForTenant,
+    replaceObjectAvailableFilesSnapshot,
+    uploadObjectArtifactBySignedToken,
     updateObjectAccessPolicyForTenant,
     upsertObjectAccessAssignmentForTenant,
 } from "../services/object-service.ts";
@@ -60,6 +93,27 @@ const listObjectsRoute: RouteDefinition = {
         const query = parseObjectListQuery(url);
         return jsonResponse(
             await listObjectsForTenant({
+                auth: authenticated,
+                query,
+            }),
+        );
+    },
+};
+
+const listArchiveRequestsRoute: RouteDefinition = {
+    method: "GET",
+    path: "/api/archive-requests",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, [
+            "viewer",
+            "archiver",
+            "admin",
+        ]);
+        const url = new URL(request.url);
+        const query = parseArchiveRequestListQuery(url);
+
+        return jsonResponse(
+            await listArchiveRequestsForTenant({
                 auth: authenticated,
                 query,
             }),
@@ -143,6 +197,58 @@ const listArtifactsRoute: RouteDefinition = {
     },
 };
 
+const listObjectAvailableFilesRoute: RouteDefinition = {
+    method: "GET",
+    path: "/api/objects/:object_id/available-files",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, [
+            "viewer",
+            "archiver",
+            "admin",
+        ]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/available-files$/,
+                "object_id",
+            ),
+        );
+
+        return jsonResponse(
+            await listObjectAvailableFilesForTenant({
+                auth: authenticated,
+                objectId,
+            }),
+        );
+    },
+};
+
+const replaceObjectAvailableFilesRoute: RouteDefinition = {
+    method: "PUT",
+    path: "/api/internal/objects/:object_id/available-files",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/internal\/objects\/([^/]+)\/available-files$/,
+                "object_id",
+            ),
+        );
+        const body = parseReplaceObjectAvailableFilesBody(
+            await parseJsonBody(request),
+        );
+
+        return jsonResponse(
+            await replaceObjectAvailableFilesSnapshot({
+                objectId,
+                body,
+            }),
+        );
+    }),
+};
+
 const createObjectDownloadRequestRoute: RouteDefinition = {
     method: "POST",
     path: "/api/objects/:object_id/download-requests",
@@ -193,11 +299,338 @@ const listObjectDownloadRequestsRoute: RouteDefinition = {
                 "object_id",
             ),
         );
+        try {
+            return jsonResponse(
+                await listObjectDownloadRequestsForTenant({
+                    auth: authenticated,
+                    objectId,
+                }),
+            );
+        } catch (err) {
+            throw err;
+        }
+        // return jsonResponse(
+        //     await listObjectDownloadRequestsForTenant({
+        //         auth: authenticated,
+        //         objectId,
+        //     }),
+        // );
+    },
+};
+
+const requestObjectResyncRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/objects/:object_id/resync",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, ["archiver", "admin"]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(pathname, /^\/api\/objects\/([^/]+)\/resync$/, "object_id"),
+        );
+        const body = parseCreateObjectResyncBody(
+            await parseOptionalJsonBody(request),
+        );
+
+        const result = await requestObjectResyncForTenant({
+            auth: authenticated,
+            objectId,
+            actionPayload: body.action_payload,
+        });
+
+        return jsonResponse(result.response, {
+            status: result.outcome === "created" ? 201 : 200,
+        });
+    },
+};
+
+const listObjectResyncRequestsRoute: RouteDefinition = {
+    method: "GET",
+    path: "/api/objects/:object_id/resync-requests",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, [
+            "viewer",
+            "archiver",
+            "admin",
+        ]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/resync-requests$/,
+                "object_id",
+            ),
+        );
 
         return jsonResponse(
-            await listObjectDownloadRequestsForTenant({
+            await listObjectResyncRequestsForTenant({
                 auth: authenticated,
                 objectId,
+            }),
+        );
+    },
+};
+
+const leaseArchiveRequestRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/archive-requests/lease",
+    handler: withWorkerAuth(async (request, _context, worker) => {
+        const body = parseWorkerLeaseArchiveRequestBody(
+            await parseOptionalJsonBody(request),
+        );
+
+        return jsonResponse(
+            await leaseNextArchiveRequest({
+                workerId: worker.workerId,
+                actionType: body.action_type,
+            }),
+        );
+    }),
+};
+
+const heartbeatArchiveRequestRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/archive-requests/:id/lease/heartbeat",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseArchiveRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/archive-requests\/([^/]+)\/lease\/heartbeat$/,
+                "id",
+            ),
+        );
+        const body = parseLeaseTokenBody(await parseJsonBody(request));
+
+        return jsonResponse(
+            await heartbeatArchiveRequestLease({
+                requestId,
+                leaseToken: body.lease_token,
+            }),
+        );
+    }),
+};
+
+const releaseArchiveRequestRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/archive-requests/:id/lease/release",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseArchiveRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/archive-requests\/([^/]+)\/lease\/release$/,
+                "id",
+            ),
+        );
+        const body = parseLeaseTokenBody(await parseJsonBody(request));
+
+        return jsonResponse(
+            await releaseArchiveRequestLeaseByToken({
+                requestId,
+                leaseToken: body.lease_token,
+            }),
+        );
+    }),
+};
+
+const completeArchiveRequestRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/archive-requests/:id/complete",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseArchiveRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/archive-requests\/([^/]+)\/complete$/,
+                "id",
+            ),
+        );
+        const body = parseWorkerCompleteArchiveRequestBody(
+            await parseJsonBody(request),
+        );
+
+        return jsonResponse(
+            await completeArchiveRequestByWorker({
+                requestId,
+                leaseToken: body.lease_token,
+            }),
+        );
+    }),
+};
+
+const failArchiveRequestRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/archive-requests/:id/fail",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseArchiveRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/archive-requests\/([^/]+)\/fail$/,
+                "id",
+            ),
+        );
+        const body = parseWorkerFailArchiveRequestBody(await parseJsonBody(request));
+
+        return jsonResponse(
+            await failArchiveRequestByWorker({
+                requestId,
+                body,
+            }),
+        );
+    }),
+};
+
+const leaseObjectDownloadRequestRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/object-download-requests/lease",
+    handler: withWorkerAuth(async (_request, _context, worker) => {
+        return jsonResponse(
+            await leaseNextObjectDownloadRequest({
+                workerId: worker.workerId,
+            }),
+        );
+    }),
+};
+
+const heartbeatObjectDownloadRequestRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/object-download-requests/:id/lease/heartbeat",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseObjectDownloadRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/object-download-requests\/([^/]+)\/lease\/heartbeat$/,
+                "id",
+            ),
+        );
+        const body = parseLeaseTokenBody(await parseJsonBody(request));
+
+        return jsonResponse(
+            await heartbeatObjectDownloadRequestLease({
+                requestId,
+                leaseToken: body.lease_token,
+            }),
+        );
+    }),
+};
+
+const releaseObjectDownloadRequestRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/object-download-requests/:id/lease/release",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseObjectDownloadRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/object-download-requests\/([^/]+)\/lease\/release$/,
+                "id",
+            ),
+        );
+        const body = parseLeaseTokenBody(await parseJsonBody(request));
+
+        return jsonResponse(
+            await releaseObjectDownloadRequestLeaseByToken({
+                requestId,
+                leaseToken: body.lease_token,
+            }),
+        );
+    }),
+};
+
+const presignObjectDownloadRequestArtifactRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/object-download-requests/:id/artifacts/presign",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseObjectDownloadRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/object-download-requests\/([^/]+)\/artifacts\/presign$/,
+                "id",
+            ),
+        );
+        const body = parseWorkerPresignObjectArtifactUploadBody(
+            await parseJsonBody(request),
+        );
+
+        return jsonResponse(
+            await presignObjectArtifactUpload({
+                requestId,
+                body,
+            }),
+        );
+    }),
+};
+
+const completeObjectDownloadRequestRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/object-download-requests/:id/complete",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseObjectDownloadRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/object-download-requests\/([^/]+)\/complete$/,
+                "id",
+            ),
+        );
+        const body = parseWorkerCompleteObjectDownloadRequestBody(
+            await parseJsonBody(request),
+        );
+
+        return jsonResponse(
+            await completeObjectDownloadRequestByWorker({
+                requestId,
+                body,
+            }),
+        );
+    }),
+};
+
+const failObjectDownloadRequestRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/object-download-requests/:id/fail",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseObjectDownloadRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/object-download-requests\/([^/]+)\/fail$/,
+                "id",
+            ),
+        );
+        const body = parseWorkerFailObjectDownloadRequestBody(
+            await parseJsonBody(request),
+        );
+
+        return jsonResponse(
+            await failObjectDownloadRequestByWorker({
+                requestId,
+                body,
+            }),
+        );
+    }),
+};
+
+const workerUploadObjectArtifactRoute: RouteDefinition = {
+    method: "PUT",
+    path: "/api/object-download-requests/uploads/:token",
+    handler: async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const uploadToken = parseUploadTokenParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/object-download-requests\/uploads\/([^/]+)$/,
+                "token",
+            ),
+        );
+
+        return jsonResponse(
+            await uploadObjectArtifactBySignedToken({
+                uploadToken,
+                request,
             }),
         );
     },
@@ -467,11 +900,28 @@ const deleteObjectAccessAssignmentRoute: RouteDefinition = {
 
 export const objectRoutes: RouteDefinition[] = [
     listObjectsRoute,
+    listArchiveRequestsRoute,
     getObjectRoute,
     patchObjectRoute,
     listArtifactsRoute,
+    listObjectAvailableFilesRoute,
+    requestObjectResyncRoute,
+    listObjectResyncRequestsRoute,
     createObjectDownloadRequestRoute,
     listObjectDownloadRequestsRoute,
+    leaseArchiveRequestRoute,
+    heartbeatArchiveRequestRoute,
+    releaseArchiveRequestRoute,
+    completeArchiveRequestRoute,
+    failArchiveRequestRoute,
+    leaseObjectDownloadRequestRoute,
+    heartbeatObjectDownloadRequestRoute,
+    releaseObjectDownloadRequestRoute,
+    presignObjectDownloadRequestArtifactRoute,
+    completeObjectDownloadRequestRoute,
+    failObjectDownloadRequestRoute,
+    workerUploadObjectArtifactRoute,
+    replaceObjectAvailableFilesRoute,
     downloadArtifactRoute,
     patchObjectAccessPolicyRoute,
     createObjectAccessRequestRoute,

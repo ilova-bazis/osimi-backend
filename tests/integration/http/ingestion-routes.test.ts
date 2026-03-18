@@ -2209,4 +2209,294 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
 
     expect(blockedCommit.status).toBe(409);
   });
+
+  test("reorders ingestion items and file order within items", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-items-order-001" })),
+      }),
+    );
+
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+    const ingestionId = createBody.ingestion.id;
+
+    const createItemOneResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          item_index: 1,
+          title: "Item One",
+          summary: { custom: "item-one" },
+        }),
+      }),
+    );
+    expect(createItemOneResponse.status).toBe(201);
+    const createItemOneBody = (await createItemOneResponse.json()) as {
+      item: { id: string };
+    };
+
+    const createItemTwoResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          item_index: 2,
+          title: "Item Two",
+          summary: { custom: "item-two" },
+        }),
+      }),
+    );
+    expect(createItemTwoResponse.status).toBe(201);
+    const createItemTwoBody = (await createItemTwoResponse.json()) as {
+      item: { id: string };
+    };
+
+    const fileOnePresign = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/presign`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          filename: "page-1.tif",
+          content_type: "image/jpeg",
+          size_bytes: 5,
+        }),
+      }),
+    );
+    expect(fileOnePresign.status).toBe(201);
+    const fileOneBody = (await fileOnePresign.json()) as { file_id: string };
+
+    const fileTwoPresign = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/presign`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          filename: "page-2.tif",
+          content_type: "image/jpeg",
+          size_bytes: 6,
+        }),
+      }),
+    );
+    expect(fileTwoPresign.status).toBe(201);
+    const fileTwoBody = (await fileTwoPresign.json()) as { file_id: string };
+
+    const linkFileOneResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items/${createItemOneBody.item.id}/files`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          ingestion_file_id: fileOneBody.file_id,
+          sort_order: 1,
+        }),
+      }),
+    );
+    expect(linkFileOneResponse.status).toBe(201);
+
+    const linkFileTwoResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items/${createItemOneBody.item.id}/files`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          ingestion_file_id: fileTwoBody.file_id,
+          sort_order: 2,
+        }),
+      }),
+    );
+    expect(linkFileTwoResponse.status).toBe(201);
+
+    const reorderFilesResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items/${createItemOneBody.item.id}/files/order`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          files: [
+            { ingestion_file_id: fileTwoBody.file_id, sort_order: 1 },
+            { ingestion_file_id: fileOneBody.file_id, sort_order: 2 },
+          ],
+        }),
+      }),
+    );
+    expect(reorderFilesResponse.status).toBe(200);
+
+    const reorderItemsResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items/order`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          items: [
+            { ingestion_item_id: createItemOneBody.item.id, item_index: 2 },
+            { ingestion_item_id: createItemTwoBody.item.id, item_index: 1 },
+          ],
+        }),
+      }),
+    );
+    expect(reorderItemsResponse.status).toBe(200);
+
+    const listItemsResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+    expect(listItemsResponse.status).toBe(200);
+    const listItemsBody = (await listItemsResponse.json()) as {
+      items: Array<{ id: string; item_index: number }>;
+    };
+
+    expect(listItemsBody.items.map((item) => item.id)).toEqual([
+      createItemTwoBody.item.id,
+      createItemOneBody.item.id,
+    ]);
+    expect(listItemsBody.items.map((item) => item.item_index)).toEqual([1, 2]);
+
+    const listItemFilesResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items/${createItemOneBody.item.id}/files`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+    expect(listItemFilesResponse.status).toBe(200);
+    const listItemFilesBody = (await listItemFilesResponse.json()) as {
+      files: Array<{ ingestion_file_id: string; sort_order: number }>;
+    };
+
+    expect(listItemFilesBody.files.map((file) => file.ingestion_file_id)).toEqual([
+      fileTwoBody.file_id,
+      fileOneBody.file_id,
+    ]);
+    expect(listItemFilesBody.files.map((file) => file.sort_order)).toEqual([1, 2]);
+  });
+
+  test("merges ingestion item metadata for dates, tags, and description", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-item-metadata-001" })),
+      }),
+    );
+
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+    const ingestionId = createBody.ingestion.id;
+
+    const createItemResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          item_index: 1,
+          title: "Original Item Title",
+          summary: {
+            classification: {
+              tags: ["existing"],
+              summary: "seed description",
+            },
+            dates: {
+              created: {
+                value: "1950",
+                approximate: true,
+                confidence: "low",
+                note: "initial",
+              },
+            },
+            custom_field: {
+              keep: true,
+            },
+          },
+        }),
+      }),
+    );
+    expect(createItemResponse.status).toBe(201);
+    const createItemBody = (await createItemResponse.json()) as { item: { id: string } };
+
+    const patchResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items/${createItemBody.item.id}`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          title: "Updated Item Title",
+          description: "Updated description",
+          tags: ["tag-a", "tag-b", "tag-a"],
+          dates: {
+            published: {
+              value: "1960-05",
+              approximate: false,
+              confidence: "high",
+              note: null,
+            },
+          },
+        }),
+      }),
+    );
+    expect(patchResponse.status).toBe(200);
+
+    const patchBody = (await patchResponse.json()) as {
+      item: {
+        title: string;
+        summary: {
+          classification: { tags: string[]; summary: string | null };
+          dates: {
+            created: { value: string; approximate: boolean; confidence: string; note: string | null };
+            published: { value: string | null; approximate: boolean; confidence: string; note: string | null };
+          };
+          custom_field: { keep: boolean };
+        };
+      };
+    };
+
+    expect(patchBody.item.title).toBe("Updated Item Title");
+    expect(patchBody.item.summary.classification.summary).toBe("Updated description");
+    expect(patchBody.item.summary.classification.tags).toEqual(["tag-a", "tag-b"]);
+    expect(patchBody.item.summary.dates.created.value).toBe("1950");
+    expect(patchBody.item.summary.dates.published.value).toBe("1960-05");
+    expect(patchBody.item.summary.custom_field.keep).toBe(true);
+  });
 });

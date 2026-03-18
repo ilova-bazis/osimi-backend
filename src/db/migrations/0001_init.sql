@@ -6,6 +6,7 @@ BEGIN
     'QUEUED',
     'PROCESSING',
     'COMPLETED',
+    'COMPLETED_WITH_ERRORS',
     'FAILED',
     'CANCELED'
   );
@@ -69,6 +70,37 @@ BEGIN
     'UPLOADED',
     'VALIDATED',
     'FAILED'
+  );
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$
+BEGIN
+  CREATE TYPE ingestion_item_status AS ENUM (
+    'PENDING',
+    'READY',
+    'PROCESSING',
+    'COMPLETED',
+    'FAILED',
+    'SKIPPED'
+  );
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$
+BEGIN
+  CREATE TYPE ingestion_item_file_role AS ENUM (
+    'primary',
+    'front',
+    'back',
+    'page',
+    'attachment',
+    'transcript_source',
+    'side_a',
+    'side_b',
+    'other'
   );
 EXCEPTION
   WHEN duplicate_object THEN NULL;
@@ -179,6 +211,8 @@ DO $$
 BEGIN
   CREATE TYPE artifact_kind AS ENUM (
     'ingest_json',
+    'pipeline_json',
+    'catalog_json',
     'original',
     'preview',
     'ocr',
@@ -187,21 +221,6 @@ BEGIN
     'pdf',
     'ocr_text',
     'thumbnail',
-    'web_version',
-    'other'
-  );
-EXCEPTION
-  WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$
-BEGIN
-  CREATE TYPE requested_artifact_kind AS ENUM (
-    'original',
-    'pdf',
-    'ocr_text',
-    'thumbnail',
-    'transcript',
     'web_version',
     'other'
   );
@@ -240,6 +259,11 @@ BEGIN
     'PIPELINE_STEP_STARTED',
     'PIPELINE_STEP_COMPLETED',
     'PIPELINE_STEP_FAILED',
+    'INGESTION_ITEM_CREATED',
+    'INGESTION_ITEM_UPDATED',
+    'INGESTION_ITEM_PROCESSING',
+    'INGESTION_ITEM_COMPLETED',
+    'INGESTION_ITEM_FAILED',
     'OBJECT_CREATED',
     'ARTIFACT_CREATED'
   );
@@ -307,11 +331,77 @@ CREATE TABLE IF NOT EXISTS ingestion_files (
     OR (status IN ('UPLOADED', 'VALIDATED') AND checksum_sha256 IS NOT NULL)
     OR (status = 'FAILED')
   ),
+  UNIQUE (id, ingestion_id),
   UNIQUE (ingestion_id, storage_key)
 );
 
 CREATE INDEX IF NOT EXISTS ingestion_files_ingestion_idx
   ON ingestion_files (ingestion_id);
+
+CREATE TABLE IF NOT EXISTS ingestion_items (
+  id uuid PRIMARY KEY,
+  ingestion_id uuid NOT NULL REFERENCES ingestions(id) ON DELETE CASCADE,
+  item_index integer NOT NULL,
+  status ingestion_item_status NOT NULL DEFAULT 'PENDING',
+  classification_type ingestion_classification_type,
+  item_kind ingest_item_kind,
+  language_code text,
+  title text,
+  summary jsonb NOT NULL DEFAULT '{}'::jsonb,
+  error_summary jsonb NOT NULL DEFAULT '{}'::jsonb,
+  object_id text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (item_index > 0),
+  CHECK (language_code IS NULL OR length(trim(language_code)) > 0),
+  CHECK (jsonb_typeof(summary) = 'object'),
+  CHECK (jsonb_typeof(error_summary) = 'object'),
+  UNIQUE (ingestion_id, item_index),
+  UNIQUE (id, ingestion_id)
+);
+
+CREATE INDEX IF NOT EXISTS ingestion_items_ingestion_idx
+  ON ingestion_items (ingestion_id, item_index);
+
+CREATE INDEX IF NOT EXISTS ingestion_items_status_idx
+  ON ingestion_items (status, updated_at ASC, id ASC);
+
+CREATE INDEX IF NOT EXISTS ingestion_items_object_idx
+  ON ingestion_items (object_id)
+  WHERE object_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ingestion_item_files (
+  id uuid PRIMARY KEY,
+  ingestion_item_id uuid NOT NULL,
+  ingestion_file_id uuid NOT NULL,
+  ingestion_id uuid NOT NULL REFERENCES ingestions(id) ON DELETE CASCADE,
+  role ingestion_item_file_role NOT NULL DEFAULT 'primary',
+  sort_order integer NOT NULL,
+  page_number integer,
+  is_primary boolean NOT NULL DEFAULT false,
+  logical_label text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (sort_order > 0),
+  CHECK (page_number IS NULL OR page_number > 0),
+  UNIQUE (ingestion_item_id, ingestion_file_id),
+  UNIQUE (ingestion_item_id, sort_order),
+  FOREIGN KEY (ingestion_item_id, ingestion_id)
+    REFERENCES ingestion_items(id, ingestion_id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (ingestion_file_id, ingestion_id)
+    REFERENCES ingestion_files(id, ingestion_id)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ingestion_item_files_item_idx
+  ON ingestion_item_files (ingestion_item_id, sort_order, id);
+
+CREATE INDEX IF NOT EXISTS ingestion_item_files_file_idx
+  ON ingestion_item_files (ingestion_file_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ingestion_item_files_one_primary_per_item_idx
+  ON ingestion_item_files (ingestion_item_id)
+  WHERE is_primary = true;
 
 CREATE TABLE IF NOT EXISTS ingestion_leases (
   id uuid PRIMARY KEY,
@@ -360,6 +450,7 @@ CREATE TABLE IF NOT EXISTS objects (
   metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
   ingest_manifest jsonb,
   source_ingestion_id uuid REFERENCES ingestions(id) ON DELETE SET NULL,
+  source_ingestion_item_id uuid REFERENCES ingestion_items(id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (object_id ~ '^OBJ-[0-9]{8}-[A-Z0-9]+$'),
@@ -378,9 +469,24 @@ CREATE INDEX IF NOT EXISTS objects_tenant_created_idx
 CREATE INDEX IF NOT EXISTS objects_tenant_language_created_idx
   ON objects (tenant_id, language_code, created_at DESC, object_id DESC);
 
-CREATE UNIQUE INDEX IF NOT EXISTS objects_source_ingestion_unique_idx
+DROP INDEX IF EXISTS objects_source_ingestion_unique_idx;
+
+CREATE UNIQUE INDEX IF NOT EXISTS objects_source_ingestion_item_unique_idx
+  ON objects (source_ingestion_item_id)
+  WHERE source_ingestion_item_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS objects_source_ingestion_idx
   ON objects (source_ingestion_id)
   WHERE source_ingestion_id IS NOT NULL;
+
+ALTER TABLE ingestion_items
+  DROP CONSTRAINT IF EXISTS ingestion_items_object_id_fkey;
+
+ALTER TABLE ingestion_items
+  ADD CONSTRAINT ingestion_items_object_id_fkey
+  FOREIGN KEY (object_id)
+  REFERENCES objects(object_id)
+  ON DELETE SET NULL;
 
 CREATE TABLE IF NOT EXISTS tags (
   id uuid PRIMARY KEY,
@@ -451,10 +557,18 @@ CREATE TABLE IF NOT EXISTS object_download_requests (
   id uuid PRIMARY KEY,
   object_id text NOT NULL REFERENCES objects(object_id) ON DELETE CASCADE,
   tenant_id uuid NOT NULL,
+  available_file_id uuid,
   requested_by uuid NOT NULL,
-  artifact_kind requested_artifact_kind NOT NULL,
+  artifact_kind artifact_kind NOT NULL,
+  variant text,
   status object_download_request_status NOT NULL DEFAULT 'PENDING',
   failure_reason text,
+  failure_details jsonb,
+  lease_id uuid,
+  lease_token_id uuid,
+  lease_expires_at timestamptz,
+  leased_by text,
+  released_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   completed_at timestamptz
@@ -466,14 +580,50 @@ CREATE INDEX IF NOT EXISTS object_download_requests_object_status_idx
 CREATE INDEX IF NOT EXISTS object_download_requests_tenant_created_idx
   ON object_download_requests (tenant_id, created_at DESC);
 
+CREATE INDEX IF NOT EXISTS object_download_requests_active_lease_idx
+  ON object_download_requests (id, lease_id, lease_token_id, lease_expires_at)
+  WHERE status = 'PROCESSING' AND released_at IS NULL;
+
 CREATE UNIQUE INDEX IF NOT EXISTS object_download_requests_one_active_kind_idx
-  ON object_download_requests (tenant_id, object_id, artifact_kind)
+  ON object_download_requests (tenant_id, object_id, artifact_kind, COALESCE(variant, ''))
   WHERE status IN ('PENDING', 'PROCESSING');
+
+CREATE TABLE IF NOT EXISTS object_available_files (
+  id uuid PRIMARY KEY,
+  object_id text NOT NULL REFERENCES objects(object_id) ON DELETE CASCADE,
+  tenant_id uuid NOT NULL,
+  archive_file_key text NOT NULL,
+  artifact_kind artifact_kind NOT NULL,
+  variant text,
+  display_name text NOT NULL,
+  content_type text,
+  size_bytes bigint CHECK (size_bytes >= 0),
+  checksum_sha256 text,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  is_available boolean NOT NULL DEFAULT true,
+  synced_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS object_available_files_archive_key_unique_idx
+  ON object_available_files (tenant_id, object_id, archive_file_key);
+
+CREATE INDEX IF NOT EXISTS object_available_files_object_available_idx
+  ON object_available_files (object_id, is_available, synced_at DESC);
+
+ALTER TABLE object_download_requests
+  DROP CONSTRAINT IF EXISTS object_download_requests_available_file_id_fkey;
+
+ALTER TABLE object_download_requests
+  ADD CONSTRAINT object_download_requests_available_file_id_fkey
+  FOREIGN KEY (available_file_id)
+  REFERENCES object_available_files(id)
+  ON DELETE SET NULL;
 
 CREATE TABLE IF NOT EXISTS object_artifacts (
   id uuid PRIMARY KEY,
   object_id text NOT NULL REFERENCES objects(object_id) ON DELETE CASCADE,
   kind artifact_kind NOT NULL,
+  variant text,
   storage_key text NOT NULL,
   content_type text NOT NULL,
   size_bytes bigint NOT NULL CHECK (size_bytes >= 0),
@@ -490,6 +640,7 @@ CREATE TABLE IF NOT EXISTS object_events (
   tenant_id uuid NOT NULL,
   type object_event_type NOT NULL,
   ingestion_id uuid REFERENCES ingestions(id) ON DELETE SET NULL,
+  ingestion_item_id uuid REFERENCES ingestion_items(id) ON DELETE SET NULL,
   object_id text REFERENCES objects(object_id) ON DELETE SET NULL,
   payload jsonb NOT NULL DEFAULT '{}'::jsonb,
   actor_user_id uuid,
@@ -501,6 +652,9 @@ CREATE INDEX IF NOT EXISTS object_events_tenant_created_idx
 
 CREATE INDEX IF NOT EXISTS object_events_ingestion_created_idx
   ON object_events (ingestion_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS object_events_ingestion_item_created_idx
+  ON object_events (ingestion_item_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS object_events_object_created_idx
   ON object_events (object_id, created_at DESC);

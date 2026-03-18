@@ -4,20 +4,46 @@ import {
 } from "../http/errors.ts";
 import { resolveStagingPath } from "../storage/staging.ts";
 import { findIngestionById } from "../repos/ingestion-repo.ts";
+import {
+  findIngestionItemById,
+  listIngestionItems,
+  setIngestionItemStatus,
+  summarizeIngestionItems,
+} from "../repos/ingestion-item-repo.ts";
 import { insertObjectEvent } from "../repos/event-repo.ts";
 import {
   createOrGetObjectBySourceIngestion,
   findObjectById,
   findObjectBySourceIngestion,
+  findObjectBySourceIngestionItem,
   updateObjectIngestManifest,
   updateObjectProjectionState,
 } from "../repos/object-repo.ts";
-import { jsonObjectSchema } from "../validation/ingestion.ts";
+import { parseIngestionSummary } from "../validation/catalog.ts";
+import { jsonObjectSchema, type IngestItemKind } from "../validation/ingestion.ts";
 import type {
   IngestWorkerEventsInput,
   IngestWorkerEventsResponse,
 } from "../types/worker-events.ts";
 import { applyStatusTransition } from "./ingestion-transition.ts";
+
+function mapItemKindToObjectType(
+  itemKind: IngestItemKind,
+): "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT" {
+  switch (itemKind) {
+    case "photo":
+      return "IMAGE";
+    case "audio":
+      return "AUDIO";
+    case "video":
+      return "VIDEO";
+    case "scanned_document":
+    case "document":
+      return "DOCUMENT";
+    case "other":
+      return "GENERIC";
+  }
+}
 
 export async function ingestWorkerEvents(
   params: IngestWorkerEventsInput,
@@ -46,18 +72,56 @@ export async function ingestWorkerEvents(
     let completionObject:
       | Awaited<ReturnType<typeof createOrGetObjectBySourceIngestion>>
       | undefined;
+    let itemCompletionObject:
+      | Awaited<ReturnType<typeof createOrGetObjectBySourceIngestion>>
+      | undefined;
+    let scopedIngestionItem:
+      | Awaited<ReturnType<typeof findIngestionItemById>>
+      | undefined;
 
-    if (event.event_type === "INGESTION_COMPLETED") {
-      try {
-        const parsedMetadata = jsonObjectSchema.safeParse(event.payload);
+      if (event.event_type === "INGESTION_COMPLETED") {
+        if (event.ingestion_item_id) {
+          scopedIngestionItem = await findIngestionItemById({
+            tenantId: ingestionRecord.tenantId,
+            ingestionId: ingestionRecord.id,
+            ingestionItemId: event.ingestion_item_id,
+          });
+
+          if (!scopedIngestionItem) {
+            throw new NotFoundError(
+              `Ingestion item '${event.ingestion_item_id}' was not found.`,
+            );
+          }
+        }
+
+        if (!event.object_id) {
+          completionObject = undefined;
+        } else {
+
+        try {
+          const summary = parseIngestionSummary(ingestionRecord.summary);
+        const parsedMetadata = jsonObjectSchema.safeParse(summary);
+        const titleFromEvent =
+          typeof event.payload.title === "string" ? event.payload.title.trim() : "";
+        const title = summary.title.primary || titleFromEvent;
+
         completionObject = await createOrGetObjectBySourceIngestion({
           objectId: event.object_id,
           tenantId: ingestionRecord.tenantId,
           sourceIngestionId: ingestionRecord.id,
-          type: "GENERIC",
-          title:
-            typeof event.payload.title === "string" ? event.payload.title : "",
+          sourceIngestionItemId: event.ingestion_item_id,
+          type: mapItemKindToObjectType(
+            scopedIngestionItem?.itemKind ?? ingestionRecord.itemKind,
+          ),
+          title,
+          languageCode: scopedIngestionItem?.languageCode ?? ingestionRecord.languageCode,
+          accessLevel: ingestionRecord.accessLevel,
+          embargoKind: ingestionRecord.embargoUntil ? "timed" : "none",
+          embargoUntil: ingestionRecord.embargoUntil,
+          rightsNote: ingestionRecord.rightsNote,
+          sensitivityNote: ingestionRecord.sensitivityNote,
           metadata: parsedMetadata.success ? parsedMetadata.data : {},
+          tags: summary.classification.tags,
         });
       } catch (error) {
         if (!isObjectConflictError(error)) {
@@ -68,6 +132,17 @@ export async function ingestWorkerEvents(
           tenantId: ingestionRecord.tenantId,
           ingestionId: ingestionRecord.id,
         });
+
+        const existingByIngestionItem = event.ingestion_item_id
+          ? await findObjectBySourceIngestionItem({
+            tenantId: ingestionRecord.tenantId,
+            ingestionItemId: event.ingestion_item_id,
+          })
+          : undefined;
+
+        if (existingByIngestionItem) {
+          completionObject = existingByIngestionItem;
+        } else 
 
         if (existingByIngestion) {
           completionObject = existingByIngestion;
@@ -91,10 +166,70 @@ export async function ingestWorkerEvents(
         }
       }
 
-      if (completionObject.objectId !== event.object_id) {
-        throw new ConflictError("Conflicting object_id for this ingestion.", {
+        if (completionObject.objectId !== event.object_id) {
+          throw new ConflictError("Conflicting object_id for this ingestion.", {
+            ingestion_id: ingestionRecord.id,
+            expected_object_id: completionObject.objectId,
+            received_object_id: event.object_id,
+          });
+        }
+        }
+      }
+
+    if (event.event_type === "INGESTION_ITEM_COMPLETED") {
+      if (!event.ingestion_item_id) {
+        throw new ConflictError("Ingestion item event requires ingestion_item_id.");
+      }
+
+      scopedIngestionItem = await findIngestionItemById({
+        tenantId: ingestionRecord.tenantId,
+        ingestionId: ingestionRecord.id,
+        ingestionItemId: event.ingestion_item_id,
+      });
+
+      if (!scopedIngestionItem) {
+        throw new NotFoundError(
+          `Ingestion item '${event.ingestion_item_id}' was not found.`,
+        );
+      }
+
+      const summary = parseIngestionSummary(ingestionRecord.summary);
+      const parsedMetadata = jsonObjectSchema.safeParse(summary);
+      const titleFromEvent =
+        typeof event.payload.title === "string" ? event.payload.title.trim() : "";
+      const title = summary.title.primary || titleFromEvent;
+
+      itemCompletionObject = await findObjectBySourceIngestionItem({
+        tenantId: ingestionRecord.tenantId,
+        ingestionItemId: event.ingestion_item_id,
+      });
+
+      if (!itemCompletionObject) {
+        itemCompletionObject = await createOrGetObjectBySourceIngestion({
+          objectId: event.object_id,
+          tenantId: ingestionRecord.tenantId,
+          sourceIngestionId: ingestionRecord.id,
+          sourceIngestionItemId: event.ingestion_item_id,
+          type: mapItemKindToObjectType(
+            scopedIngestionItem.itemKind ?? ingestionRecord.itemKind,
+          ),
+          title,
+          languageCode: scopedIngestionItem.languageCode ?? ingestionRecord.languageCode,
+          accessLevel: ingestionRecord.accessLevel,
+          embargoKind: ingestionRecord.embargoUntil ? "timed" : "none",
+          embargoUntil: ingestionRecord.embargoUntil,
+          rightsNote: ingestionRecord.rightsNote,
+          sensitivityNote: ingestionRecord.sensitivityNote,
+          metadata: parsedMetadata.success ? parsedMetadata.data : {},
+          tags: summary.classification.tags,
+        });
+      }
+
+      if (itemCompletionObject.objectId !== event.object_id) {
+        throw new ConflictError("Conflicting object_id for this ingestion item.", {
           ingestion_id: ingestionRecord.id,
-          expected_object_id: completionObject.objectId,
+          ingestion_item_id: event.ingestion_item_id,
+          expected_object_id: itemCompletionObject.objectId,
           received_object_id: event.object_id,
         });
       }
@@ -105,7 +240,8 @@ export async function ingestWorkerEvents(
       tenantId: authorizedLease.tenantId,
       type: event.event_type,
       ingestionId: authorizedLease.ingestionId,
-      objectId: event.object_id,
+      objectId: itemCompletionObject?.objectId ?? event.object_id,
+      ingestionItemId: event.ingestion_item_id,
       payload: event.payload,
       actorUserId: ingestionRecord.createdBy,
       createdAt,
@@ -139,6 +275,100 @@ export async function ingestWorkerEvents(
       });
     }
 
+    if (event.event_type === "INGESTION_ITEM_PROCESSING") {
+      if (!event.ingestion_item_id) {
+        throw new ConflictError("Ingestion item event requires ingestion_item_id.");
+      }
+
+      const updatedItem = await setIngestionItemStatus({
+        tenantId: ingestionRecord.tenantId,
+        ingestionId: ingestionRecord.id,
+        ingestionItemId: event.ingestion_item_id,
+        toStatus: "PROCESSING",
+      });
+
+      if (!updatedItem) {
+        throw new NotFoundError(
+          `Ingestion item '${event.ingestion_item_id}' was not found.`,
+        );
+      }
+
+      if (currentStatus !== "PROCESSING") {
+        currentStatus = await applyStatusTransition({
+          ingestionId: ingestionRecord.id,
+          tenantId: ingestionRecord.tenantId,
+          fromStatus: currentStatus,
+          toStatus: "PROCESSING",
+        });
+      }
+    }
+
+    if (event.event_type === "INGESTION_ITEM_FAILED") {
+      if (!event.ingestion_item_id) {
+        throw new ConflictError("Ingestion item event requires ingestion_item_id.");
+      }
+
+      const updatedItem = await setIngestionItemStatus({
+        tenantId: ingestionRecord.tenantId,
+        ingestionId: ingestionRecord.id,
+        ingestionItemId: event.ingestion_item_id,
+        toStatus: "FAILED",
+      });
+
+      if (!updatedItem) {
+        throw new NotFoundError(
+          `Ingestion item '${event.ingestion_item_id}' was not found.`,
+        );
+      }
+    }
+
+    if (event.event_type === "INGESTION_ITEM_COMPLETED") {
+      if (!event.ingestion_item_id) {
+        throw new ConflictError("Ingestion item event requires ingestion_item_id.");
+      }
+
+      const itemObject = itemCompletionObject;
+      if (!itemObject) {
+        throw new ConflictError("Item completion object resolution failed.", {
+          ingestion_id: ingestionRecord.id,
+          ingestion_item_id: event.ingestion_item_id,
+        });
+      }
+
+      await updateObjectProjectionState({
+        tenantId: ingestionRecord.tenantId,
+        objectId: itemObject.objectId,
+        processingState: "index_done",
+        availabilityState: "AVAILABLE",
+      });
+
+      const ingestJson = event.payload.ingest_json;
+      const parsedIngestJson = jsonObjectSchema.safeParse(ingestJson);
+      if (parsedIngestJson.success) {
+        await updateObjectIngestManifest({
+          tenantId: ingestionRecord.tenantId,
+          objectId: itemObject.objectId,
+          ingestManifest: parsedIngestJson.data,
+        });
+      }
+
+      const updatedItem = await setIngestionItemStatus({
+        tenantId: ingestionRecord.tenantId,
+        ingestionId: ingestionRecord.id,
+        ingestionItemId: event.ingestion_item_id,
+        toStatus: "COMPLETED",
+        objectId: itemObject.objectId,
+      });
+
+      if (!updatedItem) {
+        throw new NotFoundError(
+          `Ingestion item '${event.ingestion_item_id}' was not found.`,
+        );
+      }
+
+      completedObjectId = itemObject.objectId;
+    }
+
     if (event.event_type === "INGESTION_CANCELED") {
       currentStatus = await applyStatusTransition({
         ingestionId: ingestionRecord.id,
@@ -149,34 +379,98 @@ export async function ingestWorkerEvents(
     }
 
     if (event.event_type === "INGESTION_COMPLETED") {
-      if (!completionObject) {
-        throw new ConflictError("Completion event object resolution failed.");
-      }
-
-      await updateObjectProjectionState({
-        tenantId: ingestionRecord.tenantId,
-        objectId: completionObject.objectId,
-        processingState: "index_done",
-        availabilityState: "AVAILABLE",
-      });
-
-      completedObjectId = completionObject.objectId;
-
-      const ingestJson = event.payload.ingest_json;
-      const parsedIngestJson = jsonObjectSchema.safeParse(ingestJson);
-      if (parsedIngestJson.success) {
-        await updateObjectIngestManifest({
+      if (completionObject) {
+        await updateObjectProjectionState({
           tenantId: ingestionRecord.tenantId,
           objectId: completionObject.objectId,
-          ingestManifest: parsedIngestJson.data,
+          processingState: "index_done",
+          availabilityState: "AVAILABLE",
+        });
+
+        completedObjectId = completionObject.objectId;
+
+        const ingestJson = event.payload.ingest_json;
+        const parsedIngestJson = jsonObjectSchema.safeParse(ingestJson);
+        if (parsedIngestJson.success) {
+          await updateObjectIngestManifest({
+            tenantId: ingestionRecord.tenantId,
+            objectId: completionObject.objectId,
+            ingestManifest: parsedIngestJson.data,
+          });
+        }
+      }
+
+      const itemSummary = await summarizeIngestionItems({
+        tenantId: ingestionRecord.tenantId,
+        ingestionId: ingestionRecord.id,
+      });
+
+      if (itemSummary.totalCount > 0) {
+        const terminalCount =
+          itemSummary.completedCount +
+          itemSummary.failedCount +
+          itemSummary.skippedCount;
+
+        if (terminalCount === itemSummary.totalCount) {
+          const nextStatus = itemSummary.failedCount > 0
+            ? itemSummary.completedCount > 0 || itemSummary.skippedCount > 0
+              ? "COMPLETED_WITH_ERRORS"
+              : "FAILED"
+            : "COMPLETED";
+
+          currentStatus = await applyStatusTransition({
+            ingestionId: ingestionRecord.id,
+            tenantId: ingestionRecord.tenantId,
+            fromStatus: currentStatus,
+            toStatus: nextStatus,
+          });
+        } else {
+          currentStatus = await applyStatusTransition({
+            ingestionId: ingestionRecord.id,
+            tenantId: ingestionRecord.tenantId,
+            fromStatus: currentStatus,
+            toStatus: "COMPLETED",
+          });
+        }
+      } else {
+        currentStatus = await applyStatusTransition({
+          ingestionId: ingestionRecord.id,
+          tenantId: ingestionRecord.tenantId,
+          fromStatus: currentStatus,
+          toStatus: "COMPLETED",
         });
       }
+    }
+  }
+
+  const allItems = await listIngestionItems({
+    tenantId: ingestionRecord.tenantId,
+    ingestionId: ingestionRecord.id,
+  });
+
+  if (allItems.length > 0 && currentStatus === "PROCESSING") {
+    const itemSummary = await summarizeIngestionItems({
+      tenantId: ingestionRecord.tenantId,
+      ingestionId: ingestionRecord.id,
+    });
+
+    const terminalCount =
+      itemSummary.completedCount +
+      itemSummary.failedCount +
+      itemSummary.skippedCount;
+
+    if (terminalCount === itemSummary.totalCount) {
+      const nextStatus = itemSummary.failedCount > 0
+        ? itemSummary.completedCount > 0 || itemSummary.skippedCount > 0
+          ? "COMPLETED_WITH_ERRORS"
+          : "FAILED"
+        : "COMPLETED";
 
       currentStatus = await applyStatusTransition({
         ingestionId: ingestionRecord.id,
         tenantId: ingestionRecord.tenantId,
         fromStatus: currentStatus,
-        toStatus: "COMPLETED",
+        toStatus: nextStatus,
       });
     }
   }
@@ -202,7 +496,7 @@ function isObjectConflictError(error: unknown): boolean {
 
   return (
     maybeError.constraint === "objects_pkey" ||
-    maybeError.constraint === "objects_source_ingestion_unique_idx"
+    maybeError.constraint === "objects_source_ingestion_item_unique_idx"
   );
 }
 

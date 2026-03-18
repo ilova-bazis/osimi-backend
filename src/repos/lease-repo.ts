@@ -21,7 +21,15 @@ interface IngestionLeaseCandidateRow {
   id: string;
   batch_label: string;
   tenant_id: string;
-  status: "DRAFT" | "UPLOADING" | "QUEUED" | "PROCESSING" | "COMPLETED" | "FAILED" | "CANCELED";
+  status:
+    | "DRAFT"
+    | "UPLOADING"
+    | "QUEUED"
+    | "PROCESSING"
+    | "COMPLETED"
+    | "COMPLETED_WITH_ERRORS"
+    | "FAILED"
+    | "CANCELED";
 }
 
 export interface LeaseRecord {

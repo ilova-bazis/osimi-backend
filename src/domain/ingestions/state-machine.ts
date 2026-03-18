@@ -4,6 +4,7 @@ export const INGESTION_STATUSES = [
   "QUEUED",
   "PROCESSING",
   "COMPLETED",
+  "COMPLETED_WITH_ERRORS",
   "FAILED",
   "CANCELED",
 ] as const;
@@ -26,13 +27,19 @@ const ALLOWED_TRANSITIONS: Record<IngestionStatus, readonly IngestionStatus[]> =
   DRAFT: ["UPLOADING", "CANCELED"],
   UPLOADING: ["QUEUED", "FAILED", "CANCELED"],
   QUEUED: ["PROCESSING", "CANCELED", "UPLOADING"],
-  PROCESSING: ["COMPLETED", "FAILED", "CANCELED", "QUEUED"],
+  PROCESSING: ["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "CANCELED", "QUEUED"],
   COMPLETED: [],
+  COMPLETED_WITH_ERRORS: [],
   FAILED: ["QUEUED"],
   CANCELED: ["QUEUED", "UPLOADING", "DRAFT"],
 };
 
-const TERMINAL_STATUSES = new Set<IngestionStatus>(["COMPLETED", "FAILED", "CANCELED"]);
+const TERMINAL_STATUSES = new Set<IngestionStatus>([
+  "COMPLETED",
+  "COMPLETED_WITH_ERRORS",
+  "FAILED",
+  "CANCELED",
+]);
 
 export function isIngestionStatus(value: string): value is IngestionStatus {
   return (INGESTION_STATUSES as readonly string[]).includes(value);

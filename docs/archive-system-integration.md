@@ -6,6 +6,10 @@ It describes the worker-side protocol end to end: lease, download, event ingesti
 
 For complete route reference, see `docs/api-reference.md` (Worker APIs section).
 
+For the new generic archive task queue (`/api/archive-requests/*`), see:
+
+- `docs/archive-system-generic-requests.md`
+
 ## 1) Scope and Boundaries
 
 - This guide covers worker-to-VPS integration only.
@@ -39,7 +43,6 @@ Nuance:
 - Endpoints that mutate lease state or ingest events require body field `lease_token`.
 - `lease_token` is bound to:
   - `ingestion_id`
-  - `tenant_id`
   - `lease_id`
   - token expiry
 - If lease is expired/released/invalid, VPS rejects with non-2xx.
@@ -107,7 +110,6 @@ Response `200`:
     "lease_expires_at": "2026-02-19T18:00:00.000Z",
     "ingestion_id": "uuid",
     "batch_label": "batch-2026-02-19-001",
-    "tenant_id": "uuid",
     "download_urls": [
       {
         "file_id": "uuid",
@@ -374,6 +376,12 @@ Worker guidance:
 
 - On `INGESTION_COMPLETED`:
   - VPS creates or resolves object by source ingestion and `object_id`.
+  - On object creation from ingestion completion, VPS seeds object fields from ingestion metadata:
+    - `type` from ingestion `item_kind`
+    - `title` from ingestion summary `title.primary`
+    - `tags` from ingestion summary `classification.tags`
+    - `language_code` from ingestion `language_code`
+    - `access_level`, `embargo_kind`/`embargo_until`, `rights_note`, `sensitivity_note` from ingestion access policy fields
   - VPS updates object projection to:
     - `processing_state = index_done`
     - `availability_state = AVAILABLE`

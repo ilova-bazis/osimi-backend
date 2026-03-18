@@ -142,6 +142,7 @@ async function createQueuedIngestion(
       }),
     }),
   );
+  expect(createResponse.status).toBe(201);
 
   const created = (await createResponse.json()) as { ingestion: { id: string } };
   const ingestionId = created.ingestion.id;
@@ -161,6 +162,7 @@ async function createQueuedIngestion(
       }),
     }),
   );
+  expect(presignResponse.status).toBe(201);
 
   const presignBody = (await presignResponse.json()) as {
     file_id: string;
@@ -187,7 +189,7 @@ async function createQueuedIngestion(
     expect(overrideResponse.status).toBe(200);
   }
 
-  await app.fetch(
+  const uploadResponse = await app.fetch(
     new Request(`http://localhost${presignBody.upload_url}`, {
       method: "PUT",
       headers: {
@@ -197,8 +199,9 @@ async function createQueuedIngestion(
       body: payload,
     }),
   );
+  expect(uploadResponse.status).toBe(200);
 
-  await app.fetch(
+  const commitResponse = await app.fetch(
     new Request(`http://localhost/api/ingestions/${ingestionId}/files/commit`, {
       method: "POST",
       headers: {
@@ -211,8 +214,44 @@ async function createQueuedIngestion(
       }),
     }),
   );
+  expect(commitResponse.status).toBe(200);
 
-  await app.fetch(
+  const createItemResponse = await app.fetch(
+    new Request(`http://localhost/api/ingestions/${ingestionId}/items`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        item_index: 1,
+      }),
+    }),
+  );
+
+  expect(createItemResponse.status).toBe(201);
+  const createItemBody = (await createItemResponse.json()) as { item: { id: string } };
+
+  const linkFileResponse = await app.fetch(
+    new Request(
+      `http://localhost/api/ingestions/${ingestionId}/items/${createItemBody.item.id}/files`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          ingestion_file_id: presignBody.file_id,
+          sort_order: 1,
+        }),
+      },
+    ),
+  );
+
+  expect(linkFileResponse.status).toBe(201);
+
+  const submitResponse = await app.fetch(
     new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
       method: "POST",
       headers: {
@@ -220,6 +259,7 @@ async function createQueuedIngestion(
       },
     }),
   );
+  expect(submitResponse.status).toBe(200);
 
   return ingestionId;
 }
@@ -331,20 +371,23 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
       lease: {
         ingestion_id: string;
         lease_token: string;
-        download_urls: Array<{ download_url: string; checksum_sha256: string | null }>;
-        catalog_json: Record<string, unknown>;
+        items: Array<{
+          catalog_json: Record<string, unknown>;
+          files: Array<{ download_url: string; checksum_sha256: string | null }>;
+        }>;
       };
     };
 
     expect(leaseBody.lease.ingestion_id).toBe(ingestionId);
-    expect(leaseBody.lease.download_urls.length).toBe(1);
-    expect(leaseBody.lease.catalog_json).not.toBeNull();
-    expect(leaseBody.lease.download_urls[0]?.checksum_sha256).toBe(
+    expect(leaseBody.lease.items.length).toBe(1);
+    expect(leaseBody.lease.items[0]?.catalog_json).not.toBeNull();
+    expect(leaseBody.lease.items[0]?.files.length).toBe(1);
+    expect(leaseBody.lease.items[0]?.files[0]?.checksum_sha256).toBe(
       sha256Hex(LEASE_PAYLOAD),
     );
 
     const downloadResponse = await app.fetch(
-      new Request(`http://localhost${leaseBody.lease.download_urls[0]!.download_url}`),
+      new Request(`http://localhost${leaseBody.lease.items[0]!.files[0]!.download_url}`),
     );
 
     expect(downloadResponse.status).toBe(200);
@@ -366,10 +409,10 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     expect(heartbeatResponse.status).toBe(200);
     const heartbeatBody = (await heartbeatResponse.json()) as {
       lease: {
-        catalog_json: Record<string, unknown>;
+        items: Array<{ catalog_json: Record<string, unknown> }>;
       };
     };
-    expect(heartbeatBody.lease.catalog_json).not.toBeNull();
+    expect(heartbeatBody.lease.items[0]?.catalog_json).not.toBeNull();
 
     const releaseResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/lease/release`, {
@@ -622,7 +665,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     expect(secondBody.lease.ingestion_id).toBe(ingestionId);
   });
 
-  test("includes catalog_json in lease and heartbeat when provided at ingestion creation", async () => {
+  test("includes item catalog_json in lease and heartbeat when provided at ingestion creation", async () => {
     const app = createTestApp();
     const summary = buildSummary({
       title: {
@@ -649,19 +692,21 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
       lease: {
         ingestion_id: string;
         lease_token: string;
-        catalog_json: {
-          schema_version: string;
-          title: { primary: string };
-          object_id: string | null;
-        };
+        items: Array<{
+          catalog_json: {
+            schema_version: string;
+            title: { primary: string };
+            object_id: string | null;
+          };
+        }>;
       };
     };
 
     expect(leaseBody.lease.ingestion_id).toBe(ingestionId);
-    expect(leaseBody.lease.catalog_json).not.toBeNull();
-    expect(leaseBody.lease.catalog_json?.schema_version).toBe("1.0");
-    expect(leaseBody.lease.catalog_json?.title.primary).toBe("Lease catalog payload");
-    expect(leaseBody.lease.catalog_json?.object_id).toBeNull();
+    expect(leaseBody.lease.items[0]?.catalog_json).not.toBeNull();
+    expect(leaseBody.lease.items[0]?.catalog_json?.schema_version).toBe("1.0");
+    expect(leaseBody.lease.items[0]?.catalog_json?.title.primary).toBe("Lease catalog payload");
+    expect(leaseBody.lease.items[0]?.catalog_json?.object_id).toBeNull();
 
     const heartbeatResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/lease/heartbeat`, {
@@ -679,18 +724,20 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     expect(heartbeatResponse.status).toBe(200);
     const heartbeatBody = (await heartbeatResponse.json()) as {
       lease: {
-        catalog_json: {
-          schema_version: string;
-          title: { primary: string };
-          object_id: string | null;
-        };
+        items: Array<{
+          catalog_json: {
+            schema_version: string;
+            title: { primary: string };
+            object_id: string | null;
+          };
+        }>;
       };
     };
 
-    expect(heartbeatBody.lease.catalog_json).not.toBeNull();
-    expect(heartbeatBody.lease.catalog_json?.schema_version).toBe("1.0");
-    expect(heartbeatBody.lease.catalog_json?.title.primary).toBe("Lease catalog payload");
-    expect(heartbeatBody.lease.catalog_json?.object_id).toBeNull();
+    expect(heartbeatBody.lease.items[0]?.catalog_json).not.toBeNull();
+    expect(heartbeatBody.lease.items[0]?.catalog_json?.schema_version).toBe("1.0");
+    expect(heartbeatBody.lease.items[0]?.catalog_json?.title.primary).toBe("Lease catalog payload");
+    expect(heartbeatBody.lease.items[0]?.catalog_json?.object_id).toBeNull();
   });
 
   test("includes per-file processing overrides in lease payload", async () => {
@@ -721,12 +768,12 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     const leaseBody = (await leaseResponse.json()) as {
       lease: {
         ingestion_id: string;
-        download_urls: Array<{ processing_overrides: Record<string, unknown> }>;
+        items: Array<{ files: Array<{ processing_overrides: Record<string, unknown> }> }>;
       };
     };
 
     expect(leaseBody.lease.ingestion_id).toBe(ingestionId);
-    expect(leaseBody.lease.download_urls[0]?.processing_overrides).toMatchObject(
+    expect(leaseBody.lease.items[0]?.files[0]?.processing_overrides).toMatchObject(
       processingOverrides,
     );
   });
@@ -747,11 +794,13 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
 
     const leaseBody = (await leaseResponse.json()) as {
       lease: {
-        download_urls: Array<{ storage_key: string; file_id: string; content_type: string; size_bytes: number }>;
+        items: Array<{
+          files: Array<{ storage_key: string; file_id: string; content_type: string; size_bytes: number }>;
+        }>;
       };
     };
 
-    const file = leaseBody.lease.download_urls[0];
+    const file = leaseBody.lease.items[0]?.files[0];
     expect(file).toBeDefined();
 
     const expiredToken = createDownloadToken({
@@ -769,5 +818,253 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     );
 
     expect(downloadResponse.status).toBe(401);
+  });
+
+  test("leases grouped items in deterministic item/file order", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-lease-grouped-001" })),
+      }),
+    );
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+    const ingestionId = createBody.ingestion.id;
+
+    const filePayloads = [
+      { filename: "b-page-2.txt", content: "item1-page2" },
+      { filename: "a-page-1.txt", content: "item1-page1" },
+      { filename: "z-cover.txt", content: "item2-cover" },
+    ];
+
+    const fileIds: string[] = [];
+    for (const payload of filePayloads) {
+      const presignResponse = await app.fetch(
+        new Request(`http://localhost/api/ingestions/${ingestionId}/files/presign`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${authToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            filename: payload.filename,
+            content_type: "text/plain",
+            size_bytes: payload.content.length,
+          }),
+        }),
+      );
+      expect(presignResponse.status).toBe(201);
+      const presignBody = (await presignResponse.json()) as { file_id: string; upload_url: string };
+      fileIds.push(presignBody.file_id);
+
+      const uploadResponse = await app.fetch(
+        new Request(`http://localhost${presignBody.upload_url}`, {
+          method: "PUT",
+          headers: {
+            "content-type": "text/plain",
+            "content-length": String(payload.content.length),
+          },
+          body: payload.content,
+        }),
+      );
+      expect(uploadResponse.status).toBe(200);
+
+      const commitResponse = await app.fetch(
+        new Request(`http://localhost/api/ingestions/${ingestionId}/files/commit`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${authToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            file_id: presignBody.file_id,
+            checksum_sha256: sha256Hex(payload.content),
+          }),
+        }),
+      );
+      expect(commitResponse.status).toBe(200);
+    }
+
+    const createItemTwo = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ item_index: 2, title: "Item Two" }),
+      }),
+    );
+    expect(createItemTwo.status).toBe(201);
+    const itemTwoBody = (await createItemTwo.json()) as { item: { id: string } };
+
+    const createItemOne = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ item_index: 1, title: "Item One" }),
+      }),
+    );
+    expect(createItemOne.status).toBe(201);
+    const itemOneBody = (await createItemOne.json()) as { item: { id: string } };
+
+    const links = [
+      { itemId: itemOneBody.item.id, fileId: fileIds[0]!, sortOrder: 2 },
+      { itemId: itemOneBody.item.id, fileId: fileIds[1]!, sortOrder: 1 },
+      { itemId: itemTwoBody.item.id, fileId: fileIds[2]!, sortOrder: 1 },
+    ];
+
+    for (const link of links) {
+      const response = await app.fetch(
+        new Request(`http://localhost/api/ingestions/${ingestionId}/items/${link.itemId}/files`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${authToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            ingestion_file_id: link.fileId,
+            sort_order: link.sortOrder,
+          }),
+        }),
+      );
+      expect(response.status).toBe(201);
+    }
+
+    const submitResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+    expect(submitResponse.status).toBe(200);
+
+    const leaseResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-grouped-order",
+        },
+      }),
+    );
+    expect(leaseResponse.status).toBe(200);
+
+    const leaseBody = (await leaseResponse.json()) as {
+      lease: {
+        items: Array<{
+          ingestion_item_id: string;
+          item_index: number;
+          files: Array<{ file_id: string; sort_order: number }>;
+        }>;
+      };
+    };
+
+    expect(leaseBody.lease.items.length).toBe(2);
+    expect(leaseBody.lease.items.map((item) => item.ingestion_item_id)).toEqual([
+      itemOneBody.item.id,
+      itemTwoBody.item.id,
+    ]);
+    expect(leaseBody.lease.items.map((item) => item.item_index)).toEqual([1, 2]);
+    expect(leaseBody.lease.items[0]?.files.map((file) => file.file_id)).toEqual([
+      fileIds[1]!,
+      fileIds[0]!,
+    ]);
+    expect(leaseBody.lease.items[0]?.files.map((file) => file.sort_order)).toEqual([1, 2]);
+  });
+
+  test("rejects lease when committed files are not linked to ingestion items", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-unlinked-lease-001" })),
+      }),
+    );
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+    const ingestionId = createBody.ingestion.id;
+
+    const payload = "unlinked";
+    const presignResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/presign`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          filename: "unlinked.txt",
+          content_type: "text/plain",
+          size_bytes: payload.length,
+        }),
+      }),
+    );
+    expect(presignResponse.status).toBe(201);
+    const presignBody = (await presignResponse.json()) as { file_id: string; upload_url: string };
+
+    const uploadResponse = await app.fetch(
+      new Request(`http://localhost${presignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "text/plain",
+          "content-length": String(payload.length),
+        },
+        body: payload,
+      }),
+    );
+    expect(uploadResponse.status).toBe(200);
+
+    const commitResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/commit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          file_id: presignBody.file_id,
+          checksum_sha256: sha256Hex(payload),
+        }),
+      }),
+    );
+    expect(commitResponse.status).toBe(200);
+
+    const submitResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+    expect(submitResponse.status).toBe(200);
+
+    const leaseResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions/lease", {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-unlinked",
+        },
+      }),
+    );
+    expect(leaseResponse.status).toBe(409);
   });
 });

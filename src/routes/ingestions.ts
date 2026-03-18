@@ -2,32 +2,47 @@ import { requireRole } from "../auth/guards.ts";
 import { jsonResponse } from "../http/response.ts";
 import { parseJsonBody } from "../validation/common.ts";
 import {
+  parseAddIngestionItemFileBody,
   parseCommitUploadedFileBody,
+  parseCreateIngestionItemBody,
   parseCreateIngestionBody,
   parseCreatePresignedUploadBody,
   parseIngestionFileIdParam,
   parseIngestionIdParam,
+  parseIngestionItemIdParam,
   parseIngestionListQuery,
+  parseReorderIngestionItemsBody,
+  parseReorderIngestionItemFilesBody,
+  parseUpdateIngestionItemBody,
   parseUpdateIngestionFileOverridesBody,
   parseUpdateIngestionBody,
   parseUploadTokenParam,
 } from "../validation/ingestion.ts";
 import {
-  cancelIngestion,
-  commitUploadedFile,
-  createIngestionDraft,
-  createPresignedUpload,
-  deleteIngestionRecord,
-  getIngestionCapabilities,
-  getIngestion,
-  getIngestionList,
-  removeIngestionFile,
-  restoreIngestion,
-  retryIngestion,
-  submitIngestion,
-  updateIngestion,
-  updateIngestionFileOverrides,
-  uploadFileBySignedToken,
+  addIngestionFileToItem,
+  createIngestionItemForIngestion,
+  listIngestionItemFilesForIngestionItem,
+  listIngestionItemsForIngestion,
+  reorderIngestionItemsForIngestion,
+  reorderFilesInIngestionItem,
+  updateIngestionItemMetadata,
+} from "../services/ingestion-item-service.ts";
+import {
+  cancelIngestion as cancelIngestionRecord,
+  commitUploadedFile as commitUploadedFileRecord,
+  createIngestionDraft as createIngestionDraftRecord,
+  createPresignedUpload as createPresignedUploadRecord,
+  deleteIngestionRecord as deleteIngestionRecordService,
+  getIngestionCapabilities as getIngestionCapabilitiesRecord,
+  getIngestion as getIngestionRecord,
+  getIngestionList as getIngestionListRecord,
+  removeIngestionFile as removeIngestionFileRecord,
+  restoreIngestion as restoreIngestionRecord,
+  retryIngestion as retryIngestionRecord,
+  submitIngestion as submitIngestionRecord,
+  updateIngestion as updateIngestionRecord,
+  updateIngestionFileOverrides as updateIngestionFileOverridesRecord,
+  uploadFileBySignedToken as uploadFileBySignedTokenRecord,
 } from "../services/ingestion-service.ts";
 import { extractPathParam } from "./params.ts";
 import type { RouteDefinition } from "./types.ts";
@@ -39,7 +54,7 @@ const createIngestionRoute: RouteDefinition = {
     const auth = requireRole(context, ["archiver", "admin"]);
     const body = parseCreateIngestionBody(await parseJsonBody(request));
     return jsonResponse(
-      await createIngestionDraft({
+      await createIngestionDraftRecord({
         auth,
         body,
       }),
@@ -57,7 +72,7 @@ const listIngestionsRoute: RouteDefinition = {
     const auth = requireRole(context, ["viewer", "archiver", "admin"]);
     const url = new URL(request.url);
     const query = parseIngestionListQuery(url);
-    const result = await getIngestionList({ auth, query });
+    const result = await getIngestionListRecord({ auth, query });
 
     return jsonResponse({
       ingestions: result.items,
@@ -75,7 +90,7 @@ const getIngestionRoute: RouteDefinition = {
     const ingestionId = parseIngestionIdParam(
       extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)$/, "id"),
     );
-    return jsonResponse(await getIngestion({ auth, ingestionId }));
+    return jsonResponse(await getIngestionRecord({ auth, ingestionId }));
   },
 };
 
@@ -91,7 +106,7 @@ const updateIngestionRoute: RouteDefinition = {
     const body = parseUpdateIngestionBody(await parseJsonBody(request));
 
     return jsonResponse(
-      await updateIngestion({
+      await updateIngestionRecord({
         auth,
         ingestionId,
         body,
@@ -111,7 +126,7 @@ const deleteIngestionRoute: RouteDefinition = {
     );
 
     return jsonResponse(
-      await deleteIngestionRecord({
+      await deleteIngestionRecordService({
         auth,
         ingestionId,
       }),
@@ -124,7 +139,7 @@ const ingestionCapabilitiesRoute: RouteDefinition = {
   path: "/api/ingestions/capabilities",
   handler: async (_request, context) => {
     requireRole(context, ["viewer", "archiver", "admin"]);
-    return jsonResponse(getIngestionCapabilities());
+    return jsonResponse(getIngestionCapabilitiesRecord());
   },
 };
 
@@ -144,7 +159,7 @@ const presignFileRoute: RouteDefinition = {
     const body = parseCreatePresignedUploadBody(await parseJsonBody(request));
 
     return jsonResponse(
-      await createPresignedUpload({
+      await createPresignedUploadRecord({
         auth,
         ingestionId,
         body,
@@ -178,7 +193,7 @@ const removeFileRoute: RouteDefinition = {
     );
 
     return jsonResponse(
-      await removeIngestionFile({
+      await removeIngestionFileRecord({
         auth,
         ingestionId,
         fileId,
@@ -212,7 +227,7 @@ const updateFileOverridesRoute: RouteDefinition = {
     );
 
     return jsonResponse(
-      await updateIngestionFileOverrides({
+      await updateIngestionFileOverridesRecord({
         auth,
         ingestionId,
         fileId,
@@ -238,7 +253,7 @@ const commitFileRoute: RouteDefinition = {
     const body = parseCommitUploadedFileBody(await parseJsonBody(request));
 
     return jsonResponse(
-      await commitUploadedFile({
+      await commitUploadedFileRecord({
         auth,
         ingestionId,
         body,
@@ -258,7 +273,7 @@ const submitIngestionRoute: RouteDefinition = {
     );
 
     return jsonResponse(
-      await submitIngestion({
+      await submitIngestionRecord({
         auth,
         ingestionId,
       }),
@@ -277,7 +292,7 @@ const restoreIngestionRoute: RouteDefinition = {
     );
 
     return jsonResponse(
-      await restoreIngestion({
+      await restoreIngestionRecord({
         auth,
         ingestionId,
       }),
@@ -296,7 +311,7 @@ const cancelIngestionRoute: RouteDefinition = {
     );
 
     return jsonResponse(
-      await cancelIngestion({
+      await cancelIngestionRecord({
         auth,
         ingestionId,
       }),
@@ -315,7 +330,7 @@ const retryIngestionRoute: RouteDefinition = {
     );
 
     return jsonResponse(
-      await retryIngestion({
+      await retryIngestionRecord({
         auth,
         ingestionId,
       }),
@@ -332,9 +347,194 @@ const uploadBySignedUrlRoute: RouteDefinition = {
       extractPathParam(pathname, /^\/api\/uploads\/([^/]+)$/, "token"),
     );
     return jsonResponse(
-      await uploadFileBySignedToken({
+      await uploadFileBySignedTokenRecord({
         uploadToken,
         request,
+      }),
+    );
+  },
+};
+
+const createIngestionItemRoute: RouteDefinition = {
+  method: "POST",
+  path: "/api/ingestions/:id/items",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/items$/, "id"),
+    );
+    const body = parseCreateIngestionItemBody(await parseJsonBody(request));
+
+    return jsonResponse(
+      await createIngestionItemForIngestion({
+        auth,
+        ingestionId,
+        body,
+      }),
+      { status: 201 },
+    );
+  },
+};
+
+const listIngestionItemsRoute: RouteDefinition = {
+  method: "GET",
+  path: "/api/ingestions/:id/items",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["viewer", "archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/items$/, "id"),
+    );
+
+    return jsonResponse(
+      await listIngestionItemsForIngestion({
+        auth,
+        ingestionId,
+      }),
+    );
+  },
+};
+
+const reorderIngestionItemsRoute: RouteDefinition = {
+  method: "PATCH",
+  path: "/api/ingestions/:id/items/order",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/items\/order$/, "id"),
+    );
+    const body = parseReorderIngestionItemsBody(await parseJsonBody(request));
+
+    return jsonResponse(
+      await reorderIngestionItemsForIngestion({
+        auth,
+        ingestionId,
+        body,
+      }),
+    );
+  },
+};
+
+const updateIngestionItemRoute: RouteDefinition = {
+  method: "PATCH",
+  path: "/api/ingestions/:id/items/:itemId",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/items\/[^/]+$/, "id"),
+    );
+    const ingestionItemId = parseIngestionItemIdParam(
+      extractPathParam(pathname, /^\/api\/ingestions\/[^/]+\/items\/([^/]+)$/, "itemId"),
+    );
+    const body = parseUpdateIngestionItemBody(await parseJsonBody(request));
+
+    return jsonResponse(
+      await updateIngestionItemMetadata({
+        auth,
+        ingestionId,
+        ingestionItemId,
+        body,
+      }),
+    );
+  },
+};
+
+const addIngestionItemFileRoute: RouteDefinition = {
+  method: "POST",
+  path: "/api/ingestions/:id/items/:itemId/files",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/([^/]+)\/items\/[^/]+\/files$/,
+        "id",
+      ),
+    );
+    const ingestionItemId = parseIngestionItemIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/[^/]+\/items\/([^/]+)\/files$/,
+        "itemId",
+      ),
+    );
+    const body = parseAddIngestionItemFileBody(await parseJsonBody(request));
+
+    return jsonResponse(
+      await addIngestionFileToItem({
+        auth,
+        ingestionId,
+        ingestionItemId,
+        body,
+      }),
+      { status: 201 },
+    );
+  },
+};
+
+const listIngestionItemFilesRoute: RouteDefinition = {
+  method: "GET",
+  path: "/api/ingestions/:id/items/:itemId/files",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["viewer", "archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/([^/]+)\/items\/[^/]+\/files$/,
+        "id",
+      ),
+    );
+    const ingestionItemId = parseIngestionItemIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/[^/]+\/items\/([^/]+)\/files$/,
+        "itemId",
+      ),
+    );
+
+    return jsonResponse(
+      await listIngestionItemFilesForIngestionItem({
+        auth,
+        ingestionId,
+        ingestionItemId,
+      }),
+    );
+  },
+};
+
+const reorderIngestionItemFilesRoute: RouteDefinition = {
+  method: "PATCH",
+  path: "/api/ingestions/:id/items/:itemId/files/order",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/([^/]+)\/items\/[^/]+\/files\/order$/,
+        "id",
+      ),
+    );
+    const ingestionItemId = parseIngestionItemIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/[^/]+\/items\/([^/]+)\/files\/order$/,
+        "itemId",
+      ),
+    );
+    const body = parseReorderIngestionItemFilesBody(await parseJsonBody(request));
+
+    return jsonResponse(
+      await reorderFilesInIngestionItem({
+        auth,
+        ingestionId,
+        ingestionItemId,
+        body,
       }),
     );
   },
@@ -347,7 +547,14 @@ export const ingestionRoutes: RouteDefinition[] = [
   getIngestionRoute,
   updateIngestionRoute,
   deleteIngestionRoute,
+  createIngestionItemRoute,
+  listIngestionItemsRoute,
+  reorderIngestionItemsRoute,
+  updateIngestionItemRoute,
   presignFileRoute,
+  addIngestionItemFileRoute,
+  listIngestionItemFilesRoute,
+  reorderIngestionItemFilesRoute,
   removeFileRoute,
   updateFileOverridesRoute,
   commitFileRoute,

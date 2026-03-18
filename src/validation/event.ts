@@ -18,6 +18,11 @@ export const OBJECT_EVENT_TYPES = [
   "PIPELINE_STEP_STARTED",
   "PIPELINE_STEP_COMPLETED",
   "PIPELINE_STEP_FAILED",
+  "INGESTION_ITEM_CREATED",
+  "INGESTION_ITEM_UPDATED",
+  "INGESTION_ITEM_PROCESSING",
+  "INGESTION_ITEM_COMPLETED",
+  "INGESTION_ITEM_FAILED",
   "OBJECT_CREATED",
   "ARTIFACT_CREATED",
 ] as const;
@@ -25,9 +30,17 @@ export const OBJECT_EVENT_TYPES = [
 const objectEventTypeSchema = z.enum(OBJECT_EVENT_TYPES);
 
 const OBJECT_ID_REQUIRED_EVENT_TYPES = [
-  "INGESTION_COMPLETED",
+  "INGESTION_ITEM_COMPLETED",
   "OBJECT_CREATED",
   "ARTIFACT_CREATED",
+] as const;
+
+const INGESTION_ITEM_ID_REQUIRED_EVENT_TYPES = [
+  "INGESTION_ITEM_CREATED",
+  "INGESTION_ITEM_UPDATED",
+  "INGESTION_ITEM_PROCESSING",
+  "INGESTION_ITEM_COMPLETED",
+  "INGESTION_ITEM_FAILED",
 ] as const;
 
 const OBJECT_ID_PATTERN = /^OBJ-[0-9]{8}-[A-Z0-9]+$/;
@@ -38,6 +51,7 @@ const baseEventSchema = z.object({
   event_id: z.uuid(),
   timestamp: z.string().datetime({ offset: true }),
   payload: jsonObjectSchema,
+  ingestion_item_id: z.uuid().optional(),
 });
 
 const requiredObjectIdEventSchema = baseEventSchema.extend({
@@ -57,10 +71,25 @@ const optionalObjectIdEventSchema = baseEventSchema.extend({
     .optional(),
 });
 
-const incomingEventSchema = z.discriminatedUnion("event_type", [
+const incomingEventSchema = z
+  .discriminatedUnion("event_type", [
   requiredObjectIdEventSchema,
   optionalObjectIdEventSchema,
-]);
+  ])
+  .superRefine((event, context) => {
+    if (
+      INGESTION_ITEM_ID_REQUIRED_EVENT_TYPES.includes(
+        event.event_type as (typeof INGESTION_ITEM_ID_REQUIRED_EVENT_TYPES)[number],
+      ) &&
+      !event.ingestion_item_id
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "ingestion_item_id is required for ingestion item events.",
+        path: ["ingestion_item_id"],
+      });
+    }
+  });
 
 const ingestWorkerEventsSchema = z.object({
   lease_token: z.string().trim().min(1),

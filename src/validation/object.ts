@@ -11,6 +11,8 @@ export const objectIdParamSchema = z.string().regex(OBJECT_ID_PATTERN, {
     message: "object_id must match format OBJ-YYYYMMDD-XXXXXX.",
 });
 export const artifactIdParamSchema = z.uuid();
+export const objectDownloadRequestIdParamSchema = z.uuid();
+export const archiveRequestIdParamSchema = z.uuid();
 export const accessRequestIdParamSchema = z.uuid();
 export const userIdParamSchema = z.uuid();
 
@@ -22,6 +24,8 @@ export const objectListSortSchema = z.enum([
     "title_asc",
     "title_desc",
 ]);
+
+export const archiveRequestListSortSchema = z.enum(["created_at_desc"]);
 
 export const objectTypeSchema = z.enum([
     "GENERIC",
@@ -43,6 +47,8 @@ export const accessLevelSchema = z.enum(["private", "family", "public"]);
 
 export const artifactKindSchema = z.enum([
     "ingest_json",
+    "pipeline_json",
+    "catalog_json",
     "original",
     "preview",
     "ocr",
@@ -55,22 +61,27 @@ export const artifactKindSchema = z.enum([
     "other",
 ]);
 
-export const requestedArtifactKindSchema = z.enum([
-    "original",
-    "pdf",
-    "ocr_text",
-    "thumbnail",
-    "transcript",
-    "web_version",
-    "other",
-]);
-
 export const objectDownloadRequestStatusSchema = z.enum([
     "PENDING",
     "PROCESSING",
     "COMPLETED",
     "FAILED",
     "CANCELED",
+]);
+
+export const archiveRequestStatusSchema = z.enum([
+    "PENDING",
+    "PROCESSING",
+    "COMPLETED",
+    "FAILED",
+    "CANCELED",
+]);
+
+export const archiveRequestTargetTypeSchema = z.enum(["object", "ingestion"]);
+
+export const archiveRequestActionTypeSchema = z.enum([
+    "object_resync",
+    "artifact_fetch",
 ]);
 
 export const embargoKindSchema = z.enum(["none", "timed", "curation_state"]);
@@ -214,22 +225,237 @@ export const objectCursorPayloadSchema = z
         }
     });
 
+const archiveRequestCursorPayloadSchema = z.strictObject({
+    sort: archiveRequestListSortSchema,
+    created_at: z.iso.datetime({ offset: true }),
+    id: z.uuid(),
+});
+
+const archiveRequestListQuerySchema = z
+    .strictObject({
+        limit: z.coerce.number().int().min(1).max(200).default(50),
+        cursor: z.string().trim().min(1).optional(),
+        sort: archiveRequestListSortSchema.default("created_at_desc"),
+        target_type: archiveRequestTargetTypeSchema.optional(),
+        target_id: z.string().trim().min(1).optional(),
+        action_type: archiveRequestActionTypeSchema.optional(),
+        status: z.array(archiveRequestStatusSchema).optional(),
+        active_only: z.coerce.boolean().default(false),
+        include_payload: z.coerce.boolean().default(false),
+    })
+    .superRefine((value, context) => {
+        if (value.target_type === undefined && value.target_id !== undefined) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "target_type is required when target_id is provided.",
+                path: ["target_type"],
+            });
+        }
+
+        if (
+            value.target_type === "object" &&
+            value.target_id !== undefined &&
+            !OBJECT_ID_PATTERN.test(value.target_id)
+        ) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "target_id must match format OBJ-YYYYMMDD-XXXXXX for object target_type.",
+                path: ["target_id"],
+            });
+        }
+    });
+
+const archiveRequestListQueryWithCursorSchema = archiveRequestListQuerySchema.transform(
+    (data, context): ArchiveRequestListQuery => {
+        let cursor: ArchiveRequestCursorPayload | undefined;
+
+        if (data.cursor) {
+            let decoded: JsonObject;
+            try {
+                decoded = decodeCursor<JsonObject>(data.cursor);
+            } catch {
+                context.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: "Query parameter 'cursor' is invalid.",
+                    path: ["cursor"],
+                });
+                return z.NEVER;
+            }
+
+            const payload = archiveRequestCursorPayloadSchema.safeParse(decoded);
+            if (!payload.success) {
+                for (const issue of payload.error.issues) {
+                    context.addIssue({
+                        code: z.ZodIssueCode.custom,
+                        message: issue.message,
+                        path: ["cursor", ...issue.path],
+                    });
+                }
+                return z.NEVER;
+            }
+
+            if (payload.data.sort !== data.sort) {
+                context.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: "Query parameter 'cursor' is invalid.",
+                    path: ["cursor"],
+                });
+                return z.NEVER;
+            }
+
+            cursor = payload.data;
+        }
+
+        const statuses = data.active_only
+            ? (["PENDING", "PROCESSING"] as Array<
+                  z.infer<typeof archiveRequestStatusSchema>
+              >)
+            : data.status;
+
+        return {
+            limit: data.limit,
+            cursor,
+            sort: data.sort,
+            targetType: data.target_type,
+            targetId: data.target_id,
+            actionType: data.action_type,
+            statuses,
+            includePayload: data.include_payload,
+        };
+    },
+);
+
 export const patchObjectTitleBodySchema = z.strictObject({
     title: z.string().trim().min(1),
 });
 
 export const createObjectDownloadRequestBodySchema = z.strictObject({
-    artifact_kind: requestedArtifactKindSchema,
+    available_file_id: z.uuid(),
 });
 
-export const updateAccessPolicyBodySchema = z.strictObject({
-    access_level: accessLevelSchema,
-    embargo_kind: embargoKindSchema,
-    embargo_until: z.iso.datetime({ offset: true }).nullable().optional(),
-    embargo_curation_state: curationStateSchema.nullable().optional(),
-    rights_note: z.string().trim().min(1).nullable().optional(),
-    sensitivity_note: z.string().trim().min(1).nullable().optional(),
+export const createObjectResyncBodySchema = z
+    .strictObject({
+        action_payload: jsonObjectSchema.optional(),
+    })
+    .transform((value) => ({
+        action_payload: value.action_payload ?? {},
+    }));
+
+export const workerLeaseArchiveRequestBodySchema = z.strictObject({
+    action_type: archiveRequestActionTypeSchema.optional(),
 });
+
+export const workerPresignObjectArtifactUploadBodySchema = z.strictObject({
+    lease_token: z.string().trim().min(1),
+    content_type: z.string().trim().min(1),
+    size_bytes: z.number().int().min(0),
+    extension: z.string().trim().min(1),
+});
+
+export const workerCompleteObjectDownloadRequestBodySchema = z.strictObject({
+    lease_token: z.string().trim().min(1),
+    upload_token: z.string().trim().min(1),
+});
+
+const workerFailureSchema = z.strictObject({
+    code: z.string().trim().min(1),
+    message: z.string().trim().min(1),
+    retryable: z.boolean(),
+    details: jsonObjectSchema.optional(),
+});
+
+export const workerFailObjectDownloadRequestBodySchema = z.strictObject({
+    lease_token: z.string().trim().min(1),
+    failure: workerFailureSchema,
+});
+
+export const workerCompleteArchiveRequestBodySchema = z.strictObject({
+    lease_token: z.string().trim().min(1),
+});
+
+export const workerFailArchiveRequestBodySchema = z.strictObject({
+    lease_token: z.string().trim().min(1),
+    failure: workerFailureSchema,
+});
+
+const objectAvailableFileSchema = z.object({
+    id: z.string(),
+    object_id: objectIdParamSchema,
+    archive_file_key: z.string(),
+    artifact_kind: artifactKindSchema,
+    variant: z.string().nullable(),
+    display_name: z.string(),
+    content_type: z.string().nullable(),
+    size_bytes: z.number().nullable(),
+    checksum_sha256: z.string().nullable(),
+    metadata: jsonObjectSchema,
+    is_available: z.boolean(),
+    synced_at: z.string(),
+});
+
+export const listObjectAvailableFilesResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    available_files: z.array(objectAvailableFileSchema),
+});
+
+const replaceObjectAvailableFilesItemSchema = z
+    .strictObject({
+        archive_file_key: z.string().trim().min(1),
+        artifact_kind: artifactKindSchema,
+        variant: z.string().trim().min(1).nullable().optional(),
+        display_name: z.string().trim().min(1),
+        content_type: z.string().trim().min(1).nullable().optional(),
+        size_bytes: z.number().int().min(0).nullable().optional(),
+        checksum_sha256: z.string().trim().min(1).nullable().optional(),
+        metadata: jsonObjectSchema.optional(),
+        is_available: z.boolean().optional(),
+    })
+    .transform((item) => ({
+        ...item,
+        metadata: item.metadata ?? {},
+        is_available: item.is_available ?? true,
+    }));
+
+export const replaceObjectAvailableFilesBodySchema = z.strictObject({
+    files: z.array(replaceObjectAvailableFilesItemSchema),
+});
+
+export const replaceObjectAvailableFilesResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    synced_files: z.number().int().nonnegative(),
+});
+
+export const updateAccessPolicyBodySchema = z
+    .strictObject({
+        access_level: accessLevelSchema,
+        embargo_kind: embargoKindSchema,
+        embargo_until: z.iso.datetime({ offset: true }).nullable().optional(),
+        embargo_curation_state: curationStateSchema.nullable().optional(),
+        rights_note: z.string().trim().min(1).nullable().optional(),
+        sensitivity_note: z.string().trim().min(1).nullable().optional(),
+    })
+    .superRefine((value, context) => {
+        if (value.embargo_kind === "timed" && value.embargo_until == null) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message:
+                    "embargo_until is required when embargo_kind is 'timed'.",
+                path: ["embargo_until"],
+            });
+        }
+
+        if (
+            value.embargo_kind === "curation_state" &&
+            value.embargo_curation_state == null
+        ) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message:
+                    "embargo_curation_state is required when embargo_kind is 'curation_state'.",
+                path: ["embargo_curation_state"],
+            });
+        }
+    });
 
 export const createAccessRequestBodySchema = z.strictObject({
     requested_level: z.enum(["family", "private"]),
@@ -248,6 +474,7 @@ export const upsertAccessAssignmentBodySchema = z.strictObject({
 export const objectDtoSchema = z.object({
     id: z.string(),
     object_id: objectIdParamSchema,
+    thumbnail_artifact_id: z.string().nullable(),
     tenant_id: z.string(),
     type: objectTypeSchema,
     title: z.string(),
@@ -302,6 +529,7 @@ export const objectArtifactSchema = z.object({
     id: z.string(),
     object_id: objectIdParamSchema,
     kind: artifactKindSchema,
+    variant: z.string().nullable(),
     storage_key: z.string(),
     content_type: z.string(),
     size_bytes: z.number(),
@@ -311,13 +539,107 @@ export const objectArtifactSchema = z.object({
 const objectDownloadRequestSchema = z.object({
     id: z.string(),
     object_id: objectIdParamSchema,
+    available_file_id: z.uuid().nullable(),
     requested_by: z.string(),
-    artifact_kind: requestedArtifactKindSchema,
+    artifact_kind: artifactKindSchema,
+    variant: z.string().nullable(),
     status: objectDownloadRequestStatusSchema,
     failure_reason: z.string().nullable(),
+    failure_details: jsonObjectSchema.nullable(),
     created_at: z.string(),
     updated_at: z.string(),
     completed_at: z.string().nullable(),
+});
+
+const archiveRequestSchema = z.object({
+    id: z.uuid(),
+    tenant_id: z.uuid(),
+    target_type: archiveRequestTargetTypeSchema,
+    target_id: z.string().min(1),
+    action_type: archiveRequestActionTypeSchema,
+    action_payload: jsonObjectSchema,
+    requested_by: z.uuid(),
+    dedupe_key: z.string().nullable(),
+    status: archiveRequestStatusSchema,
+    failure_reason: z.string().nullable(),
+    failure_details: jsonObjectSchema.nullable(),
+    created_at: z.string(),
+    updated_at: z.string(),
+    completed_at: z.string().nullable(),
+});
+
+const archiveRequestListItemSchema = archiveRequestSchema
+    .omit({ action_payload: true })
+    .extend({
+        action_payload: jsonObjectSchema.optional(),
+    });
+
+export const listArchiveRequestsResponseSchema = z.object({
+    requests: z.array(archiveRequestListItemSchema),
+    next_cursor: z.string().nullable(),
+    filtered_count: z.number().int().nonnegative(),
+});
+
+export const requestObjectResyncResponseSchema = z.object({
+    status: z.literal("queued"),
+    object_id: objectIdParamSchema,
+    request: archiveRequestSchema.extend({
+        target_type: z.literal("object"),
+        action_type: z.literal("object_resync"),
+    }),
+});
+
+export const listObjectResyncRequestsResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    requests: z.array(
+        archiveRequestSchema.extend({
+            target_type: z.literal("object"),
+            action_type: z.literal("object_resync"),
+        }),
+    ),
+});
+
+export const workerLeaseArchiveRequestResponseSchema = z.object({
+    request: z
+        .object({
+            request_id: z.uuid(),
+            lease_id: z.uuid(),
+            lease_token: z.string(),
+            lease_expires_at: z.string(),
+            tenant_id: z.uuid(),
+            target_type: archiveRequestTargetTypeSchema,
+            target_id: z.string(),
+            action_type: archiveRequestActionTypeSchema,
+            action_payload: jsonObjectSchema,
+            requested_by: z.uuid(),
+            dedupe_key: z.string().nullable(),
+        })
+        .nullable(),
+});
+
+export const workerHeartbeatArchiveRequestResponseSchema = z.object({
+    request: z.object({
+        request_id: z.uuid(),
+        lease_id: z.uuid(),
+        lease_token: z.string(),
+        lease_expires_at: z.string(),
+    }),
+});
+
+export const workerReleaseArchiveRequestResponseSchema = z.object({
+    status: z.literal("ok"),
+    request_id: z.uuid(),
+});
+
+export const workerCompleteArchiveRequestResponseSchema = z.object({
+    status: z.literal("completed"),
+    request: archiveRequestSchema,
+});
+
+export const workerFailArchiveRequestResponseSchema = z.object({
+    status: z.literal("failed"),
+    request_id: z.uuid(),
+    retryable: z.boolean(),
 });
 
 export const createObjectDownloadRequestResponseSchema = z.discriminatedUnion(
@@ -339,6 +661,67 @@ export const createObjectDownloadRequestResponseSchema = z.discriminatedUnion(
 export const listObjectDownloadRequestsResponseSchema = z.object({
     object_id: objectIdParamSchema,
     requests: z.array(objectDownloadRequestSchema),
+});
+
+export const workerLeaseObjectDownloadRequestResponseSchema = z.object({
+    request: z
+        .object({
+            request_id: z.string(),
+            lease_id: z.string(),
+            lease_token: z.string(),
+            lease_expires_at: z.string(),
+            object_id: objectIdParamSchema,
+            tenant_id: z.string(),
+            available_file_id: z.uuid().nullable(),
+            artifact_kind: artifactKindSchema,
+            variant: z.string().nullable(),
+            available_file: objectAvailableFileSchema.nullable(),
+        })
+        .nullable(),
+});
+
+export const workerHeartbeatObjectDownloadRequestResponseSchema = z.object({
+    request: z.object({
+        request_id: z.string(),
+        lease_id: z.string(),
+        lease_token: z.string(),
+        lease_expires_at: z.string(),
+    }),
+});
+
+export const workerReleaseObjectDownloadRequestResponseSchema = z.object({
+    status: z.literal("ok"),
+    request_id: z.string(),
+});
+
+export const workerPresignObjectArtifactUploadResponseSchema = z.object({
+    upload_token: z.string(),
+    upload_url: z.string(),
+    storage_key: z.string(),
+    expires_at: z.string(),
+    headers: z.object({
+        "content-type": z.string(),
+        "content-length": z.number(),
+    }),
+});
+
+export const workerCompleteObjectDownloadRequestResponseSchema = z.object({
+    status: z.literal("completed"),
+    request_id: z.string(),
+    object_id: objectIdParamSchema,
+    artifact: objectArtifactSchema,
+});
+
+export const workerFailObjectDownloadRequestResponseSchema = z.object({
+    status: z.literal("failed"),
+    request_id: z.string(),
+    retryable: z.boolean(),
+});
+
+export const workerUploadObjectArtifactByTokenResponseSchema = z.object({
+    status: z.literal("ok"),
+    request_id: z.string(),
+    size_bytes: z.number(),
 });
 
 export const objectArtifactsResponseSchema = z.object({
@@ -444,12 +827,49 @@ export interface ObjectListQuery {
     to?: string;
     tag?: string;
 }
+export interface ArchiveRequestCursorPayload {
+    sort: z.infer<typeof archiveRequestListSortSchema>;
+    created_at: string;
+    id: string;
+}
+
+export interface ArchiveRequestListQuery {
+    limit: number;
+    cursor?: ArchiveRequestCursorPayload;
+    sort: z.infer<typeof archiveRequestListSortSchema>;
+    targetType?: z.infer<typeof archiveRequestTargetTypeSchema>;
+    targetId?: string;
+    actionType?: z.infer<typeof archiveRequestActionTypeSchema>;
+    statuses?: Array<z.infer<typeof archiveRequestStatusSchema>>;
+    includePayload: boolean;
+}
 export type ObjectCursorPayload = z.infer<typeof objectCursorPayloadSchema>;
 export type PatchObjectTitleBody = z.infer<typeof patchObjectTitleBodySchema>;
+export type WorkerPresignObjectArtifactUploadBody = z.infer<
+    typeof workerPresignObjectArtifactUploadBodySchema
+>;
+export type WorkerCompleteObjectDownloadRequestBody = z.infer<
+    typeof workerCompleteObjectDownloadRequestBodySchema
+>;
+export type WorkerFailObjectDownloadRequestBody = z.infer<
+    typeof workerFailObjectDownloadRequestBodySchema
+>;
+export type WorkerCompleteArchiveRequestBody = z.infer<
+    typeof workerCompleteArchiveRequestBodySchema
+>;
+export type WorkerFailArchiveRequestBody = z.infer<
+    typeof workerFailArchiveRequestBodySchema
+>;
 export type CreateObjectDownloadRequestBody = z.infer<
     typeof createObjectDownloadRequestBodySchema
 >;
-export type RequestedArtifactKind = z.infer<typeof requestedArtifactKindSchema>;
+export type CreateObjectResyncBody = z.infer<typeof createObjectResyncBodySchema>;
+export type WorkerLeaseArchiveRequestBody = z.infer<
+    typeof workerLeaseArchiveRequestBodySchema
+>;
+export type ReplaceObjectAvailableFilesBody = z.infer<
+    typeof replaceObjectAvailableFilesBodySchema
+>;
 export type UpdateAccessPolicyBody = z.infer<
     typeof updateAccessPolicyBodySchema
 >;
@@ -475,12 +895,64 @@ export type PatchObjectTitleResponse = z.infer<
 export type CreateObjectDownloadRequestResponse = z.infer<
     typeof createObjectDownloadRequestResponseSchema
 >;
+export type RequestObjectResyncResponse = z.infer<
+    typeof requestObjectResyncResponseSchema
+>;
+export type ListObjectResyncRequestsResponse = z.infer<
+    typeof listObjectResyncRequestsResponseSchema
+>;
+export type ListArchiveRequestsResponse = z.infer<
+    typeof listArchiveRequestsResponseSchema
+>;
 export type ObjectArtifactDto = z.infer<typeof objectArtifactSchema>;
 export type ObjectDownloadRequestDto = z.infer<
     typeof objectDownloadRequestSchema
 >;
+export type ObjectAvailableFileDto = z.infer<typeof objectAvailableFileSchema>;
+export type ListObjectAvailableFilesResponse = z.infer<
+    typeof listObjectAvailableFilesResponseSchema
+>;
+export type ReplaceObjectAvailableFilesResponse = z.infer<
+    typeof replaceObjectAvailableFilesResponseSchema
+>;
 export type ListObjectDownloadRequestsResponse = z.infer<
     typeof listObjectDownloadRequestsResponseSchema
+>;
+export type WorkerLeaseObjectDownloadRequestResponse = z.infer<
+    typeof workerLeaseObjectDownloadRequestResponseSchema
+>;
+export type WorkerHeartbeatObjectDownloadRequestResponse = z.infer<
+    typeof workerHeartbeatObjectDownloadRequestResponseSchema
+>;
+export type WorkerReleaseObjectDownloadRequestResponse = z.infer<
+    typeof workerReleaseObjectDownloadRequestResponseSchema
+>;
+export type WorkerPresignObjectArtifactUploadResponse = z.infer<
+    typeof workerPresignObjectArtifactUploadResponseSchema
+>;
+export type WorkerCompleteObjectDownloadRequestResponse = z.infer<
+    typeof workerCompleteObjectDownloadRequestResponseSchema
+>;
+export type WorkerFailObjectDownloadRequestResponse = z.infer<
+    typeof workerFailObjectDownloadRequestResponseSchema
+>;
+export type WorkerLeaseArchiveRequestResponse = z.infer<
+    typeof workerLeaseArchiveRequestResponseSchema
+>;
+export type WorkerHeartbeatArchiveRequestResponse = z.infer<
+    typeof workerHeartbeatArchiveRequestResponseSchema
+>;
+export type WorkerReleaseArchiveRequestResponse = z.infer<
+    typeof workerReleaseArchiveRequestResponseSchema
+>;
+export type WorkerCompleteArchiveRequestResponse = z.infer<
+    typeof workerCompleteArchiveRequestResponseSchema
+>;
+export type WorkerFailArchiveRequestResponse = z.infer<
+    typeof workerFailArchiveRequestResponseSchema
+>;
+export type WorkerUploadObjectArtifactByTokenResponse = z.infer<
+    typeof workerUploadObjectArtifactByTokenResponseSchema
 >;
 export type UpdateAccessPolicyResponse = z.infer<
     typeof updateAccessPolicyResponseSchema
@@ -515,6 +987,24 @@ export function parseObjectIdParam(value: string): string {
 
 export function parseArtifactIdParam(value: string): string {
     const parsed = artifactIdParamSchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseObjectDownloadRequestIdParam(value: string): string {
+    const parsed = objectDownloadRequestIdParamSchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseArchiveRequestIdParam(value: string): string {
+    const parsed = archiveRequestIdParamSchema.safeParse(value);
     if (!parsed.success) {
         throw mapZodErrorToValidation(parsed.error);
     }
@@ -577,6 +1067,32 @@ export function parseObjectListQuery(url: URL): {
     return parsed.data;
 }
 
+export function parseArchiveRequestListQuery(url: URL): ArchiveRequestListQuery {
+    const rawStatuses = url.searchParams
+        .getAll("status")
+        .flatMap((value) => value.split(","))
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+
+    const parsed = archiveRequestListQueryWithCursorSchema.safeParse({
+        limit: url.searchParams.get("limit") ?? undefined,
+        cursor: url.searchParams.get("cursor") ?? undefined,
+        sort: url.searchParams.get("sort") ?? undefined,
+        target_type: url.searchParams.get("target_type") ?? undefined,
+        target_id: url.searchParams.get("target_id") ?? undefined,
+        action_type: url.searchParams.get("action_type") ?? undefined,
+        status: rawStatuses.length > 0 ? rawStatuses : undefined,
+        active_only: url.searchParams.get("active_only") ?? undefined,
+        include_payload: url.searchParams.get("include_payload") ?? undefined,
+    });
+
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
 export function parsePatchObjectTitleBody(
     value: unknown,
 ): PatchObjectTitleBody {
@@ -592,6 +1108,94 @@ export function parseCreateObjectDownloadRequestBody(
     value: unknown,
 ): CreateObjectDownloadRequestBody {
     const parsed = createObjectDownloadRequestBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseCreateObjectResyncBody(
+    value: unknown,
+): CreateObjectResyncBody {
+    const parsed = createObjectResyncBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseWorkerLeaseArchiveRequestBody(
+    value: unknown,
+): WorkerLeaseArchiveRequestBody {
+    const parsed = workerLeaseArchiveRequestBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseWorkerPresignObjectArtifactUploadBody(
+    value: unknown,
+): WorkerPresignObjectArtifactUploadBody {
+    const parsed = workerPresignObjectArtifactUploadBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseWorkerCompleteObjectDownloadRequestBody(
+    value: unknown,
+): WorkerCompleteObjectDownloadRequestBody {
+    const parsed = workerCompleteObjectDownloadRequestBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseWorkerFailObjectDownloadRequestBody(
+    value: unknown,
+): WorkerFailObjectDownloadRequestBody {
+    const parsed = workerFailObjectDownloadRequestBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseWorkerCompleteArchiveRequestBody(
+    value: unknown,
+): WorkerCompleteArchiveRequestBody {
+    const parsed = workerCompleteArchiveRequestBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseWorkerFailArchiveRequestBody(
+    value: unknown,
+): WorkerFailArchiveRequestBody {
+    const parsed = workerFailArchiveRequestBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseReplaceObjectAvailableFilesBody(
+    value: unknown,
+): ReplaceObjectAvailableFilesBody {
+    const parsed = replaceObjectAvailableFilesBodySchema.safeParse(value);
     if (!parsed.success) {
         throw mapZodErrorToValidation(parsed.error);
     }

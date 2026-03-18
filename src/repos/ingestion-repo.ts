@@ -1,4 +1,5 @@
 import { withSchemaClient } from "../db/client.ts";
+import { toSafeNumberFromDbInt, type DbInt } from "../db/number.ts";
 import type { IngestionStatus } from "../domain/ingestions/state-machine.ts";
 import type {
   AccessLevel,
@@ -38,7 +39,7 @@ interface IngestionFileRow {
   ingestion_id: string;
   filename: string;
   content_type: string;
-  size_bytes: number;
+  size_bytes: DbInt;
   storage_key: string;
   status: IngestionFileStatus;
   checksum_sha256: string | null;
@@ -140,7 +141,7 @@ function mapIngestionFile(row: IngestionFileRow): IngestionFileRecord {
     ingestionId: row.ingestion_id,
     filename: row.filename,
     contentType: row.content_type,
-    sizeBytes: Number(row.size_bytes),
+    sizeBytes: toSafeNumberFromDbInt(row.size_bytes, "ingestion_files.size_bytes"),
     storageKey: row.storage_key,
     status: row.status,
     checksumSha256: row.checksum_sha256 ?? undefined,

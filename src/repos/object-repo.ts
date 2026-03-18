@@ -1,5 +1,6 @@
 import { withSchemaClient } from "../db/client.ts";
 import type { DbClient } from "../db/client.ts";
+import { toSafeNumberFromDbInt, type DbInt } from "../db/number.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
 
 interface ObjectRow {
@@ -11,6 +12,7 @@ interface ObjectRow {
   metadata: JsonObject;
   ingest_manifest: JsonObject | null;
   source_ingestion_id: string | null;
+  source_ingestion_item_id: string | null;
   source_batch_label: string | null;
   processing_state:
     | "queued"
@@ -50,10 +52,16 @@ interface ObjectArtifactRow {
   id: string;
   object_id: string;
   kind: ArtifactKind;
+  variant: string | null;
   storage_key: string;
   content_type: string;
-  size_bytes: number;
+  size_bytes: DbInt;
   created_at: Date;
+}
+
+interface ObjectArtifactIdByObjectRow {
+  object_id: string;
+  artifact_id: string;
 }
 
 export interface ObjectRecord {
@@ -66,6 +74,7 @@ export interface ObjectRecord {
   metadata: JsonObject;
   ingestManifest: JsonObject | null;
   sourceIngestionId?: string;
+  sourceIngestionItemId?: string;
   sourceBatchLabel?: string;
   processingState: ObjectRow["processing_state"];
   curationState: ObjectRow["curation_state"];
@@ -84,6 +93,7 @@ export interface ObjectArtifactRecord {
   id: string;
   objectId: string;
   kind: ArtifactKind;
+  variant: string | null;
   storageKey: string;
   contentType: string;
   sizeBytes: number;
@@ -92,6 +102,8 @@ export interface ObjectArtifactRecord {
 
 export type ArtifactKind =
   | "ingest_json"
+  | "pipeline_json"
+  | "catalog_json"
   | "original"
   | "preview"
   | "ocr"
@@ -219,6 +231,7 @@ function mapObject(row: ObjectRow): ObjectRecord {
     metadata: row.metadata,
     ingestManifest: row.ingest_manifest ?? null,
     sourceIngestionId: row.source_ingestion_id ?? undefined,
+    sourceIngestionItemId: row.source_ingestion_item_id ?? undefined,
     sourceBatchLabel: row.source_batch_label ?? undefined,
     processingState: row.processing_state,
     curationState: row.curation_state,
@@ -239,9 +252,10 @@ function mapArtifact(row: ObjectArtifactRow): ObjectArtifactRecord {
     id: row.id,
     objectId: row.object_id,
     kind: row.kind,
+    variant: row.variant,
     storageKey: row.storage_key,
     contentType: row.content_type,
-    sizeBytes: Number(row.size_bytes),
+    sizeBytes: toSafeNumberFromDbInt(row.size_bytes, "object_artifacts.size_bytes"),
     createdAt: new Date(row.created_at),
   };
 }
@@ -261,6 +275,7 @@ export async function findObjectBySourceIngestion(params: {
         obj.metadata,
         obj.ingest_manifest,
         obj.source_ingestion_id,
+        obj.source_ingestion_item_id,
         ing.batch_label AS source_batch_label,
         obj.availability_state,
         obj.access_level,
@@ -292,10 +307,103 @@ export async function findObjectBySourceIngestion(params: {
   return row ? mapObject(row) : undefined;
 }
 
+export async function listObjectsBySourceIngestion(params: {
+  tenantId: string;
+  ingestionId: string;
+}): Promise<ObjectRecord[]> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<ObjectRow[]>`
+      SELECT
+        obj.object_id,
+        obj.tenant_id,
+        obj.type,
+        obj.title,
+        obj.language_code,
+        obj.metadata,
+        obj.ingest_manifest,
+        obj.source_ingestion_id,
+        obj.source_ingestion_item_id,
+        ing.batch_label AS source_batch_label,
+        obj.availability_state,
+        obj.access_level,
+        obj.embargo_kind,
+        obj.processing_state,
+        obj.curation_state,
+        obj.embargo_until,
+        obj.embargo_curation_state,
+        obj.rights_note,
+        obj.sensitivity_note,
+        obj.created_at,
+        obj.updated_at,
+        COALESCE((
+          SELECT array_agg(tag.name_normalized ORDER BY tag.name_normalized)
+          FROM object_tags otag
+          INNER JOIN tags tag ON tag.id = otag.tag_id
+          WHERE otag.object_id = obj.object_id
+        ), ARRAY[]::text[]) AS tags
+      FROM objects obj
+      LEFT JOIN ingestions ing ON ing.id = obj.source_ingestion_id
+      WHERE obj.tenant_id = ${params.tenantId}
+        AND obj.source_ingestion_id = ${params.ingestionId}
+      ORDER BY obj.created_at ASC, obj.object_id ASC
+    `;
+  });
+
+  return rows.map(mapObject);
+}
+
+export async function findObjectBySourceIngestionItem(params: {
+  tenantId: string;
+  ingestionItemId: string;
+}): Promise<ObjectRecord | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<ObjectRow[]>`
+      SELECT
+        obj.object_id,
+        obj.tenant_id,
+        obj.type,
+        obj.title,
+        obj.language_code,
+        obj.metadata,
+        obj.ingest_manifest,
+        obj.source_ingestion_id,
+        obj.source_ingestion_item_id,
+        ing.batch_label AS source_batch_label,
+        obj.availability_state,
+        obj.access_level,
+        obj.embargo_kind,
+        obj.processing_state,
+        obj.curation_state,
+        obj.embargo_until,
+        obj.embargo_curation_state,
+        obj.rights_note,
+        obj.sensitivity_note,
+        obj.created_at,
+        obj.updated_at,
+        COALESCE((
+          SELECT array_agg(tag.name_normalized ORDER BY tag.name_normalized)
+          FROM object_tags otag
+          INNER JOIN tags tag ON tag.id = otag.tag_id
+          WHERE otag.object_id = obj.object_id
+        ), ARRAY[]::text[]) AS tags
+      FROM objects obj
+      LEFT JOIN ingestions ing ON ing.id = obj.source_ingestion_id
+      WHERE obj.tenant_id = ${params.tenantId}
+        AND obj.source_ingestion_item_id = ${params.ingestionItemId}
+      ORDER BY obj.created_at ASC
+      LIMIT 1
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapObject(row) : undefined;
+}
+
 export async function createObject(params: {
   objectId: string;
   tenantId: string;
   sourceIngestionId: string;
+  sourceIngestionItemId?: string;
   type?: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
   title?: string;
   languageCode?: string;
@@ -311,7 +419,8 @@ export async function createObject(params: {
         title,
         language_code,
         metadata,
-        source_ingestion_id
+        source_ingestion_id,
+        source_ingestion_item_id
       )
       VALUES (
         ${params.objectId},
@@ -320,7 +429,8 @@ export async function createObject(params: {
         ${params.title ?? ""},
         ${params.languageCode ?? null},
         ${params.metadata ?? {}},
-        ${params.sourceIngestionId}
+        ${params.sourceIngestionId},
+        ${params.sourceIngestionItemId ?? null}
       )
       RETURNING
         object_id,
@@ -331,6 +441,7 @@ export async function createObject(params: {
         metadata,
         ingest_manifest,
         source_ingestion_id,
+        source_ingestion_item_id,
         (SELECT ing.batch_label FROM ingestions ing WHERE ing.id = source_ingestion_id) AS source_batch_label,
         availability_state,
         access_level,
@@ -368,9 +479,15 @@ export async function createOrGetObjectBySourceIngestion(params: {
   objectId: string;
   tenantId: string;
   sourceIngestionId: string;
+  sourceIngestionItemId?: string;
   type?: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
   title?: string;
   languageCode?: string;
+  accessLevel?: ObjectRow["access_level"];
+  embargoKind?: ObjectRow["embargo_kind"];
+  embargoUntil?: Date;
+  rightsNote?: string;
+  sensitivityNote?: string;
   metadata?: JsonObject;
   tags?: string[];
 }): Promise<ObjectRecord> {
@@ -382,8 +499,14 @@ export async function createOrGetObjectBySourceIngestion(params: {
         type,
         title,
         language_code,
+        access_level,
+        embargo_kind,
+        embargo_until,
+        rights_note,
+        sensitivity_note,
         metadata,
-        source_ingestion_id
+        source_ingestion_id,
+        source_ingestion_item_id
       )
       VALUES (
         ${params.objectId},
@@ -391,11 +514,16 @@ export async function createOrGetObjectBySourceIngestion(params: {
         ${params.type ?? "GENERIC"},
         ${params.title ?? ""},
         ${params.languageCode ?? null},
+        ${params.accessLevel ?? "private"}::object_access_level,
+        ${params.embargoKind ?? "none"}::object_embargo_kind,
+        ${params.embargoUntil ? params.embargoUntil.toISOString() : null},
+        ${params.rightsNote ?? null},
+        ${params.sensitivityNote ?? null},
         ${params.metadata ?? {}},
-        ${params.sourceIngestionId}
+        ${params.sourceIngestionId},
+        ${params.sourceIngestionItemId ?? null}
       )
-      ON CONFLICT (source_ingestion_id)
-      WHERE source_ingestion_id IS NOT NULL
+      ON CONFLICT (object_id)
       DO NOTHING
       RETURNING
         object_id,
@@ -406,6 +534,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
         metadata,
         ingest_manifest,
         source_ingestion_id,
+        source_ingestion_item_id,
         (SELECT ing.batch_label FROM ingestions ing WHERE ing.id = source_ingestion_id) AS source_batch_label,
         availability_state,
         access_level,
@@ -444,6 +573,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
         obj.metadata,
         obj.ingest_manifest,
         obj.source_ingestion_id,
+        obj.source_ingestion_item_id,
         ing.batch_label AS source_batch_label,
         obj.availability_state,
         obj.access_level,
@@ -465,20 +595,11 @@ export async function createOrGetObjectBySourceIngestion(params: {
       FROM objects obj
       LEFT JOIN ingestions ing ON ing.id = obj.source_ingestion_id
       WHERE obj.tenant_id = ${params.tenantId}
-        AND obj.source_ingestion_id = ${params.sourceIngestionId}
+        AND obj.object_id = ${params.objectId}
       LIMIT 1
     `;
 
-    const tags = normalizeTags(params.tags ?? params.metadata?.tags);
     const existingObject = mapObject(existingRows[0]!);
-
-    if (tags.length > 0) {
-      await replaceObjectTags(sql, existingObject.objectId, tags);
-      return {
-        ...existingObject,
-        tags,
-      };
-    }
 
     return existingObject;
   });
@@ -487,6 +608,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
 export async function createObjectArtifact(params: {
   objectId: string;
   kind: ArtifactKind;
+  variant?: string | null;
   storageKey: string;
   contentType: string;
   sizeBytes: number;
@@ -497,6 +619,7 @@ export async function createObjectArtifact(params: {
         id,
         object_id,
         kind,
+        variant,
         storage_key,
         content_type,
         size_bytes
@@ -505,11 +628,12 @@ export async function createObjectArtifact(params: {
         ${crypto.randomUUID()},
         ${params.objectId},
         ${params.kind},
+        ${params.variant ?? null},
         ${params.storageKey},
         ${params.contentType},
         ${params.sizeBytes}
       )
-      RETURNING id, object_id, kind, storage_key, content_type, size_bytes, created_at
+      RETURNING id, object_id, kind, variant, storage_key, content_type, size_bytes, created_at
     `;
   });
 
@@ -519,20 +643,18 @@ export async function createObjectArtifact(params: {
 export async function findLatestArtifactByKind(params: {
   tenantId: string;
   objectId: string;
-  kinds: ArtifactKind[];
+  kind: ArtifactKind;
+  variant: string | null;
 }): Promise<ObjectArtifactRecord | undefined> {
-  if (params.kinds.length === 0) {
-    return undefined;
-  }
-
   const rows = await withSchemaClient(async (sql) => {
     return await sql<ObjectArtifactRow[]>`
-      SELECT art.id, art.object_id, art.kind, art.storage_key, art.content_type, art.size_bytes, art.created_at
+      SELECT art.id, art.object_id, art.kind, art.variant, art.storage_key, art.content_type, art.size_bytes, art.created_at
       FROM object_artifacts art
       INNER JOIN objects obj ON obj.object_id = art.object_id
       WHERE obj.tenant_id = ${params.tenantId}
         AND obj.object_id = ${params.objectId}
-        AND art.kind = ANY(${params.kinds}::artifact_kind[])
+        AND art.kind = ${params.kind}::artifact_kind
+        AND art.variant IS NOT DISTINCT FROM ${params.variant}
       ORDER BY art.created_at DESC, art.id DESC
       LIMIT 1
     `;
@@ -592,6 +714,7 @@ export async function listObjects(
           obj.metadata,
           obj.ingest_manifest,
           obj.source_ingestion_id,
+          obj.source_ingestion_item_id,
           ing.batch_label AS source_batch_label,
           obj.availability_state,
           obj.access_level,
@@ -649,6 +772,7 @@ export async function listObjects(
           obj.metadata,
           obj.ingest_manifest,
           obj.source_ingestion_id,
+          obj.source_ingestion_item_id,
           ing.batch_label AS source_batch_label,
           obj.availability_state,
           obj.access_level,
@@ -706,6 +830,7 @@ export async function listObjects(
           obj.metadata,
           obj.ingest_manifest,
           obj.source_ingestion_id,
+          obj.source_ingestion_item_id,
           ing.batch_label AS source_batch_label,
           obj.availability_state,
           obj.access_level,
@@ -763,6 +888,7 @@ export async function listObjects(
           obj.metadata,
           obj.ingest_manifest,
           obj.source_ingestion_id,
+          obj.source_ingestion_item_id,
           ing.batch_label AS source_batch_label,
           obj.availability_state,
           obj.access_level,
@@ -820,6 +946,7 @@ export async function listObjects(
           obj.metadata,
           obj.ingest_manifest,
           obj.source_ingestion_id,
+          obj.source_ingestion_item_id,
           ing.batch_label AS source_batch_label,
           obj.availability_state,
           obj.access_level,
@@ -877,6 +1004,7 @@ export async function listObjects(
           obj.metadata,
           obj.ingest_manifest,
           obj.source_ingestion_id,
+          obj.source_ingestion_item_id,
           ing.batch_label AS source_batch_label,
           obj.availability_state,
           obj.access_level,
@@ -948,6 +1076,7 @@ export async function findObjectById(params: {
         obj.metadata,
         obj.ingest_manifest,
         obj.source_ingestion_id,
+        obj.source_ingestion_item_id,
         ing.batch_label AS source_batch_label,
         obj.availability_state,
         obj.access_level,
@@ -978,6 +1107,50 @@ export async function findObjectById(params: {
   return row ? mapObject(row) : undefined;
 }
 
+export async function findObjectByIdUnscoped(params: {
+  objectId: string;
+}): Promise<ObjectRecord | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<ObjectRow[]>`
+      SELECT
+        obj.object_id,
+        obj.tenant_id,
+        obj.type,
+        obj.title,
+        obj.language_code,
+        obj.metadata,
+        obj.ingest_manifest,
+        obj.source_ingestion_id,
+        obj.source_ingestion_item_id,
+        ing.batch_label AS source_batch_label,
+        obj.availability_state,
+        obj.access_level,
+        obj.embargo_kind,
+        obj.processing_state,
+        obj.curation_state,
+        obj.embargo_until,
+        obj.embargo_curation_state,
+        obj.rights_note,
+        obj.sensitivity_note,
+        obj.created_at,
+        obj.updated_at,
+        COALESCE((
+          SELECT array_agg(tag.name_normalized ORDER BY tag.name_normalized)
+          FROM object_tags otag
+          INNER JOIN tags tag ON tag.id = otag.tag_id
+          WHERE otag.object_id = obj.object_id
+        ), ARRAY[]::text[]) AS tags
+      FROM objects obj
+      LEFT JOIN ingestions ing ON ing.id = obj.source_ingestion_id
+      WHERE obj.object_id = ${params.objectId}
+      LIMIT 1
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapObject(row) : undefined;
+}
+
 export async function updateObjectTitle(params: {
   tenantId: string;
   objectId: string;
@@ -999,6 +1172,7 @@ export async function updateObjectTitle(params: {
         metadata,
         ingest_manifest,
         source_ingestion_id,
+        source_ingestion_item_id,
         (SELECT ing.batch_label FROM ingestions ing WHERE ing.id = source_ingestion_id) AS source_batch_label,
         availability_state,
         access_level,
@@ -1045,6 +1219,7 @@ export async function updateObjectIngestManifest(params: {
         metadata,
         ingest_manifest,
         source_ingestion_id,
+        source_ingestion_item_id,
         (SELECT ing.batch_label FROM ingestions ing WHERE ing.id = source_ingestion_id) AS source_batch_label,
         availability_state,
         access_level,
@@ -1122,6 +1297,7 @@ export async function updateObjectProjectionState(params: {
         metadata,
         ingest_manifest,
         source_ingestion_id,
+        source_ingestion_item_id,
         (SELECT ing.batch_label FROM ingestions ing WHERE ing.id = source_ingestion_id) AS source_batch_label,
         availability_state,
         access_level,
@@ -1185,6 +1361,7 @@ export async function updateObjectAccessPolicy(params: {
         metadata,
         ingest_manifest,
         source_ingestion_id,
+        source_ingestion_item_id,
         (SELECT ing.batch_label FROM ingestions ing WHERE ing.id = source_ingestion_id) AS source_batch_label,
         availability_state,
         access_level,
@@ -1216,7 +1393,7 @@ export async function listArtifactsByObjectId(params: {
 }): Promise<ObjectArtifactRecord[]> {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<ObjectArtifactRow[]>`
-      SELECT art.id, art.object_id, art.kind, art.storage_key, art.content_type, art.size_bytes, art.created_at
+      SELECT art.id, art.object_id, art.kind, art.variant, art.storage_key, art.content_type, art.size_bytes, art.created_at
       FROM object_artifacts art
       INNER JOIN objects obj ON obj.object_id = art.object_id
       WHERE obj.tenant_id = ${params.tenantId}
@@ -1228,6 +1405,58 @@ export async function listArtifactsByObjectId(params: {
   return rows.map(mapArtifact);
 }
 
+export async function findPreferredThumbnailArtifactIdByObjectId(params: {
+  tenantId: string;
+  objectId: string;
+}): Promise<string | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<{ artifact_id: string }[]>`
+      SELECT art.id AS artifact_id
+      FROM object_artifacts art
+      INNER JOIN objects obj ON obj.object_id = art.object_id
+      WHERE obj.tenant_id = ${params.tenantId}
+        AND obj.object_id = ${params.objectId}
+        AND art.kind = ${"thumbnail"}::artifact_kind
+      ORDER BY
+        CASE WHEN art.variant IS NULL THEN 0 ELSE 1 END ASC,
+        art.created_at DESC,
+        art.id DESC
+      LIMIT 1
+    `;
+  });
+
+  return rows[0]?.artifact_id;
+}
+
+export async function listPreferredThumbnailArtifactIdsByObjectIds(params: {
+  tenantId: string;
+  objectIds: string[];
+}): Promise<Map<string, string>> {
+  if (params.objectIds.length === 0) {
+    return new Map();
+  }
+
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<ObjectArtifactIdByObjectRow[]>`
+      SELECT DISTINCT ON (art.object_id)
+        art.object_id,
+        art.id AS artifact_id
+      FROM object_artifacts art
+      INNER JOIN objects obj ON obj.object_id = art.object_id
+      WHERE obj.tenant_id = ${params.tenantId}
+        AND art.object_id IN ${sql(params.objectIds)}
+        AND art.kind = ${"thumbnail"}::artifact_kind
+      ORDER BY
+        art.object_id ASC,
+        CASE WHEN art.variant IS NULL THEN 0 ELSE 1 END ASC,
+        art.created_at DESC,
+        art.id DESC
+    `;
+  });
+
+  return new Map(rows.map((row) => [row.object_id, row.artifact_id]));
+}
+
 export async function findArtifactById(params: {
   tenantId: string;
   objectId: string;
@@ -1235,7 +1464,7 @@ export async function findArtifactById(params: {
 }): Promise<ObjectArtifactRecord | undefined> {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<ObjectArtifactRow[]>`
-      SELECT art.id, art.object_id, art.kind, art.storage_key, art.content_type, art.size_bytes, art.created_at
+      SELECT art.id, art.object_id, art.kind, art.variant, art.storage_key, art.content_type, art.size_bytes, art.created_at
       FROM object_artifacts art
       INNER JOIN objects obj ON obj.object_id = art.object_id
       WHERE obj.tenant_id = ${params.tenantId}
@@ -1255,7 +1484,7 @@ export async function findArtifactByStorageKey(params: {
 }): Promise<ObjectArtifactRecord | undefined> {
   const rows = await withSchemaClient(async (sql) => {
     return await sql<ObjectArtifactRow[]>`
-      SELECT id, object_id, kind, storage_key, content_type, size_bytes, created_at
+      SELECT id, object_id, kind, variant, storage_key, content_type, size_bytes, created_at
       FROM object_artifacts
       WHERE object_id = ${params.objectId}
         AND storage_key = ${params.storageKey}

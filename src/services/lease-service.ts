@@ -7,10 +7,14 @@ import {
 } from "../auth/worker-lease.ts";
 import {
   findIngestionWithCreator,
-  listIngestionFiles,
   updateIngestionStatus,
 } from "../repos/ingestion-repo.ts";
-import { findObjectBySourceIngestion } from "../repos/object-repo.ts";
+import {
+  listIngestionItems,
+  listLeasedIngestionFiles,
+  type IngestionItemRecord,
+} from "../repos/ingestion-item-repo.ts";
+import { findObjectBySourceIngestionItem } from "../repos/object-repo.ts";
 import {
   extendLease,
   leaseQueuedIngestionById,
@@ -29,15 +33,98 @@ import type {
   LeaseDto,
   ReleaseLeaseInput,
   ReleaseLeaseResponse,
-  WorkerDownloadUrl,
+  WorkerLeasedItem,
+  WorkerLeasedItemFile,
 } from "../types/lease.ts";
+import type { JsonObject } from "../validation/ingestion.ts";
 import { parseIngestionSummary } from "../validation/catalog.ts";
 
 const DEFAULT_LEASE_TTL_SECONDS = 60 * 5;
 
-function buildCatalogJson(params: {
+type CatalogDateConfidence = "low" | "medium" | "high";
+
+interface CatalogDateBlock {
+  value: string | null;
+  approximate: boolean;
+  confidence: CatalogDateConfidence;
+  note: string | null;
+}
+
+interface CatalogDates {
+  published: CatalogDateBlock;
+  created: CatalogDateBlock;
+}
+
+const DATE_VALUE_PATTERN = /^\d{4}(-\d{2})?(-\d{2})?$/;
+
+function mergeJsonObjects(base: JsonObject, patch: JsonObject): JsonObject {
+  const result: JsonObject = { ...base };
+
+  for (const [key, patchValue] of Object.entries(patch)) {
+    const baseValue = result[key];
+    if (
+      patchValue !== null &&
+      typeof patchValue === "object" &&
+      !Array.isArray(patchValue) &&
+      baseValue !== null &&
+      typeof baseValue === "object" &&
+      !Array.isArray(baseValue)
+    ) {
+      result[key] = mergeJsonObjects(baseValue as JsonObject, patchValue as JsonObject);
+      continue;
+    }
+
+    result[key] = patchValue;
+  }
+
+  return result;
+}
+
+function normalizeCatalogDateBlock(
+  candidate: unknown,
+  fallback: CatalogDateBlock,
+): CatalogDateBlock {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return fallback;
+  }
+
+  const raw = candidate as Record<string, unknown>;
+  const value = raw.value;
+  const approximate = raw.approximate;
+  const confidence = raw.confidence;
+  const note = raw.note;
+
+  return {
+    value:
+      value === null || (typeof value === "string" && DATE_VALUE_PATTERN.test(value))
+        ? value
+        : fallback.value,
+    approximate: typeof approximate === "boolean" ? approximate : fallback.approximate,
+    confidence:
+      confidence === "low" || confidence === "medium" || confidence === "high"
+        ? confidence
+        : fallback.confidence,
+    note: note === null || typeof note === "string" ? note : fallback.note,
+  };
+}
+
+function normalizeCatalogDates(candidate: unknown, fallback: CatalogDates): CatalogDates {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return fallback;
+  }
+
+  const raw = candidate as Record<string, unknown>;
+
+  return {
+    published: normalizeCatalogDateBlock(raw.published, fallback.published),
+    created: normalizeCatalogDateBlock(raw.created, fallback.created),
+  };
+}
+
+function buildItemCatalogJson(params: {
   ingestion: Awaited<ReturnType<typeof findIngestionWithCreator>>;
-  object?: Awaited<ReturnType<typeof findObjectBySourceIngestion>>;
+  item: IngestionItemRecord;
+  objectId?: string;
 }): Record<string, unknown> {
   const ingestion = params.ingestion;
   if (!ingestion) {
@@ -59,10 +146,26 @@ function buildCatalogJson(params: {
     });
   }
 
+  const itemSummary = params.item.summary as JsonObject;
+  const mergedSummary = mergeJsonObjects(summary as JsonObject, itemSummary);
+  const fallbackDates = summary.dates as CatalogDates;
+  const effectiveDates = normalizeCatalogDates(mergedSummary.dates, fallbackDates);
+
+  const baseTitle = mergedSummary.title as Record<string, unknown> | undefined;
+  const effectiveTitle =
+    params.item.title && params.item.title.trim().length > 0
+      ? {
+        ...(baseTitle ?? {}),
+        primary: params.item.title,
+      }
+      : (baseTitle ?? summary.title);
+
   const catalog: Record<string, unknown> = {
     schema_version: ingestion.schemaVersion,
-    object_id: params.object?.objectId ?? null,
-    updated_at: ingestion.updatedAt.toISOString(),
+    object_id: params.objectId ?? null,
+    ingestion_item_id: params.item.id,
+    item_index: params.item.itemIndex,
+    updated_at: params.item.updatedAt.toISOString(),
     updated_by: ingestion.createdByUsername,
     access: {
       level: ingestion.accessLevel,
@@ -70,82 +173,58 @@ function buildCatalogJson(params: {
       rights_note: ingestion.rightsNote ?? null,
       sensitivity_note: ingestion.sensitivityNote ?? null,
     },
-    title: summary.title,
+    title: effectiveTitle,
     classification: {
-      ...(summary.classification as Record<string, unknown>),
-      type: ingestion.classificationType,
-      language: ingestion.languageCode,
+      ...((mergedSummary.classification as Record<string, unknown> | undefined) ?? {}),
+      type: params.item.classificationType ?? ingestion.classificationType,
+      language: params.item.languageCode ?? ingestion.languageCode,
     },
-    dates: summary.dates,
+    dates: effectiveDates,
   };
 
-  catalog.item_kind = ingestion.itemKind;
+  catalog.item_kind = params.item.itemKind ?? ingestion.itemKind;
 
-  if (summary.processing !== undefined) {
-    catalog.processing = summary.processing;
+  if (mergedSummary.processing !== undefined) {
+    catalog.processing = mergedSummary.processing;
   }
 
-  if (summary.publication !== undefined) {
-    catalog.publication = summary.publication;
+  if (mergedSummary.publication !== undefined) {
+    catalog.publication = mergedSummary.publication;
   }
 
-  if (summary.people !== undefined) {
-    catalog.people = summary.people;
+  if (mergedSummary.people !== undefined) {
+    catalog.people = mergedSummary.people;
   }
 
-  if (summary.links !== undefined) {
-    catalog.links = summary.links;
+  if (mergedSummary.links !== undefined) {
+    catalog.links = mergedSummary.links;
   }
 
-  if (summary.notes !== undefined) {
-    catalog.notes = summary.notes;
-  }
-
-  if (params.object) {
-    const access = catalog.access as Record<string, unknown>;
-    access.level = params.object.accessLevel;
-    access.embargo_until = params.object.embargoUntil ?? null;
-    access.rights_note = params.object.rightsNote ?? null;
-    access.sensitivity_note = params.object.sensitivityNote ?? null;
-    catalog.access = access;
-
-    const title = (catalog.title ?? {}) as Record<string, unknown>;
-    if (params.object.title && params.object.title.trim().length > 0) {
-      title.primary = params.object.title;
-    }
-    catalog.title = title;
-
-    const classification = (catalog.classification ?? {}) as Record<string, unknown>;
-    if (params.object.languageCode) {
-      classification.language = params.object.languageCode;
-    }
-    if (params.object.tags.length > 0) {
-      classification.tags = params.object.tags;
-    }
-    catalog.classification = classification;
-
-    catalog.object_id = params.object.objectId;
+  if (mergedSummary.notes !== undefined) {
+    catalog.notes = mergedSummary.notes;
   }
 
   return catalog;
 }
 
-function buildDownloadUrls(params: {
+function buildLeasedItemFiles(params: {
   tenantId: string;
   ingestionId: string;
   files: Array<{
     id: string;
+    filename: string;
+    ingestionItemId?: string;
+    itemIndex?: number;
+    sortOrder?: number;
     storageKey: string;
     contentType: string;
     sizeBytes: number;
-    checksumSha256?: string;
+    checksumSha256?: string | null;
     processingOverrides: Record<string, unknown>;
-    status: string;
   }>;
   expiresAt: Date;
-}): WorkerDownloadUrl[] {
+}): WorkerLeasedItemFile[] {
   return params.files
-    .filter((file) => file.status === "UPLOADED" || file.status === "VALIDATED")
     .map((file) => {
       const token = createDownloadToken({
         ingestion_id: params.ingestionId,
@@ -159,6 +238,8 @@ function buildDownloadUrls(params: {
 
       return {
         file_id: file.id,
+        filename: file.filename,
+        sort_order: file.sortOrder ?? 0,
         storage_key: file.storageKey,
         content_type: file.contentType,
         size_bytes: file.sizeBytes,
@@ -182,10 +263,13 @@ async function buildLeasePayload(params: {
   tenantId: string;
   workerId?: string;
 }): Promise<LeaseDto> {
-  const ingestionFiles = await listIngestionFiles({
+  const allIngestionFiles = await listLeasedIngestionFiles({
     tenantId: params.tenantId,
     ingestionId: params.ingestionId,
   });
+  const ingestionFiles = allIngestionFiles.filter(
+    (file) => file.status === "UPLOADED" || file.status === "VALIDATED",
+  );
 
   const ingestion = await findIngestionWithCreator({
     tenantId: params.tenantId,
@@ -196,10 +280,51 @@ async function buildLeasePayload(params: {
     throw new NotFoundError(`Ingestion '${params.ingestionId}' was not found.`);
   }
 
-  const object = await findObjectBySourceIngestion({
+  const ingestionItems = await listIngestionItems({
     tenantId: params.tenantId,
     ingestionId: params.ingestionId,
   });
+
+  const itemsById = new Map(ingestionItems.map((item) => [item.id, item]));
+  const fileRowsByItemId = new Map<string, typeof ingestionFiles>();
+
+  for (const file of ingestionFiles) {
+    if (!file.ingestionItemId) {
+      throw new ConflictError(
+        "All committed ingestion files must be linked to ingestion items before leasing.",
+        {
+          ingestion_id: params.ingestionId,
+          file_id: file.id,
+        },
+      );
+    }
+
+    if (!file.sortOrder || file.sortOrder <= 0) {
+      throw new ConflictError(
+        "All committed ingestion files must define sort_order before leasing.",
+        {
+          ingestion_id: params.ingestionId,
+          file_id: file.id,
+        },
+      );
+    }
+
+    const item = itemsById.get(file.ingestionItemId);
+    if (!item) {
+      throw new ConflictError("File links an unknown ingestion item.", {
+        ingestion_id: params.ingestionId,
+        file_id: file.id,
+        ingestion_item_id: file.ingestionItemId,
+      });
+    }
+
+    const files = fileRowsByItemId.get(item.id);
+    if (files) {
+      files.push(file);
+    } else {
+      fileRowsByItemId.set(item.id, [file]);
+    }
+  }
 
   const leaseToken = createLeaseToken({
     lease_id: params.leaseId,
@@ -210,6 +335,36 @@ async function buildLeasePayload(params: {
     exp: params.leaseExpiresAt.toISOString(),
   });
 
+  const leasedItems: WorkerLeasedItem[] = [];
+
+  for (const item of ingestionItems) {
+    const filesForItem = fileRowsByItemId.get(item.id) ?? [];
+    if (filesForItem.length === 0) {
+      continue;
+    }
+
+    const existingObject = await findObjectBySourceIngestionItem({
+      tenantId: params.tenantId,
+      ingestionItemId: item.id,
+    });
+
+    leasedItems.push({
+      ingestion_item_id: item.id,
+      item_index: item.itemIndex,
+      catalog_json: buildItemCatalogJson({
+        ingestion,
+        item,
+        objectId: existingObject?.objectId,
+      }),
+      files: buildLeasedItemFiles({
+        tenantId: params.tenantId,
+        ingestionId: params.ingestionId,
+        files: filesForItem,
+        expiresAt: params.leaseExpiresAt,
+      }),
+    });
+  }
+
   return {
     lease_id: params.leaseId,
     lease_token: leaseToken,
@@ -217,16 +372,7 @@ async function buildLeasePayload(params: {
     ingestion_id: params.ingestionId,
     batch_label: params.batchLabel,
     tenant_id: params.tenantId,
-    download_urls: buildDownloadUrls({
-      tenantId: params.tenantId,
-      ingestionId: params.ingestionId,
-      files: ingestionFiles,
-      expiresAt: params.leaseExpiresAt,
-    }),
-    catalog_json: buildCatalogJson({
-      ingestion,
-      object,
-    }),
+    items: leasedItems,
   };
 }
 
@@ -321,16 +467,6 @@ export async function heartbeatLease(
     );
   }
 
-  const ingestionFiles = await listIngestionFiles({
-    tenantId: authorizedLease.tenantId,
-    ingestionId: authorizedLease.ingestionId,
-  });
-
-  const object = await findObjectBySourceIngestion({
-    tenantId: authorizedLease.tenantId,
-    ingestionId: authorizedLease.ingestionId,
-  });
-
   const refreshedToken = createLeaseToken({
     lease_id: updatedLease.id,
     lease_token_id: updatedLease.leaseTokenId,
@@ -348,16 +484,15 @@ export async function heartbeatLease(
       ingestion_id: authorizedLease.ingestionId,
       batch_label: ingestion.batchLabel,
       tenant_id: authorizedLease.tenantId,
-      download_urls: buildDownloadUrls({
-        tenantId: authorizedLease.tenantId,
+      items: (await buildLeasePayload({
+        leaseId: updatedLease.id,
+        leaseTokenId: updatedLease.leaseTokenId,
+        leaseExpiresAt: updatedLease.leaseExpiresAt,
         ingestionId: authorizedLease.ingestionId,
-        files: ingestionFiles,
-        expiresAt: updatedLease.leaseExpiresAt,
-      }),
-      catalog_json: buildCatalogJson({
-        ingestion,
-        object,
-      }),
+        batchLabel: ingestion.batchLabel,
+        tenantId: authorizedLease.tenantId,
+        workerId: authorizedLease.workerId,
+      })).items,
     },
   };
 }

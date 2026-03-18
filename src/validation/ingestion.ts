@@ -42,6 +42,7 @@ export const ingestionStatusSchema = z.enum([
     "QUEUED",
     "PROCESSING",
     "COMPLETED",
+    "COMPLETED_WITH_ERRORS",
     "FAILED",
     "CANCELED",
 ]);
@@ -87,6 +88,27 @@ export const ingestionFileStatusSchema = z.enum([
     "UPLOADED",
     "VALIDATED",
     "FAILED",
+]);
+
+export const ingestionItemStatusSchema = z.enum([
+    "PENDING",
+    "READY",
+    "PROCESSING",
+    "COMPLETED",
+    "FAILED",
+    "SKIPPED",
+]);
+
+export const ingestionItemFileRoleSchema = z.enum([
+    "primary",
+    "front",
+    "back",
+    "page",
+    "attachment",
+    "transcript_source",
+    "side_a",
+    "side_b",
+    "other",
 ]);
 
 const processingOverrideSchema = z.strictObject({
@@ -139,6 +161,7 @@ export const ingestionListQuerySchema = z.strictObject({
 
 export const ingestionIdParamSchema = z.uuid();
 export const ingestionFileIdParamSchema = z.uuid();
+export const ingestionItemIdParamSchema = z.uuid();
 export const uploadTokenParamSchema = z.string().trim().min(1);
 
 export const presignNewFileBodySchema = z.strictObject({
@@ -168,6 +191,81 @@ export const commitUploadedFileBodySchema = z.strictObject({
 export const updateIngestionFileOverridesBodySchema = z.strictObject({
     processing_overrides: ingestionFileProcessingOverridesSchema,
 });
+
+export const createIngestionItemBodySchema = z.strictObject({
+    item_index: z.number().int().min(1),
+    classification_type: ingestionClassificationTypeSchema.optional(),
+    item_kind: ingestItemKindSchema.optional(),
+    language_code: z.string().trim().min(1).optional(),
+    title: z.string().trim().min(1).optional(),
+    summary: jsonObjectSchema.optional(),
+});
+
+export const addIngestionItemFileBodySchema = z.strictObject({
+    ingestion_file_id: z.uuid(),
+    role: ingestionItemFileRoleSchema.optional(),
+    sort_order: z.number().int().min(1),
+    page_number: z.number().int().min(1).optional(),
+    is_primary: z.boolean().optional(),
+    logical_label: z.string().trim().min(1).optional(),
+});
+
+export const reorderIngestionItemFilesBodySchema = z.strictObject({
+    files: z.array(z.strictObject({
+        ingestion_file_id: z.uuid(),
+        sort_order: z.number().int().min(1),
+    })).min(1),
+});
+
+export const reorderIngestionItemsBodySchema = z.strictObject({
+    items: z.array(z.strictObject({
+        ingestion_item_id: z.uuid(),
+        item_index: z.number().int().min(1),
+    })).min(1),
+});
+
+const ingestionItemDateValueSchema = z
+    .string()
+    .regex(/^\d{4}(-\d{2})?(-\d{2})?$/, {
+        message: "date value must be YYYY, YYYY-MM, or YYYY-MM-DD",
+    })
+    .nullable();
+
+const ingestionItemDateConfidenceSchema = z.enum(["low", "medium", "high"]);
+
+const ingestionItemDatePatchBlockSchema = z
+    .strictObject({
+        value: ingestionItemDateValueSchema.optional(),
+        approximate: z.boolean().optional(),
+        confidence: ingestionItemDateConfidenceSchema.optional(),
+        note: z.string().nullable().optional(),
+    })
+    .refine((value) => Object.keys(value).length > 0, {
+        message: "date block patch must include at least one field",
+    });
+
+const ingestionItemDatesPatchSchema = z
+    .strictObject({
+        published: ingestionItemDatePatchBlockSchema.optional(),
+        created: ingestionItemDatePatchBlockSchema.optional(),
+    })
+    .refine((value) => value.published !== undefined || value.created !== undefined, {
+        message: "dates patch must include published or created",
+    });
+
+export const updateIngestionItemBodySchema = z
+    .strictObject({
+        classification_type: ingestionClassificationTypeSchema.optional(),
+        item_kind: ingestItemKindSchema.optional(),
+        language_code: z.string().trim().min(1).optional(),
+        title: z.string().trim().min(1).nullable().optional(),
+        description: z.string().nullable().optional(),
+        tags: z.array(z.string().trim().min(1)).optional(),
+        dates: ingestionItemDatesPatchSchema.optional(),
+    })
+    .refine((value) => Object.keys(value).length > 0, {
+        message: "At least one field must be provided.",
+    });
 
 export const ingestionDtoSchema = z.object({
     id: z.string(),
@@ -203,6 +301,35 @@ export const ingestionFileDtoSchema = z.object({
     error: jsonObjectSchema,
     created_at: z.string(),
     updated_at: z.string(),
+});
+
+export const ingestionItemDtoSchema = z.object({
+    id: z.string(),
+    ingestion_id: z.string(),
+    item_index: z.number(),
+    status: ingestionItemStatusSchema,
+    classification_type: ingestionClassificationTypeSchema.nullable(),
+    item_kind: ingestItemKindSchema.nullable(),
+    language_code: z.string().nullable(),
+    title: z.string().nullable(),
+    summary: jsonObjectSchema,
+    error_summary: jsonObjectSchema,
+    object_id: z.string().nullable(),
+    created_at: z.string(),
+    updated_at: z.string(),
+});
+
+export const ingestionItemFileDtoSchema = z.object({
+    id: z.string(),
+    ingestion_item_id: z.string(),
+    ingestion_file_id: z.string(),
+    ingestion_id: z.string(),
+    role: ingestionItemFileRoleSchema,
+    sort_order: z.number(),
+    page_number: z.number().nullable(),
+    is_primary: z.boolean(),
+    logical_label: z.string().nullable(),
+    created_at: z.string(),
 });
 
 export const ingestionListResultSchema = z.object({
@@ -275,6 +402,34 @@ export const uploadFileBySignedTokenResponseSchema = z.object({
     size_bytes: z.number(),
 });
 
+export const createIngestionItemResponseSchema = z.object({
+    item: ingestionItemDtoSchema,
+});
+
+export const listIngestionItemsResponseSchema = z.object({
+    items: z.array(ingestionItemDtoSchema),
+});
+
+export const addIngestionItemFileResponseSchema = z.object({
+    file: ingestionItemFileDtoSchema,
+});
+
+export const listIngestionItemFilesResponseSchema = z.object({
+    files: z.array(ingestionItemFileDtoSchema),
+});
+
+export const reorderIngestionItemFilesResponseSchema = z.object({
+    files: z.array(ingestionItemFileDtoSchema),
+});
+
+export const reorderIngestionItemsResponseSchema = z.object({
+    items: z.array(ingestionItemDtoSchema),
+});
+
+export const updateIngestionItemResponseSchema = z.object({
+    item: ingestionItemDtoSchema,
+});
+
 export const ingestionCapabilitiesResponseSchema = z.object({
     media_kinds: z.array(z.string()),
     extensions_by_kind: z.object({
@@ -307,6 +462,11 @@ export type CommitUploadedFileBody = z.infer<
 export type UpdateIngestionFileOverridesBody = z.infer<
     typeof updateIngestionFileOverridesBodySchema
 >;
+export type CreateIngestionItemBody = z.infer<typeof createIngestionItemBodySchema>;
+export type AddIngestionItemFileBody = z.infer<typeof addIngestionItemFileBodySchema>;
+export type ReorderIngestionItemFilesBody = z.infer<typeof reorderIngestionItemFilesBodySchema>;
+export type ReorderIngestionItemsBody = z.infer<typeof reorderIngestionItemsBodySchema>;
+export type UpdateIngestionItemBody = z.infer<typeof updateIngestionItemBodySchema>;
 export type AccessLevel = z.infer<typeof accessLevelSchema>;
 export type IngestionClassificationType = z.infer<typeof ingestionClassificationTypeSchema>;
 export type IngestItemKind = z.infer<typeof ingestItemKindSchema>;
@@ -315,6 +475,8 @@ export type IngestionPipelinePreset = z.infer<
 >;
 export type IngestionDto = z.infer<typeof ingestionDtoSchema>;
 export type IngestionFileDto = z.infer<typeof ingestionFileDtoSchema>;
+export type IngestionItemDto = z.infer<typeof ingestionItemDtoSchema>;
+export type IngestionItemFileDto = z.infer<typeof ingestionItemFileDtoSchema>;
 export type IngestionFileProcessingOverrides = z.infer<
     typeof ingestionFileProcessingOverridesSchema
 >;
@@ -356,6 +518,13 @@ export type RetryIngestionResponse = z.infer<
 export type UploadFileBySignedTokenResponse = z.infer<
     typeof uploadFileBySignedTokenResponseSchema
 >;
+export type CreateIngestionItemResponse = z.infer<typeof createIngestionItemResponseSchema>;
+export type ListIngestionItemsResponse = z.infer<typeof listIngestionItemsResponseSchema>;
+export type AddIngestionItemFileResponse = z.infer<typeof addIngestionItemFileResponseSchema>;
+export type ListIngestionItemFilesResponse = z.infer<typeof listIngestionItemFilesResponseSchema>;
+export type ReorderIngestionItemFilesResponse = z.infer<typeof reorderIngestionItemFilesResponseSchema>;
+export type ReorderIngestionItemsResponse = z.infer<typeof reorderIngestionItemsResponseSchema>;
+export type UpdateIngestionItemResponse = z.infer<typeof updateIngestionItemResponseSchema>;
 export type IngestionCapabilitiesResponse = z.infer<
     typeof ingestionCapabilitiesResponseSchema
 >;
@@ -440,6 +609,15 @@ export function parseIngestionFileIdParam(value: string): string {
     return parsed.data;
 }
 
+export function parseIngestionItemIdParam(value: string): string {
+    const parsed = ingestionItemIdParamSchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
 export function parseUploadTokenParam(value: string): string {
     const parsed = uploadTokenParamSchema.safeParse(value);
     if (!parsed.success) {
@@ -475,6 +653,51 @@ export function parseUpdateIngestionFileOverridesBody(
     value: unknown,
 ): UpdateIngestionFileOverridesBody {
     const parsed = updateIngestionFileOverridesBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseCreateIngestionItemBody(value: unknown): CreateIngestionItemBody {
+    const parsed = createIngestionItemBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseAddIngestionItemFileBody(value: unknown): AddIngestionItemFileBody {
+    const parsed = addIngestionItemFileBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseReorderIngestionItemFilesBody(value: unknown): ReorderIngestionItemFilesBody {
+    const parsed = reorderIngestionItemFilesBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseReorderIngestionItemsBody(value: unknown): ReorderIngestionItemsBody {
+    const parsed = reorderIngestionItemsBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseUpdateIngestionItemBody(value: unknown): UpdateIngestionItemBody {
+    const parsed = updateIngestionItemBodySchema.safeParse(value);
     if (!parsed.success) {
         throw mapZodErrorToValidation(parsed.error);
     }
