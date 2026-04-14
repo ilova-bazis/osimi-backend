@@ -111,6 +111,10 @@ import {
     type ResolveAccessRequestResponse,
     type ObjectArtifactDto,
     type ObjectDownloadRequestDto,
+    type ObjectViewer,
+    type ObjectViewerActiveRequest,
+    type ObjectViewerArtifactRef,
+    type ObjectViewerPayload,
     type UpdateAccessPolicyBody,
     type UpdateAccessPolicyResponse,
     type UpsertAccessAssignmentBody,
@@ -121,7 +125,22 @@ import type { JsonObject } from "../validation/ingestion.ts";
 const DEFAULT_DOWNLOAD_REQUEST_LEASE_TTL_SECONDS = 60 * 5;
 const DEFAULT_WORKER_UPLOAD_TTL_SECONDS = 60 * 15;
 const SYSTEM_DOWNLOAD_REQUEST_USER_ID = "00000000-0000-0000-0000-000000000000";
-const AUTO_REQUEST_ARTIFACT_KINDS: ArtifactKind[] = ["thumbnail", "ocr_text"];
+const AUTO_REQUEST_ARTIFACT_KINDS: ArtifactKind[] = [
+    "thumbnail",
+    "ocr_text",
+    "web_version",
+];
+
+function canAutoRequestArtifactKindForObjectType(params: {
+    artifactKind: ArtifactKind;
+    objectType: ObjectRecord["type"];
+}): boolean {
+    if (params.artifactKind !== "web_version") {
+        return true;
+    }
+
+    return params.objectType === "IMAGE";
+}
 
 interface SyncAvailableFileCandidate {
     archiveFileKey: string;
@@ -166,15 +185,23 @@ function selectAutoRequestCandidate(params: {
 async function enqueueAutoArtifactRequestsFromSnapshot(params: {
     tenantId: string;
     objectId: string;
+    objectType: ObjectRecord["type"];
     files: SyncAvailableFileCandidate[];
 }): Promise<void> {
-    const selectedCandidates = AUTO_REQUEST_ARTIFACT_KINDS.map((artifactKind) => ({
-        artifactKind,
-        candidate: selectAutoRequestCandidate({
-            files: params.files,
+    const selectedCandidates = AUTO_REQUEST_ARTIFACT_KINDS.filter((artifactKind) =>
+        canAutoRequestArtifactKindForObjectType({
             artifactKind,
+            objectType: params.objectType,
         }),
-    })).filter(
+    )
+        .map((artifactKind) => ({
+            artifactKind,
+            candidate: selectAutoRequestCandidate({
+                files: params.files,
+                artifactKind,
+            }),
+        }))
+        .filter(
         (
             item,
         ): item is {
@@ -388,6 +415,578 @@ function serializeAvailableFile(
         is_available: record.isAvailable,
         synced_at: record.syncedAt.toISOString(),
     };
+}
+
+type ViewerMediaType = NonNullable<ObjectDetailResponse["viewer"]>["media_type"];
+type ViewerSourceType = NonNullable<
+    ObjectDetailResponse["viewer"]
+>["primary_source"]["source_type"];
+
+interface ViewerSourceCandidate {
+    artifactKind: ArtifactKind;
+    sourceType: ViewerSourceType;
+}
+
+interface ViewerBuildInput {
+    objectRecord: ObjectRecord;
+    projection: ReturnType<typeof computeAccessProjection>;
+    artifacts: ObjectArtifactRecord[];
+    availableFiles: ObjectAvailableFileRecord[];
+    requests: ArchiveRequestRecord[];
+    thumbnailArtifactId?: string;
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getMetadataNumber(
+    metadata: JsonObject,
+    key: string,
+): number | null {
+    const value = metadata[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function getMetadataString(
+    metadata: JsonObject,
+    key: string,
+): string | null {
+    const value = metadata[key];
+    return typeof value === "string" ? value : null;
+}
+
+function getMetadataPages(
+    metadata: JsonObject,
+): Array<{
+    page_number: number;
+    label: string | null;
+    image_artifact_id: string | null;
+    ocr_text_artifact_id: string | null;
+}> | undefined {
+    const value = metadata.pages;
+    if (!Array.isArray(value)) {
+        return undefined;
+    }
+
+    const pages = value
+        .map((entry) => {
+            if (!isJsonObject(entry)) {
+                return undefined;
+            }
+
+            const pageNumber = entry.page_number;
+            if (typeof pageNumber !== "number" || !Number.isInteger(pageNumber) || pageNumber <= 0) {
+                return undefined;
+            }
+
+            return {
+                page_number: pageNumber,
+                label: typeof entry.label === "string" ? entry.label : null,
+                image_artifact_id:
+                    typeof entry.image_artifact_id === "string"
+                        ? entry.image_artifact_id
+                        : null,
+                ocr_text_artifact_id:
+                    typeof entry.ocr_text_artifact_id === "string"
+                        ? entry.ocr_text_artifact_id
+                        : null,
+            };
+        })
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined)
+        .sort((left, right) => left.page_number - right.page_number);
+
+    return pages.length > 0 ? pages : undefined;
+}
+
+function mapObjectTypeToViewerMediaType(
+    type: ObjectRecord["type"],
+): ViewerMediaType | undefined {
+    switch (type) {
+        case "DOCUMENT":
+            return "document";
+        case "IMAGE":
+            return "image";
+        case "AUDIO":
+            return "audio";
+        case "VIDEO":
+            return "video";
+        default:
+            return undefined;
+    }
+}
+
+function getPrimarySourceCandidates(
+    mediaType: ViewerMediaType,
+): ViewerSourceCandidate[] {
+    switch (mediaType) {
+        case "document":
+            return [
+                { artifactKind: "pdf", sourceType: "access_copy" },
+                { artifactKind: "web_version", sourceType: "access_copy" },
+                { artifactKind: "original", sourceType: "original" },
+                { artifactKind: "preview", sourceType: "preview" },
+                { artifactKind: "other", sourceType: "other" },
+            ];
+        case "image":
+            return [
+                { artifactKind: "web_version", sourceType: "access_copy" },
+                { artifactKind: "preview", sourceType: "preview" },
+                { artifactKind: "original", sourceType: "original" },
+                { artifactKind: "other", sourceType: "other" },
+            ];
+        case "audio":
+            return [
+                { artifactKind: "web_version", sourceType: "stream" },
+                { artifactKind: "original", sourceType: "original" },
+                { artifactKind: "other", sourceType: "other" },
+            ];
+        case "video":
+            return [
+                { artifactKind: "web_version", sourceType: "stream" },
+                { artifactKind: "original", sourceType: "original" },
+                { artifactKind: "preview", sourceType: "preview" },
+                { artifactKind: "other", sourceType: "other" },
+            ];
+    }
+}
+
+function compareArtifacts(
+    left: Pick<ObjectArtifactRecord, "variant" | "createdAt" | "id">,
+    right: Pick<ObjectArtifactRecord, "variant" | "createdAt" | "id">,
+): number {
+    if (left.variant === null && right.variant !== null) {
+        return -1;
+    }
+
+    if (left.variant !== null && right.variant === null) {
+        return 1;
+    }
+
+    const createdAtOrder = right.createdAt.getTime() - left.createdAt.getTime();
+    if (createdAtOrder !== 0) {
+        return createdAtOrder;
+    }
+
+    return right.id.localeCompare(left.id);
+}
+
+function compareAvailableFiles(
+    left: Pick<ObjectAvailableFileRecord, "variant" | "archiveFileKey">,
+    right: Pick<ObjectAvailableFileRecord, "variant" | "archiveFileKey">,
+): number {
+    if (left.variant === null && right.variant !== null) {
+        return -1;
+    }
+
+    if (left.variant !== null && right.variant === null) {
+        return 1;
+    }
+
+    return left.archiveFileKey.localeCompare(right.archiveFileKey);
+}
+
+function isBrowserViewableArtifact(record: {
+    contentType: string;
+}): boolean {
+    const contentType = record.contentType.toLowerCase();
+    return (
+        contentType === "application/pdf" ||
+        contentType === "text/html" ||
+        contentType === "text/plain" ||
+        contentType.startsWith("image/") ||
+        contentType.startsWith("audio/") ||
+        contentType.startsWith("video/")
+    );
+}
+
+function isPrimaryArtifactViewable(
+    mediaType: ViewerMediaType,
+    artifact: ObjectArtifactRecord,
+): boolean {
+    if (!isBrowserViewableArtifact(artifact)) {
+        return false;
+    }
+
+    const contentType = artifact.contentType.toLowerCase();
+    switch (mediaType) {
+        case "document":
+            return (
+                contentType === "application/pdf" ||
+                contentType === "text/html" ||
+                contentType === "text/plain" ||
+                contentType.startsWith("image/")
+            );
+        case "image":
+            return contentType.startsWith("image/");
+        case "audio":
+            return contentType.startsWith("audio/");
+        case "video":
+            return contentType.startsWith("video/");
+    }
+}
+
+function findBestArtifactByKind(
+    artifacts: ObjectArtifactRecord[],
+    artifactKind: ArtifactKind,
+): ObjectArtifactRecord | undefined {
+    return artifacts
+        .filter((artifact) => artifact.kind === artifactKind)
+        .slice()
+        .sort(compareArtifacts)[0];
+}
+
+function findMatchingAvailableFile(
+    availableFiles: ObjectAvailableFileRecord[],
+    artifactKind: ArtifactKind,
+    variant: string | null,
+): ObjectAvailableFileRecord | undefined {
+    return availableFiles.find(
+        (file) =>
+            file.artifactKind === artifactKind &&
+            file.variant === variant,
+    );
+}
+
+function findBestAvailableFileByKind(
+    availableFiles: ObjectAvailableFileRecord[],
+    artifactKind: ArtifactKind,
+): ObjectAvailableFileRecord | undefined {
+    return availableFiles
+        .filter((file) => file.artifactKind === artifactKind)
+        .slice()
+        .sort(compareAvailableFiles)[0];
+}
+
+function serializeViewerArtifactRef(
+    artifact: ObjectArtifactRecord,
+    displayName: string | null,
+    metadata: JsonObject = {},
+): ObjectViewerArtifactRef {
+    return {
+        available: true,
+        artifact_id: artifact.id,
+        content_type: artifact.contentType,
+        display_name: displayName,
+        metadata,
+    };
+}
+
+function findRelevantActiveRequest(
+    requests: ArchiveRequestRecord[],
+    objectId: string,
+    artifactKind: ArtifactKind,
+    variant: string | null,
+): ObjectViewerActiveRequest | null {
+    const dedupeKey = artifactFetchDedupeKey({
+        objectId,
+        artifactKind,
+        variant,
+    });
+    const request = requests.find(
+        (record) =>
+            record.actionType === "artifact_fetch" &&
+            record.status !== "COMPLETED" &&
+            record.status !== "FAILED" &&
+            record.status !== "CANCELED" &&
+            record.dedupeKey === dedupeKey,
+    );
+
+    if (!request) {
+        return null;
+    }
+
+    return {
+        id: request.id,
+        action_type: "artifact_fetch",
+        status: request.status === "PROCESSING" ? "PROCESSING" : "PENDING",
+        created_at: request.createdAt.toISOString(),
+        updated_at: request.updatedAt.toISOString(),
+    };
+}
+
+function buildViewerPayload(params: {
+    mediaType: ViewerMediaType;
+    primaryArtifact: ObjectArtifactRecord | undefined;
+    primaryAvailableFile: ObjectAvailableFileRecord | undefined;
+    ocrArtifact: ObjectArtifactRecord | undefined;
+    transcriptArtifact: ObjectArtifactRecord | undefined;
+    posterArtifact: ObjectArtifactRecord | undefined;
+}): ObjectViewerPayload {
+    const metadata = params.primaryAvailableFile?.metadata ?? {};
+    switch (params.mediaType) {
+        case "document": {
+            const pageCount =
+                getMetadataNumber(metadata, "page_count") ??
+                getMetadataNumber(metadata, "pageCount");
+            const pages = getMetadataPages(metadata);
+            return {
+                kind: "document",
+                artifact_id: params.primaryArtifact?.id ?? null,
+                content_type: params.primaryArtifact?.contentType ?? null,
+                ocr_text_artifact_id: params.ocrArtifact?.id ?? null,
+                page_count: pageCount,
+                ...(pages ? { pages } : {}),
+            };
+        }
+        case "image":
+            return {
+                kind: "image",
+                artifact_id: params.primaryArtifact?.id ?? null,
+                content_type: params.primaryArtifact?.contentType ?? null,
+                width:
+                    getMetadataNumber(metadata, "width") ??
+                    getMetadataNumber(metadata, "pixel_width"),
+                height:
+                    getMetadataNumber(metadata, "height") ??
+                    getMetadataNumber(metadata, "pixel_height"),
+            };
+        case "audio":
+            return {
+                kind: "audio",
+                artifact_id: params.primaryArtifact?.id ?? null,
+                content_type: params.primaryArtifact?.contentType ?? null,
+                transcript_artifact_id: params.transcriptArtifact?.id ?? null,
+                duration_seconds:
+                    getMetadataNumber(metadata, "duration_seconds") ??
+                    getMetadataNumber(metadata, "duration"),
+            };
+        case "video":
+            return {
+                kind: "video",
+                artifact_id: params.primaryArtifact?.id ?? null,
+                content_type: params.primaryArtifact?.contentType ?? null,
+                poster_artifact_id: params.posterArtifact?.id ?? null,
+                transcript_artifact_id: params.transcriptArtifact?.id ?? null,
+                captions_artifact_id: null,
+                duration_seconds:
+                    getMetadataNumber(metadata, "duration_seconds") ??
+                    getMetadataNumber(metadata, "duration"),
+            };
+    }
+}
+
+function buildObjectViewer(params: ViewerBuildInput): ObjectViewer | null {
+    const mediaType = mapObjectTypeToViewerMediaType(params.objectRecord.type);
+    if (!mediaType) {
+        return null;
+    }
+
+    const sourceCandidates = getPrimarySourceCandidates(mediaType);
+    const fallbackCandidate = sourceCandidates[0];
+    if (!fallbackCandidate) {
+        return null;
+    }
+
+    const ocrArtifact = findBestArtifactByKind(params.artifacts, "ocr_text");
+    const transcriptArtifact = findBestArtifactByKind(
+        params.artifacts,
+        "transcript",
+    );
+    const thumbnailArtifact = params.thumbnailArtifactId
+        ? params.artifacts.find((artifact) => artifact.id === params.thumbnailArtifactId)
+        : findBestArtifactByKind(params.artifacts, "thumbnail");
+    const posterArtifact = findBestArtifactByKind(params.artifacts, "preview");
+
+    const selectedCandidate = sourceCandidates.find((candidate) => {
+        const artifact = findBestArtifactByKind(params.artifacts, candidate.artifactKind);
+        if (artifact && isPrimaryArtifactViewable(mediaType, artifact)) {
+            return true;
+        }
+
+        return Boolean(
+            findBestAvailableFileByKind(params.availableFiles, candidate.artifactKind),
+        );
+    }) ?? fallbackCandidate;
+
+    const primaryArtifact = findBestArtifactByKind(
+        params.artifacts,
+        selectedCandidate.artifactKind,
+    );
+    const usablePrimaryArtifact =
+        primaryArtifact && isPrimaryArtifactViewable(mediaType, primaryArtifact)
+            ? primaryArtifact
+            : undefined;
+    const primaryAvailableFile = usablePrimaryArtifact
+        ? findMatchingAvailableFile(
+              params.availableFiles,
+              usablePrimaryArtifact.kind,
+              usablePrimaryArtifact.variant,
+          )
+        : findBestAvailableFileByKind(
+              params.availableFiles,
+              selectedCandidate.artifactKind,
+          );
+    const primaryRequest = findRelevantActiveRequest(
+        params.requests,
+        params.objectRecord.objectId,
+        selectedCandidate.artifactKind,
+        primaryAvailableFile?.variant ?? usablePrimaryArtifact?.variant ?? null,
+    );
+
+    let status: ObjectViewer["primary_source"]["status"];
+    if (!params.projection.isAuthorized) {
+        status = "restricted";
+    } else if (usablePrimaryArtifact) {
+        status = "available";
+    } else if (primaryRequest) {
+        status = "request_pending";
+    } else if (primaryAvailableFile) {
+        status = "request_required";
+    } else if (!params.projection.isDeliverable) {
+        status = "temporarily_unavailable";
+    } else {
+        status = "temporarily_unavailable";
+    }
+
+    const previewThumbnail = thumbnailArtifact && isBrowserViewableArtifact(thumbnailArtifact)
+        ? serializeViewerArtifactRef(thumbnailArtifact, "Thumbnail")
+        : null;
+    const previewPoster =
+        mediaType === "video" && posterArtifact && isBrowserViewableArtifact(posterArtifact)
+            ? serializeViewerArtifactRef(posterArtifact, "Poster")
+            : null;
+    const previewOcr = ocrArtifact
+        ? serializeViewerArtifactRef(ocrArtifact, "OCR Text", {
+              ...(primaryAvailableFile?.metadata.page_count !== undefined
+                  ? { page_count: primaryAvailableFile.metadata.page_count }
+                  : {}),
+          })
+        : null;
+    const previewTranscript = transcriptArtifact
+        ? serializeViewerArtifactRef(transcriptArtifact, "Transcript")
+        : null;
+
+    return {
+        media_type: mediaType,
+        primary_source: {
+            source_type: selectedCandidate.sourceType,
+            artifact_kind: selectedCandidate.artifactKind,
+            variant: usablePrimaryArtifact?.variant ?? primaryAvailableFile?.variant ?? null,
+            status,
+            available_file_id: primaryAvailableFile?.id ?? null,
+            artifact_id: usablePrimaryArtifact?.id ?? null,
+            display_name: primaryAvailableFile?.displayName ?? null,
+            content_type:
+                usablePrimaryArtifact?.contentType ?? primaryAvailableFile?.contentType ?? null,
+            size_bytes: usablePrimaryArtifact?.sizeBytes ?? primaryAvailableFile?.sizeBytes ?? null,
+            access_reason_code:
+                status === "available"
+                    ? "OK"
+                    : status === "request_required"
+                      ? "RESTORE_REQUIRED"
+                      : status === "request_pending"
+                        ? "RESTORE_IN_PROGRESS"
+                        : params.projection.accessReasonCode,
+        },
+        active_request: primaryRequest,
+        preview_artifacts: {
+            thumbnail: previewThumbnail,
+            poster: previewPoster,
+            ocr_text: previewOcr,
+            transcript: previewTranscript,
+            captions: null,
+        },
+        viewer_payload: buildViewerPayload({
+            mediaType,
+            primaryArtifact: usablePrimaryArtifact,
+            primaryAvailableFile,
+            ocrArtifact,
+            transcriptArtifact,
+            posterArtifact,
+        }),
+    };
+}
+
+function getViewableArtifactIds(viewer: ObjectViewer | null): Set<string> {
+    const ids = new Set<string>();
+
+    if (!viewer) {
+        return ids;
+    }
+
+    if (
+        viewer.primary_source.status === "available" &&
+        viewer.primary_source.artifact_id
+    ) {
+        ids.add(viewer.primary_source.artifact_id);
+    }
+
+    for (const artifact of Object.values(viewer.preview_artifacts)) {
+        if (artifact?.artifact_id) {
+            ids.add(artifact.artifact_id);
+        }
+    }
+
+    switch (viewer.viewer_payload.kind) {
+        case "document":
+            if (viewer.viewer_payload.artifact_id) {
+                ids.add(viewer.viewer_payload.artifact_id);
+            }
+            if (viewer.viewer_payload.ocr_text_artifact_id) {
+                ids.add(viewer.viewer_payload.ocr_text_artifact_id);
+            }
+            for (const page of viewer.viewer_payload.pages ?? []) {
+                if (page.image_artifact_id) {
+                    ids.add(page.image_artifact_id);
+                }
+                if (page.ocr_text_artifact_id) {
+                    ids.add(page.ocr_text_artifact_id);
+                }
+            }
+            break;
+        case "image":
+        case "audio":
+            if (viewer.viewer_payload.artifact_id) {
+                ids.add(viewer.viewer_payload.artifact_id);
+            }
+            break;
+        case "video":
+            if (viewer.viewer_payload.artifact_id) {
+                ids.add(viewer.viewer_payload.artifact_id);
+            }
+            if (viewer.viewer_payload.poster_artifact_id) {
+                ids.add(viewer.viewer_payload.poster_artifact_id);
+            }
+            if (viewer.viewer_payload.transcript_artifact_id) {
+                ids.add(viewer.viewer_payload.transcript_artifact_id);
+            }
+            break;
+    }
+
+    return ids;
+}
+
+async function buildViewerForObject(params: {
+    auth: AuthenticatedContext;
+    objectRecord: ObjectRecord;
+    projection: ReturnType<typeof computeAccessProjection>;
+    thumbnailArtifactId?: string;
+}): Promise<ObjectViewer | null> {
+    const [artifacts, availableFiles, requests] = await Promise.all([
+        listArtifactsByObjectId({
+            tenantId: params.auth.tenantId,
+            objectId: params.objectRecord.objectId,
+        }),
+        listAvailableFilesByObjectId({
+            tenantId: params.auth.tenantId,
+            objectId: params.objectRecord.objectId,
+        }),
+        listArchiveRequestsByTarget({
+            tenantId: params.auth.tenantId,
+            targetType: "object",
+            targetId: params.objectRecord.objectId,
+        }),
+    ]);
+
+    return buildObjectViewer({
+        objectRecord: params.objectRecord,
+        projection: params.projection,
+        artifacts,
+        availableFiles,
+        requests,
+        thumbnailArtifactId: params.thumbnailArtifactId,
+    });
 }
 
 
@@ -951,6 +1550,7 @@ export async function replaceObjectAvailableFilesSnapshot(params: {
     await enqueueAutoArtifactRequestsFromSnapshot({
         tenantId: object.tenantId,
         objectId: params.objectId,
+        objectType: object.type,
         files,
     });
 
@@ -1498,6 +2098,12 @@ export async function getObjectDetail(params: {
         tenantId: params.auth.tenantId,
         objectId: params.objectId,
     });
+    const viewer = await buildViewerForObject({
+        auth: params.auth,
+        objectRecord,
+        projection,
+        thumbnailArtifactId,
+    });
 
     return {
         object: {
@@ -1508,6 +2114,7 @@ export async function getObjectDetail(params: {
             can_download: projection.canDownload,
             access_reason_code: projection.accessReasonCode,
         },
+        viewer,
     };
 }
 
@@ -1561,6 +2168,94 @@ export async function listObjectArtifactsForTenant(params: {
         object_id: params.objectId,
         artifacts: artifacts.map(serializeArtifact),
     };
+}
+
+export async function viewObjectArtifactForTenant(params: {
+    auth: AuthenticatedContext;
+    objectId: string;
+    artifactId: string;
+}): Promise<Response> {
+    const objectRecord = await findObjectById({
+        tenantId: params.auth.tenantId,
+        objectId: params.objectId,
+    });
+
+    if (!objectRecord) {
+        throw new NotFoundError(`Object '${params.objectId}' was not found.`);
+    }
+
+    const assignment = await findObjectAccessAssignmentForUser({
+        tenantId: params.auth.tenantId,
+        objectId: params.objectId,
+        userId: params.auth.userId,
+    });
+
+    const projection = computeAccessProjection(objectRecord, {
+        role: params.auth.role,
+        assignmentLevel: assignment?.grantedLevel,
+    });
+
+    if (!projection.isAuthorized) {
+        throw new ValidationError(
+            "Object artifact is not viewable in the current access state.",
+            {
+                access_reason_code: projection.accessReasonCode,
+            },
+        );
+    }
+
+    const artifact = await findArtifactById({
+        tenantId: params.auth.tenantId,
+        objectId: params.objectId,
+        artifactId: params.artifactId,
+    });
+
+    if (!artifact) {
+        throw new NotFoundError(
+            `Artifact '${params.artifactId}' was not found for object '${params.objectId}'.`,
+        );
+    }
+
+    const thumbnailArtifactId = await findPreferredThumbnailArtifactIdByObjectId({
+        tenantId: params.auth.tenantId,
+        objectId: params.objectId,
+    });
+    const viewer = await buildViewerForObject({
+        auth: params.auth,
+        objectRecord,
+        projection,
+        thumbnailArtifactId,
+    });
+    const viewableArtifactIds = getViewableArtifactIds(viewer);
+    if (!viewableArtifactIds.has(params.artifactId)) {
+        throw new ConflictError(
+            `Artifact '${params.artifactId}' is not viewable for object '${params.objectId}'.`,
+        );
+    }
+
+    if (!isBrowserViewableArtifact(artifact)) {
+        throw new ConflictError(
+            `Artifact '${params.artifactId}' is not browser-viewable.`,
+        );
+    }
+
+    const filePath = resolveStagingPath(artifact.storageKey);
+    const file = Bun.file(filePath);
+
+    if (!(await file.exists())) {
+        throw new NotFoundError(
+            `Artifact '${params.artifactId}' storage file was not found.`,
+        );
+    }
+
+    return new Response(file, {
+        status: 200,
+        headers: {
+            "content-type": artifact.contentType,
+            "content-length": String(artifact.sizeBytes),
+            "content-disposition": `inline; filename=artifact-${artifact.id}`,
+        },
+    });
 }
 
 export async function downloadObjectArtifactForTenant(params: {

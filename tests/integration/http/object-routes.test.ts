@@ -523,6 +523,309 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
         expect(notFoundResponse.status).toBe(404);
     });
 
+    test("returns viewer contract and serves inline view artifacts", async () => {
+        const app = createTestApp();
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        const objectId = "OBJ-20260210-VIEW01";
+        const pdfArtifactId = "60000000-0000-4000-8000-000000000410";
+        const thumbnailArtifactId = "60000000-0000-4000-8000-000000000411";
+        const ocrArtifactId = "60000000-0000-4000-8000-000000000412";
+        const availableFileId = "70000000-0000-4000-8000-000000000410";
+        const pdfStorageKey = `tenants/${tenantOneId}/objects/${objectId}/artifacts/viewer.pdf`;
+        const thumbStorageKey = `tenants/${tenantOneId}/objects/${objectId}/artifacts/thumb.jpg`;
+        const ocrStorageKey = `tenants/${tenantOneId}/objects/${objectId}/artifacts/ocr.txt`;
+
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+        INSERT INTO objects (
+          object_id,
+          tenant_id,
+          type,
+          title,
+          metadata,
+          ingest_manifest,
+          availability_state,
+          access_level,
+          language_code
+        )
+        VALUES (
+          ${objectId},
+          ${tenantOneId},
+          ${"DOCUMENT"}::object_type,
+          ${"Viewer Ready Document"},
+          ${{ source: "archive-system" }},
+          NULL,
+          ${"AVAILABLE"}::object_availability_state,
+          ${"public"}::object_access_level,
+          ${"en"}
+        )
+      `;
+
+            await sql`
+        INSERT INTO object_artifacts (id, object_id, kind, variant, storage_key, content_type, size_bytes)
+        VALUES
+          (
+            ${pdfArtifactId},
+            ${objectId},
+            ${"pdf"}::artifact_kind,
+            NULL,
+            ${pdfStorageKey},
+            ${"application/pdf"},
+            ${12}
+          ),
+          (
+            ${thumbnailArtifactId},
+            ${objectId},
+            ${"thumbnail"}::artifact_kind,
+            NULL,
+            ${thumbStorageKey},
+            ${"image/jpeg"},
+            ${9}
+          ),
+          (
+            ${ocrArtifactId},
+            ${objectId},
+            ${"ocr_text"}::artifact_kind,
+            NULL,
+            ${ocrStorageKey},
+            ${"text/plain"},
+            ${14}
+          )
+      `;
+
+            await sql`
+        INSERT INTO object_available_files (
+          id,
+          object_id,
+          tenant_id,
+          archive_file_key,
+          artifact_kind,
+          variant,
+          display_name,
+          content_type,
+          size_bytes,
+          metadata,
+          is_available
+        )
+        VALUES (
+          ${availableFileId},
+          ${objectId},
+          ${tenantOneId},
+          ${"archive-pdf-viewer"},
+          ${"pdf"}::artifact_kind,
+          NULL,
+          ${"Reading PDF"},
+          ${"application/pdf"},
+          ${12},
+          ${{
+              page_count: 2,
+              pages: [
+                  {
+                      page_number: 1,
+                      label: "1",
+                      image_artifact_id: null,
+                      ocr_text_artifact_id: null,
+                  },
+                  {
+                      page_number: 2,
+                      label: "2",
+                      image_artifact_id: null,
+                      ocr_text_artifact_id: null,
+                  },
+              ],
+          }},
+          true
+        )
+      `;
+        } finally {
+            await sql.close();
+        }
+
+        await mkdir(dirname(join(stagingRoot, pdfStorageKey)), { recursive: true });
+        await Bun.write(join(stagingRoot, pdfStorageKey), "pdf-content\n");
+        await Bun.write(join(stagingRoot, thumbStorageKey), "thumb-jpg\n");
+        await Bun.write(join(stagingRoot, ocrStorageKey), "ocr-content\n");
+
+        const detailResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${objectId}`, {
+                method: "GET",
+                headers: {
+                    authorization: `Bearer ${viewerToken}`,
+                },
+            }),
+        );
+
+        expect(detailResponse.status).toBe(200);
+        const detailBody = (await detailResponse.json()) as {
+            viewer: {
+                media_type: string;
+                primary_source: {
+                    source_type: string;
+                    artifact_kind: string;
+                    status: string;
+                    artifact_id: string | null;
+                    available_file_id: string | null;
+                };
+                preview_artifacts: {
+                    thumbnail: { artifact_id: string } | null;
+                    ocr_text: { artifact_id: string } | null;
+                };
+                viewer_payload: {
+                    kind: string;
+                    artifact_id: string | null;
+                    page_count: number | null;
+                    pages?: Array<{ page_number: number; label: string | null }>;
+                };
+            } | null;
+        };
+
+        expect(detailBody.viewer?.media_type).toBe("document");
+        expect(detailBody.viewer?.primary_source.source_type).toBe("access_copy");
+        expect(detailBody.viewer?.primary_source.artifact_kind).toBe("pdf");
+        expect(detailBody.viewer?.primary_source.status).toBe("available");
+        expect(detailBody.viewer?.primary_source.artifact_id).toBe(pdfArtifactId);
+        expect(detailBody.viewer?.primary_source.available_file_id).toBe(
+            availableFileId,
+        );
+        expect(detailBody.viewer?.preview_artifacts.thumbnail?.artifact_id).toBe(
+            thumbnailArtifactId,
+        );
+        expect(detailBody.viewer?.preview_artifacts.ocr_text?.artifact_id).toBe(
+            ocrArtifactId,
+        );
+        expect(detailBody.viewer?.viewer_payload.kind).toBe("document");
+        expect(detailBody.viewer?.viewer_payload.artifact_id).toBe(pdfArtifactId);
+        expect(detailBody.viewer?.viewer_payload.page_count).toBe(2);
+        expect(detailBody.viewer?.viewer_payload.pages?.map((page) => page.page_number)).toEqual([
+            1,
+            2,
+        ]);
+
+        const viewResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${objectId}/artifacts/${pdfArtifactId}/view`,
+                {
+                    method: "GET",
+                    headers: {
+                        authorization: `Bearer ${viewerToken}`,
+                    },
+                },
+            ),
+        );
+
+        expect(viewResponse.status).toBe(200);
+        expect(viewResponse.headers.get("content-type")).toBe("application/pdf");
+        expect(viewResponse.headers.get("content-disposition")).toContain("inline");
+        expect(await viewResponse.text()).toBe("pdf-content\n");
+    });
+
+    test("returns request-required viewer state and rejects non-viewable artifacts", async () => {
+        const app = createTestApp();
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        const objectId = "OBJ-20260210-VIEW02";
+        const availableFileId = "70000000-0000-4000-8000-000000000420";
+
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+        INSERT INTO objects (
+          object_id,
+          tenant_id,
+          type,
+          title,
+          metadata,
+          ingest_manifest,
+          availability_state,
+          access_level
+        )
+        VALUES (
+          ${objectId},
+          ${tenantOneId},
+          ${"DOCUMENT"}::object_type,
+          ${"Archived Viewer Document"},
+          ${{ source: "archive-system" }},
+          NULL,
+          ${"ARCHIVED"}::object_availability_state,
+          ${"public"}::object_access_level
+        )
+      `;
+
+            await sql`
+        INSERT INTO object_available_files (
+          id,
+          object_id,
+          tenant_id,
+          archive_file_key,
+          artifact_kind,
+          variant,
+          display_name,
+          content_type,
+          size_bytes,
+          metadata,
+          is_available
+        )
+        VALUES (
+          ${availableFileId},
+          ${objectId},
+          ${tenantOneId},
+          ${"archive-pdf-requestable"},
+          ${"pdf"}::artifact_kind,
+          NULL,
+          ${"Requestable PDF"},
+          ${"application/pdf"},
+          ${64},
+          ${{ page_count: 4 }},
+          true
+        )
+      `;
+        } finally {
+            await sql.close();
+        }
+
+        const detailResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${objectId}`, {
+                method: "GET",
+                headers: {
+                    authorization: `Bearer ${viewerToken}`,
+                },
+            }),
+        );
+
+        expect(detailResponse.status).toBe(200);
+        const detailBody = (await detailResponse.json()) as {
+            viewer: {
+                primary_source: {
+                    status: string;
+                    artifact_id: string | null;
+                    available_file_id: string | null;
+                };
+                active_request: unknown;
+            } | null;
+        };
+
+        expect(detailBody.viewer?.primary_source.status).toBe("request_required");
+        expect(detailBody.viewer?.primary_source.artifact_id).toBeNull();
+        expect(detailBody.viewer?.primary_source.available_file_id).toBe(
+            availableFileId,
+        );
+        expect(detailBody.viewer?.active_request).toBeNull();
+
+        const rejectedViewResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/artifacts/${artifactId}/view`,
+                {
+                    method: "GET",
+                    headers: {
+                        authorization: `Bearer ${adminToken}`,
+                    },
+                },
+            ),
+        );
+
+        expect(rejectedViewResponse.status).toBe(409);
+    });
+
     test("includes preferred thumbnail_artifact_id in list and detail", async () => {
         const app = createTestApp();
         const sql = createSqlClient(TEST_DATABASE_URL!);
@@ -1233,6 +1536,191 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
         expect(fileKeyById.get(ocrRequests[0]?.available_file_id ?? "")).toBe(
             "archive-ocr-primary",
         );
+    });
+
+    test("auto-queues web_version for image objects", async () => {
+        const app = createTestApp();
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        const objectId = "OBJ-20260305-WEBIM1";
+
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+        INSERT INTO objects (
+          object_id,
+          tenant_id,
+          type,
+          title,
+          metadata,
+          availability_state
+        )
+        VALUES (
+          ${objectId},
+          ${tenantOneId},
+          ${"IMAGE"}::object_type,
+          ${"Web Candidate Image"},
+          ${{ source: "web-sync" }},
+          ${"AVAILABLE"}::object_availability_state
+        )
+      `;
+        } finally {
+            await sql.close();
+        }
+
+        const syncResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/internal/objects/${objectId}/available-files`,
+                {
+                    method: "PUT",
+                    headers: {
+                        "x-worker-auth-token": "worker-secret",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        files: [
+                            {
+                                archive_file_key: "archive-web-primary",
+                                artifact_kind: "web_version",
+                                variant: null,
+                                display_name: "Web Version Primary",
+                            },
+                            {
+                                archive_file_key: "archive-web-alt",
+                                artifact_kind: "web_version",
+                                variant: "mobile",
+                                display_name: "Web Version Mobile",
+                            },
+                        ],
+                    }),
+                },
+            ),
+        );
+
+        expect(syncResponse.status).toBe(200);
+
+        const availableResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${objectId}/available-files`, {
+                method: "GET",
+                headers: {
+                    authorization: `Bearer ${viewerToken}`,
+                },
+            }),
+        );
+
+        expect(availableResponse.status).toBe(200);
+        const availableBody = (await availableResponse.json()) as {
+            available_files: Array<{ id: string; archive_file_key: string }>;
+        };
+
+        const fileKeyById = new Map(
+            availableBody.available_files.map((file) => [
+                file.id,
+                file.archive_file_key,
+            ]),
+        );
+
+        const requestsResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${objectId}/download-requests`, {
+                method: "GET",
+                headers: {
+                    authorization: `Bearer ${viewerToken}`,
+                },
+            }),
+        );
+
+        expect(requestsResponse.status).toBe(200);
+        const requestsBody = (await requestsResponse.json()) as {
+            requests: Array<{
+                available_file_id: string | null;
+                artifact_kind: string;
+                variant: string | null;
+            }>;
+        };
+
+        const webRequests = requestsBody.requests.filter(
+            (request) => request.artifact_kind === "web_version",
+        );
+
+        expect(webRequests.length).toBe(1);
+        expect(webRequests[0]?.variant).toBeNull();
+        expect(fileKeyById.get(webRequests[0]?.available_file_id ?? "")).toBe(
+            "archive-web-primary",
+        );
+    });
+
+    test("does not auto-queue web_version for non-image objects", async () => {
+        const app = createTestApp();
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        const objectId = "OBJ-20260305-WEBDOC";
+
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+        INSERT INTO objects (
+          object_id,
+          tenant_id,
+          type,
+          title,
+          metadata,
+          availability_state
+        )
+        VALUES (
+          ${objectId},
+          ${tenantOneId},
+          ${"DOCUMENT"}::object_type,
+          ${"Web Candidate Document"},
+          ${{ source: "web-sync" }},
+          ${"AVAILABLE"}::object_availability_state
+        )
+      `;
+        } finally {
+            await sql.close();
+        }
+
+        const syncResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/internal/objects/${objectId}/available-files`,
+                {
+                    method: "PUT",
+                    headers: {
+                        "x-worker-auth-token": "worker-secret",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        files: [
+                            {
+                                archive_file_key: "archive-web-document",
+                                artifact_kind: "web_version",
+                                variant: null,
+                                display_name: "Web Version Document",
+                            },
+                        ],
+                    }),
+                },
+            ),
+        );
+
+        expect(syncResponse.status).toBe(200);
+
+        const requestsResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${objectId}/download-requests`, {
+                method: "GET",
+                headers: {
+                    authorization: `Bearer ${viewerToken}`,
+                },
+            }),
+        );
+
+        expect(requestsResponse.status).toBe(200);
+        const requestsBody = (await requestsResponse.json()) as {
+            requests: Array<{ artifact_kind: string }>;
+        };
+
+        const webRequests = requestsBody.requests.filter(
+            (request) => request.artifact_kind === "web_version",
+        );
+
+        expect(webRequests).toEqual([]);
     });
 
     test("auto-queue thumbnail picks lowest archive key when no null variant exists", async () => {

@@ -138,6 +138,7 @@ Current default auto-request kinds:
 
 - `thumbnail`
 - `ocr_text`
+- `web_version` (image objects only)
 
 This is not a patch API. Always send the full current file list for that object.
 

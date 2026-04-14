@@ -365,6 +365,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `400 BAD_REQUEST` for invalid path/body shape
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when ingestion does not exist in tenant scope
   - `409 CONFLICT` for full-set mismatch or immutable ingestion state
 
 ### PATCH `/api/ingestions/:id/items/:itemId`
@@ -537,6 +538,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `file` (Ingestion File Schema)
 - Error behavior:
   - `400 BAD_REQUEST` for invalid path/body shape
+    - includes unsupported ingestion file `content_type` values
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when ingestion or file does not exist in tenant scope
@@ -596,6 +598,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `400 BAD_REQUEST` for invalid path/body shape
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when ingestion does not exist in tenant scope
   - `409 CONFLICT` for full-set mismatch or immutable ingestion state
 
 ### POST `/api/ingestions/:id/submit`
@@ -721,6 +724,261 @@ Object response shapes in this section are authoritative with `src/validation/ob
 - `access_reason_code`:
   - `OK|FORBIDDEN_POLICY|EMBARGO_ACTIVE|RESTORE_REQUIRED|RESTORE_IN_PROGRESS|TEMP_UNAVAILABLE`
 
+### Object Viewer Schema
+
+`GET /api/objects/:object_id` returns `viewer` as a top-level sibling of `object`:
+
+- response shape: `{ object, viewer }`
+- `viewer` provides the canonical media rendering contract for the frontend and eliminates frontend heuristics
+
+The `viewer` block is `null` for `GENERIC` object types until a viewer strategy is defined.
+
+#### Viewer Top-Level Fields
+
+- `media_type` (`document|image|audio|video`)
+  - Canonical viewer media type derived from object type
+  - `DOCUMENT` → `document`, `IMAGE` → `image`, `AUDIO` → `audio`, `VIDEO` → `video`
+
+- `primary_source` (object)
+  - The single canonical source the frontend should use for the main media canvas
+  - `source_type` (`original|access_copy|stream|preview|other`)
+    - Viewer-facing abstraction (UI should key behavior off this + status)
+  - `artifact_kind` (`original|preview|pdf|ocr_text|thumbnail|web_version|transcript|other`)
+    - Backend-facing concrete identity (for diagnostics, not UI decisions)
+    - current primary-source selection uses viewer-facing kinds (`pdf`, `web_version`, `original`, `preview`, `other`)
+    - `ocr` and `metadata` are internal backend kinds that may exist in artifact inventories but are not selected as canonical `primary_source` in current implementation
+    - OCR for viewer contracts is represented via `ocr_text` references (`preview_artifacts.ocr_text`, `viewer_payload.ocr_text_artifact_id`)
+  - `variant` (string, nullable)
+    - Artifact variant identifier
+  - `status` (`available|request_required|request_pending|restricted|temporarily_unavailable`)
+    - Determines the UI state for the primary media canvas
+  - `available_file_id` (string, nullable)
+    - ID of requestable available-file when artifact not yet materialized
+  - `artifact_id` (string, nullable)
+    - ID of materialized artifact when available
+  - `display_name` (string, nullable)
+    - Human-readable name for the source
+  - `content_type` (string, nullable)
+    - MIME type of the source
+  - `size_bytes` (number, nullable)
+    - File size in bytes
+  - `access_reason_code` (`OK|FORBIDDEN_POLICY|EMBARGO_ACTIVE|RESTORE_REQUIRED|RESTORE_IN_PROGRESS|TEMP_UNAVAILABLE`)
+    - Reason for current access state
+
+- `active_request` (object, nullable)
+  - Present when an artifact fetch request is in progress for the primary source
+  - `id` (string)
+  - `action_type` (`artifact_fetch`)
+  - `status` (`PENDING|PROCESSING`)
+  - `created_at` (ISO timestamp)
+  - `updated_at` (ISO timestamp)
+
+- `preview_artifacts` (object)
+  - Supporting artifacts available independently of primary source
+  - `thumbnail` (object, nullable)
+    - `available` (boolean, always `true` when present)
+    - `artifact_id` (string)
+    - `content_type` (string, nullable)
+    - `display_name` (string, nullable)
+    - `metadata` (JSON object)
+  - `poster` (object, nullable) - Video poster image
+  - `ocr_text` (object, nullable) - OCR text artifact
+  - `transcript` (object, nullable) - Transcript artifact
+  - `captions` (object, nullable) - Caption/subtitle artifact (reserved for future)
+
+- `viewer_payload` (media-specific object)
+  - Render-oriented payload for the viewer component
+  - Schema varies by `media_type` (see below)
+
+#### Primary Source Status Guide
+
+| Status | Meaning | UI Action |
+|--------|---------|-----------|
+| `available` | Primary source ready to render | Display the media using `artifact_id` |
+| `request_required` | User can access, but source must be fetched | Show "Request" button; may show `preview_artifacts` |
+| `request_pending` | Fetch already in progress | Show loading/waiting state; check `active_request` |
+| `restricted` | Access denied by policy/embargo | Show access denied message using `access_reason_code` |
+| `temporarily_unavailable` | Source expected but not deliverable | Show unavailable message; may retry later |
+
+#### Media-Specific Viewer Payloads
+
+**Document Payload** (`kind: "document"`):
+- `artifact_id` (string, nullable) - PDF or document artifact ID
+- `content_type` (string, nullable) - e.g., `application/pdf`
+- `ocr_text_artifact_id` (string, nullable) - OCR text artifact ID
+- `page_count` (number, nullable) - Total page count
+- `pages` (array, optional) - Page-level structure:
+  - `page_number` (number)
+  - `label` (string, nullable)
+  - `image_artifact_id` (string, nullable)
+  - `ocr_text_artifact_id` (string, nullable)
+
+**Image Payload** (`kind: "image"`):
+- `artifact_id` (string, nullable)
+- `content_type` (string, nullable) - e.g., `image/jpeg`
+- `width` (number, nullable) - Pixel width
+- `height` (number, nullable) - Pixel height
+
+**Audio Payload** (`kind: "audio"`):
+- `artifact_id` (string, nullable) - Browser-playable audio artifact
+- `content_type` (string, nullable) - e.g., `audio/mpeg`
+- `transcript_artifact_id` (string, nullable)
+- `duration_seconds` (number, nullable)
+
+**Video Payload** (`kind: "video"`):
+- `artifact_id` (string, nullable) - Browser-playable video artifact
+- `content_type` (string, nullable) - e.g., `video/mp4`
+- `poster_artifact_id` (string, nullable)
+- `transcript_artifact_id` (string, nullable)
+- `captions_artifact_id` (string, nullable) - Reserved for future
+- `duration_seconds` (number, nullable)
+
+#### Example: Available Document
+
+```json
+{
+  "object": {
+    "id": "OBJ-20260213-ABC123",
+    "object_id": "OBJ-20260213-ABC123",
+    "type": "DOCUMENT",
+    "title": "Historical Document",
+    "is_authorized": true,
+    "is_deliverable": true,
+    "can_download": true,
+    "access_reason_code": "OK"
+  },
+  "viewer": {
+    "media_type": "document",
+    "primary_source": {
+      "source_type": "access_copy",
+      "artifact_kind": "pdf",
+      "variant": null,
+      "status": "available",
+      "available_file_id": "70000000-0000-4000-8000-000000000001",
+      "artifact_id": "60000000-0000-4000-8000-000000000099",
+      "display_name": "Reading PDF",
+      "content_type": "application/pdf",
+      "size_bytes": 12345,
+      "access_reason_code": "OK"
+    },
+    "active_request": null,
+    "preview_artifacts": {
+      "thumbnail": {
+        "available": true,
+        "artifact_id": "60000000-0000-4000-8000-000000000777",
+        "content_type": "image/jpeg",
+        "display_name": "Thumbnail",
+        "metadata": {}
+      },
+      "poster": null,
+      "ocr_text": {
+        "available": true,
+        "artifact_id": "60000000-0000-4000-8000-000000000778",
+        "content_type": "text/plain",
+        "display_name": "OCR Text",
+        "metadata": { "page_count": 12 }
+      },
+      "transcript": null,
+      "captions": null
+    },
+    "viewer_payload": {
+      "kind": "document",
+      "artifact_id": "60000000-0000-4000-8000-000000000099",
+      "content_type": "application/pdf",
+      "ocr_text_artifact_id": "60000000-0000-4000-8000-000000000778",
+      "page_count": 12,
+      "pages": [
+        { "page_number": 1, "label": "1", "image_artifact_id": null, "ocr_text_artifact_id": null },
+        { "page_number": 2, "label": "2", "image_artifact_id": null, "ocr_text_artifact_id": null }
+      ]
+    }
+  }
+}
+```
+
+#### Example: Request-Required Video
+
+```json
+{
+  "object": {
+    "id": "OBJ-20260213-VID001",
+    "object_id": "OBJ-20260213-VID001",
+    "type": "VIDEO",
+    "title": "Family Interview",
+    "is_authorized": true,
+    "is_deliverable": true,
+    "can_download": true,
+    "access_reason_code": "OK"
+  },
+  "viewer": {
+    "media_type": "video",
+    "primary_source": {
+      "source_type": "stream",
+      "artifact_kind": "web_version",
+      "variant": null,
+      "status": "request_required",
+      "available_file_id": "70000000-0000-4000-8000-000000000201",
+      "artifact_id": null,
+      "display_name": "Web Version",
+      "content_type": "video/mp4",
+      "size_bytes": 52428800,
+      "access_reason_code": "RESTORE_REQUIRED"
+    },
+    "active_request": null,
+    "preview_artifacts": {
+      "thumbnail": {
+        "available": true,
+        "artifact_id": "60000000-0000-4000-8000-000000000801",
+        "content_type": "image/jpeg",
+        "display_name": "Thumbnail",
+        "metadata": {}
+      },
+      "poster": {
+        "available": true,
+        "artifact_id": "60000000-0000-4000-8000-000000000802",
+        "content_type": "image/jpeg",
+        "display_name": "Poster",
+        "metadata": {}
+      },
+      "ocr_text": null,
+      "transcript": null,
+      "captions": null
+    },
+    "viewer_payload": {
+      "kind": "video",
+      "artifact_id": null,
+      "content_type": "video/mp4",
+      "poster_artifact_id": "60000000-0000-4000-8000-000000000802",
+      "transcript_artifact_id": null,
+      "captions_artifact_id": null,
+      "duration_seconds": 642
+    }
+  }
+}
+```
+
+#### Frontend Usage Patterns
+
+1. **Check `viewer` is not null** - Only `DOCUMENT`, `IMAGE`, `AUDIO`, `VIDEO` types have viewer contracts
+
+2. **Key UI decisions off `primary_source.source_type` + `primary_source.status`**, not `artifact_kind`
+
+3. **When `status = "available"`**:
+   - Use `viewer_payload` to configure the viewer
+   - Load media via `GET /api/objects/:object_id/artifacts/:artifact_id/view`
+   - Also load any `preview_artifacts` the UI wants to display
+
+4. **When `status = "request_required"`**:
+   - Show request gate UI
+   - Display `preview_artifacts.thumbnail` or `preview_artifacts.poster` if available
+   - Call `POST /api/objects/:object_id/download-requests` to initiate fetch
+
+5. **When `status = "request_pending"`**:
+   - Show loading/waiting state
+   - Poll for changes or use `active_request` to show progress
+
+6. **Never construct direct URLs** - Always resolve artifacts through the `/view` endpoint
+
 ### GET `/api/objects`
 
 - Auth: Bearer token
@@ -817,6 +1075,12 @@ Each object item includes `thumbnail_artifact_id`:
     - includes `tags`
     - includes `ingest_manifest` (or `null`)
     - includes `thumbnail_artifact_id` (`null` when no thumbnail artifact exists)
+  - `viewer` (`object_viewer`, nullable)
+    - includes canonical `media_type`
+    - includes canonical `primary_source`
+    - includes relevant `active_request` when present
+    - includes `preview_artifacts`
+    - includes media-specific `viewer_payload`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:object_id` format
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
@@ -857,6 +1121,36 @@ Example response:
     "is_deliverable": true,
     "can_download": true,
     "access_reason_code": "OK"
+  },
+  "viewer": {
+    "media_type": "document",
+    "primary_source": {
+      "source_type": "access_copy",
+      "artifact_kind": "pdf",
+      "variant": null,
+      "status": "available",
+      "available_file_id": "70000000-0000-4000-8000-000000000001",
+      "artifact_id": "60000000-0000-4000-8000-000000000099",
+      "display_name": "Reading PDF",
+      "content_type": "application/pdf",
+      "size_bytes": 12345,
+      "access_reason_code": "OK"
+    },
+    "active_request": null,
+    "preview_artifacts": {
+      "thumbnail": null,
+      "poster": null,
+      "ocr_text": null,
+      "transcript": null,
+      "captions": null
+    },
+    "viewer_payload": {
+      "kind": "document",
+      "artifact_id": "60000000-0000-4000-8000-000000000099",
+      "content_type": "application/pdf",
+      "ocr_text_artifact_id": null,
+      "page_count": null
+    }
   }
 }
 ```
@@ -877,6 +1171,7 @@ Example response:
   - `action_type` (optional `object_resync|artifact_fetch`)
   - `status` (optional; can be repeated and/or comma-separated; values `PENDING|PROCESSING|COMPLETED|FAILED|CANCELED`)
   - `active_only` (optional boolean; when `true`, equivalent to filtering `PENDING|PROCESSING`)
+    - precedence: when `active_only=true`, backend ignores explicit `status` filters and uses `PENDING|PROCESSING`
   - `include_payload` (optional boolean, default `false`; when `true`, each item includes `action_payload`)
 - 200 response:
   - `requests[]` where each item includes:
@@ -916,6 +1211,11 @@ Example response:
 - 200 response:
   - `object_id`
   - `artifacts[]` (`id`, `object_id`, `kind`, `variant`, `storage_key`, `content_type`, `size_bytes`, `created_at`)
+- Notes:
+  - `storage_key` is internal storage metadata, not a direct client URL
+  - frontend must resolve delivery through `/view` or `/download` endpoints
+  - this list may include artifacts that are not inline-viewable via `/view`
+  - `kind` uses full backend enum (includes internal kinds such as `ocr`, `metadata`, `ingest_json`, `pipeline_json`, `catalog_json`)
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:object_id` format
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
@@ -929,6 +1229,9 @@ Example response:
 - 200 response:
   - `object_id`
   - `available_files[]` (`id`, `object_id`, `archive_file_key`, `artifact_kind`, `variant`, `display_name`, `content_type`, `size_bytes`, `checksum_sha256`, `metadata`, `is_available`, `synced_at`)
+- Notes:
+  - `artifact_kind` uses full backend enum, including internal kinds
+  - `ocr` is backend/internal OCR artifact kind; `ocr_text` is the normalized OCR text artifact kind used by viewer contracts
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:object_id` format
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
@@ -1051,6 +1354,32 @@ Worker-only object endpoints are documented in `## Worker APIs`:
 - 200 response:
   - Binary file response
   - headers include `content-type`, `content-length`, `content-disposition`
+  - current implementation returns full-file `200 OK` responses (no `Range`/`206 Partial Content` support yet)
+
+### GET `/api/objects/:object_id/artifacts/:artifact_id/view`
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- Purpose:
+  - browser-consumable inline artifact delivery for object viewers
+  - resolves viewer-selected `artifact_id` references into inline content
+- Access policy:
+  - endpoint is role-aware and object access-policy aware
+  - artifact must be viewable under the object viewer contract
+  - not every artifact in `GET /api/objects/:object_id/artifacts` is guaranteed to be viewable through this endpoint
+  - frontend should use this endpoint for inline viewing/playback, not the download endpoint
+- 200 response:
+  - Binary file response
+  - headers include `content-type`, `content-length`, `content-disposition: inline`
+  - current implementation returns full-file `200 OK` responses (no `Range`/`206 Partial Content` support yet)
+- Browser-viewable MIME families:
+  - `application/pdf`, `text/html`, `text/plain`, `image/*`, `audio/*`, `video/*`
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path params or when object exists but is not viewable in current access state
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when object or artifact does not exist in tenant scope
+  - `409 CONFLICT` when artifact exists but is not viewable inline for browser use
 
 ### PATCH `/api/objects/:object_id/access-policy`
 
@@ -1453,6 +1782,8 @@ Integration guides for archive worker teams:
     - `archive_file_key` (required string, non-empty)
     - `artifact_kind` (required enum):
       - `ingest_json|pipeline_json|catalog_json|original|preview|ocr|transcript|metadata|pdf|ocr_text|thumbnail|web_version|other`
+      - `ocr` = backend/internal OCR artifact kind
+      - `ocr_text` = normalized OCR text artifact kind used by viewer contracts and auto-request defaults
     - `variant` (optional nullable string, non-empty when present)
     - `display_name` (required string, non-empty)
     - `content_type` (optional nullable string, non-empty when present)
@@ -1463,7 +1794,8 @@ Integration guides for archive worker teams:
 - Behavior:
   - tenant is resolved internally from `object_id`
   - Replaces object snapshot by archive key: upserts provided entries and marks omitted entries unavailable.
-  - Auto-request side effect: backend attempts to auto-queue one `artifact_fetch` request per configured default kind (`thumbnail`, `ocr_text`) when corresponding available entries are present.
+  - Auto-request side effect: backend attempts to auto-queue one `artifact_fetch` request per configured default kind (`thumbnail`, `ocr_text`, `web_version`) when corresponding available entries are present.
+    - `web_version` auto-request currently applies only to `IMAGE` objects.
   - Auto-request suppression: per kind, backend skips auto-queue when artifact already exists or an active request (`PENDING`/`PROCESSING`) already exists.
   - Auto-request selection priority: for each kind, prefer `variant = null`; otherwise choose lexicographically lowest `archive_file_key`.
 - 200 response:
@@ -1601,3 +1933,5 @@ Integration guides for archive worker teams:
 - Use client Bearer APIs only; do not call worker endpoints from UI.
 - `ingest_manifest` is available on object detail only (`GET /api/objects/:object_id`).
 - List endpoints return `next_cursor`; pass it back as `cursor` for pagination.
+- There is no dedicated `recents` endpoint; use `GET /api/dashboard/activity` for recents/activity UX.
+- Do not infer rendering behavior from worker/internal artifact-kind taxonomy; use `viewer.primary_source` + `viewer_payload` and resolve artifact bytes via `/view`.

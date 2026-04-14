@@ -63,6 +63,7 @@ import {
     uploadObjectArtifactBySignedToken,
     updateObjectAccessPolicyForTenant,
     upsertObjectAccessAssignmentForTenant,
+    viewObjectArtifactForTenant,
 } from "../services/object-service.ts";
 import { extractPathParam } from "./params.ts";
 import type { RouteDefinition } from "./types.ts";
@@ -673,6 +674,38 @@ const downloadArtifactRoute: RouteDefinition = {
     },
 };
 
+const viewArtifactRoute: RouteDefinition = {
+    method: "GET",
+    path: "/api/objects/:object_id/artifacts/:artifact_id/view",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, [
+            "viewer",
+            "archiver",
+            "admin",
+        ]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/artifacts\/[^/]+\/view$/,
+                "object_id",
+            ),
+        );
+        const artifactId = parseArtifactIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/[^/]+\/artifacts\/([^/]+)\/view$/,
+                "artifact_id",
+            ),
+        );
+        return viewObjectArtifactForTenant({
+            auth: authenticated,
+            objectId,
+            artifactId,
+        });
+    },
+};
+
 const patchObjectAccessPolicyRoute: RouteDefinition = {
     method: "PATCH",
     path: "/api/objects/:object_id/access-policy",
@@ -923,6 +956,7 @@ export const objectRoutes: RouteDefinition[] = [
     workerUploadObjectArtifactRoute,
     replaceObjectAvailableFilesRoute,
     downloadArtifactRoute,
+    viewArtifactRoute,
     patchObjectAccessPolicyRoute,
     createObjectAccessRequestRoute,
     listObjectAccessRequestsRoute,
