@@ -11,10 +11,15 @@ import {
     parseCreateAccessRequestBody,
     parseCreateObjectDownloadRequestBody,
     parseCreateObjectResyncBody,
+    parseObjectEditHistoryQuery,
     parseObjectDownloadRequestIdParam,
     parseObjectIdParam,
     parseObjectListQuery,
+    parsePatchObjectMetadataBody,
     parsePatchObjectTitleBody,
+    parsePutDocumentCurationBody,
+    parseReplaceObjectTextManifestBody,
+    parseSubmitObjectCurationBody,
     parseResolveAccessRequestBody,
     parseReplaceObjectAvailableFilesBody,
     parseWorkerCompleteArchiveRequestBody,
@@ -34,8 +39,20 @@ import {
     failArchiveRequestByWorker,
     heartbeatArchiveRequestLease,
     leaseNextArchiveRequest,
+    presignArchiveRequestArtifactByWorker,
     releaseArchiveRequestLeaseByToken,
 } from "../services/archive-request-service.ts";
+import {
+    getObjectEditDetail,
+    getObjectEditHistoryForTenant,
+    patchObjectMetadataForTenant,
+    putDocumentCurationForTenant,
+    releaseObjectEditLockForTenant,
+    submitObjectCurationForTenant,
+} from "../services/object-edit-service.ts";
+import {
+    replaceObjectTextManifest,
+} from "../services/object-text-manifest-service.ts";
 import {
     completeObjectDownloadRequestByWorker,
     createObjectDownloadRequestForTenant,
@@ -172,6 +189,153 @@ const patchObjectRoute: RouteDefinition = {
     },
 };
 
+const getObjectEditRoute: RouteDefinition = {
+    method: "GET",
+    path: "/api/objects/:object_id/edit",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, [
+            "archiver",
+            "admin",
+        ]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/edit$/,
+                "object_id",
+            ),
+        );
+        return jsonResponse(
+            await getObjectEditDetail({
+                auth: authenticated,
+                objectId,
+            }),
+        );
+    },
+};
+
+const patchObjectMetadataRoute: RouteDefinition = {
+    method: "PATCH",
+    path: "/api/objects/:object_id/metadata",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, ["archiver", "admin"]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/metadata$/,
+                "object_id",
+            ),
+        );
+        const body = parsePatchObjectMetadataBody(await parseJsonBody(request));
+        return jsonResponse(
+            await patchObjectMetadataForTenant({
+                auth: authenticated,
+                objectId,
+                body,
+            }),
+        );
+    },
+};
+
+const getObjectCurationHistoryRoute: RouteDefinition = {
+    method: "GET",
+    path: "/api/objects/:object_id/curation/history",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, [
+            "viewer",
+            "archiver",
+            "admin",
+        ]);
+        const url = new URL(request.url);
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                url.pathname,
+                /^\/api\/objects\/([^/]+)\/curation\/history$/,
+                "object_id",
+            ),
+        );
+        const query = parseObjectEditHistoryQuery(url);
+        return jsonResponse(
+            await getObjectEditHistoryForTenant({
+                auth: authenticated,
+                objectId,
+                query,
+            }),
+        );
+    },
+};
+
+const putObjectDocumentCurationRoute: RouteDefinition = {
+    method: "PUT",
+    path: "/api/objects/:object_id/curation/document",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, ["archiver", "admin"]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/curation\/document$/,
+                "object_id",
+            ),
+        );
+        const body = parsePutDocumentCurationBody(await parseJsonBody(request));
+        return jsonResponse(
+            await putDocumentCurationForTenant({
+                auth: authenticated,
+                objectId,
+                body,
+            }),
+        );
+    },
+};
+
+const submitObjectCurationRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/objects/:object_id/curation/submit",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, ["archiver", "admin"]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/curation\/submit$/,
+                "object_id",
+            ),
+        );
+        const body = parseSubmitObjectCurationBody(await parseJsonBody(request));
+        return jsonResponse(
+            await submitObjectCurationForTenant({
+                auth: authenticated,
+                objectId,
+                body,
+            }),
+        );
+    },
+};
+
+const deleteObjectEditLockRoute: RouteDefinition = {
+    method: "DELETE",
+    path: "/api/objects/:object_id/edit-lock",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, ["archiver", "admin"]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/edit-lock$/,
+                "object_id",
+            ),
+        );
+        return jsonResponse(
+            await releaseObjectEditLockForTenant({
+                auth: authenticated,
+                objectId,
+            }),
+        );
+    },
+};
+
 const listArtifactsRoute: RouteDefinition = {
     method: "GET",
     path: "/api/objects/:object_id/artifacts",
@@ -243,6 +407,31 @@ const replaceObjectAvailableFilesRoute: RouteDefinition = {
 
         return jsonResponse(
             await replaceObjectAvailableFilesSnapshot({
+                objectId,
+                body,
+            }),
+        );
+    }),
+};
+
+const replaceObjectTextManifestRoute: RouteDefinition = {
+    method: "PUT",
+    path: "/api/internal/objects/:object_id/object-text-manifest",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/internal\/objects\/([^/]+)\/object-text-manifest$/,
+                "object_id",
+            ),
+        );
+        const body = parseReplaceObjectTextManifestBody(
+            await parseJsonBody(request),
+        );
+
+        return jsonResponse(
+            await replaceObjectTextManifest({
                 objectId,
                 body,
             }),
@@ -434,6 +623,31 @@ const releaseArchiveRequestRoute: RouteDefinition = {
     }),
 };
 
+const presignArchiveRequestArtifactRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/archive-requests/:id/artifacts/presign",
+    handler: withWorkerAuth(async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseArchiveRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/archive-requests\/([^/]+)\/artifacts\/presign$/,
+                "id",
+            ),
+        );
+        const body = parseWorkerPresignObjectArtifactUploadBody(
+            await parseJsonBody(request),
+        );
+
+        return jsonResponse(
+            await presignArchiveRequestArtifactByWorker({
+                requestId,
+                body,
+            }),
+        );
+    }),
+};
+
 const completeArchiveRequestRoute: RouteDefinition = {
     method: "POST",
     path: "/api/archive-requests/:id/complete",
@@ -453,7 +667,7 @@ const completeArchiveRequestRoute: RouteDefinition = {
         return jsonResponse(
             await completeArchiveRequestByWorker({
                 requestId,
-                leaseToken: body.lease_token,
+                body,
             }),
         );
     }),
@@ -616,6 +830,28 @@ const failObjectDownloadRequestRoute: RouteDefinition = {
 };
 
 const workerUploadObjectArtifactRoute: RouteDefinition = {
+    method: "PUT",
+    path: "/api/archive-requests/uploads/:token",
+    handler: async (request) => {
+        const pathname = new URL(request.url).pathname;
+        const uploadToken = parseUploadTokenParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/archive-requests\/uploads\/([^/]+)$/,
+                "token",
+            ),
+        );
+
+        return jsonResponse(
+            await uploadObjectArtifactBySignedToken({
+                uploadToken,
+                request,
+            }),
+        );
+    },
+};
+
+const workerUploadObjectArtifactLegacyRoute: RouteDefinition = {
     method: "PUT",
     path: "/api/object-download-requests/uploads/:token",
     handler: async (request) => {
@@ -936,8 +1172,14 @@ export const objectRoutes: RouteDefinition[] = [
     listArchiveRequestsRoute,
     getObjectRoute,
     patchObjectRoute,
+    getObjectEditRoute,
+    patchObjectMetadataRoute,
     listArtifactsRoute,
     listObjectAvailableFilesRoute,
+    getObjectCurationHistoryRoute,
+    putObjectDocumentCurationRoute,
+    submitObjectCurationRoute,
+    deleteObjectEditLockRoute,
     requestObjectResyncRoute,
     listObjectResyncRequestsRoute,
     createObjectDownloadRequestRoute,
@@ -945,6 +1187,7 @@ export const objectRoutes: RouteDefinition[] = [
     leaseArchiveRequestRoute,
     heartbeatArchiveRequestRoute,
     releaseArchiveRequestRoute,
+    presignArchiveRequestArtifactRoute,
     completeArchiveRequestRoute,
     failArchiveRequestRoute,
     leaseObjectDownloadRequestRoute,
@@ -954,7 +1197,9 @@ export const objectRoutes: RouteDefinition[] = [
     completeObjectDownloadRequestRoute,
     failObjectDownloadRequestRoute,
     workerUploadObjectArtifactRoute,
+    workerUploadObjectArtifactLegacyRoute,
     replaceObjectAvailableFilesRoute,
+    replaceObjectTextManifestRoute,
     downloadArtifactRoute,
     viewArtifactRoute,
     patchObjectAccessPolicyRoute,

@@ -1387,6 +1387,61 @@ export async function updateObjectAccessPolicy(params: {
   return row ? mapObject(row) : undefined;
 }
 
+export async function updateObjectMetadataPages(params: {
+  tenantId: string;
+  objectId: string;
+  pages: Array<{
+    page_number: number;
+    label: string | null;
+    image_artifact_id?: string | null;
+    ocr_text_artifact_id?: string | null;
+  }>;
+}): Promise<ObjectRecord | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<ObjectRow[]>`
+      UPDATE objects
+      SET metadata = metadata || ${{
+        pages: params.pages,
+        page_count: params.pages.length,
+      }},
+          updated_at = now()
+      WHERE tenant_id = ${params.tenantId}
+        AND object_id = ${params.objectId}
+      RETURNING
+        object_id,
+        tenant_id,
+        type,
+        title,
+        language_code,
+        metadata,
+        ingest_manifest,
+        source_ingestion_id,
+        source_ingestion_item_id,
+        (SELECT ing.batch_label FROM ingestions ing WHERE ing.id = source_ingestion_id) AS source_batch_label,
+        availability_state,
+        access_level,
+        embargo_kind,
+        processing_state,
+        curation_state,
+        embargo_until,
+        embargo_curation_state,
+        rights_note,
+        sensitivity_note,
+        created_at,
+        updated_at,
+        COALESCE((
+          SELECT array_agg(tag.name_normalized ORDER BY tag.name_normalized)
+          FROM object_tags otag
+          INNER JOIN tags tag ON tag.id = otag.tag_id
+          WHERE otag.object_id = ${params.objectId}
+        ), ARRAY[]::text[]) AS tags
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapObject(row) : undefined;
+}
+
 export async function listArtifactsByObjectId(params: {
   tenantId: string;
   objectId: string;

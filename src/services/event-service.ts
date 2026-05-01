@@ -6,6 +6,7 @@ import { resolveStagingPath } from "../storage/staging.ts";
 import { findIngestionById } from "../repos/ingestion-repo.ts";
 import {
   findIngestionItemById,
+  listIngestionItemFiles,
   listIngestionItems,
   setIngestionItemStatus,
   summarizeIngestionItems,
@@ -17,7 +18,9 @@ import {
   findObjectBySourceIngestion,
   findObjectBySourceIngestionItem,
   updateObjectIngestManifest,
+  updateObjectMetadataPages,
   updateObjectProjectionState,
+  type ObjectRecord,
 } from "../repos/object-repo.ts";
 import { parseIngestionSummary } from "../validation/catalog.ts";
 import { jsonObjectSchema, type IngestItemKind } from "../validation/ingestion.ts";
@@ -43,6 +46,72 @@ function mapItemKindToObjectType(
     case "other":
       return "GENERIC";
   }
+}
+
+async function findSoleIngestionItemTitle(params: {
+  tenantId: string;
+  ingestionId: string;
+}): Promise<string> {
+  const items = await listIngestionItems({
+    tenantId: params.tenantId,
+    ingestionId: params.ingestionId,
+  });
+
+  if (items.length !== 1) {
+    return "";
+  }
+
+  return items[0]?.title?.trim() ?? "";
+}
+
+async function populateObjectMetadataPagesFromIngestion(params: {
+  tenantId: string;
+  ingestionId: string;
+  ingestionItemId?: string;
+  objectRecord: ObjectRecord;
+}): Promise<void> {
+  if (params.objectRecord.type !== "DOCUMENT") {
+    return;
+  }
+
+  const metadata = params.objectRecord.metadata;
+  if (Array.isArray(metadata.pages)) {
+    return;
+  }
+
+  const itemId = params.ingestionItemId ?? params.objectRecord.sourceIngestionItemId ?? undefined;
+  if (!itemId) {
+    return;
+  }
+
+  const itemFiles = await listIngestionItemFiles({
+    tenantId: params.tenantId,
+    ingestionId: params.ingestionId,
+    ingestionItemId: itemId,
+  });
+
+  const pageFiles = itemFiles.filter(
+    (file) => typeof file.pageNumber === "number" && file.pageNumber > 0,
+  );
+
+  if (pageFiles.length === 0) {
+    return;
+  }
+
+  const pages = pageFiles
+    .map((file) => ({
+      page_number: file.pageNumber!,
+      label: file.logicalLabel ?? String(file.pageNumber),
+      image_artifact_id: null,
+      ocr_text_artifact_id: null,
+    }))
+    .sort((left, right) => left.page_number - right.page_number);
+
+  await updateObjectMetadataPages({
+    tenantId: params.tenantId,
+    objectId: params.objectRecord.objectId,
+    pages,
+  });
 }
 
 export async function ingestWorkerEvents(
@@ -101,9 +170,17 @@ export async function ingestWorkerEvents(
         try {
           const summary = parseIngestionSummary(ingestionRecord.summary);
         const parsedMetadata = jsonObjectSchema.safeParse(summary);
+        const titleFromItem =
+          scopedIngestionItem?.title?.trim() ??
+          (await findSoleIngestionItemTitle({
+            tenantId: ingestionRecord.tenantId,
+            ingestionId: ingestionRecord.id,
+          }));
         const titleFromEvent =
           typeof event.payload.title === "string" ? event.payload.title.trim() : "";
-        const title = summary.title.primary || titleFromEvent;
+        const titleFromSummary =
+          typeof summary.title.primary === "string" ? summary.title.primary.trim() : "";
+        const title = titleFromItem || titleFromEvent || titleFromSummary;
 
         completionObject = await createOrGetObjectBySourceIngestion({
           objectId: event.object_id,
@@ -173,6 +250,15 @@ export async function ingestWorkerEvents(
             received_object_id: event.object_id,
           });
         }
+
+        if (completionObject) {
+          await populateObjectMetadataPagesFromIngestion({
+            tenantId: ingestionRecord.tenantId,
+            ingestionId: ingestionRecord.id,
+            ingestionItemId: event.ingestion_item_id,
+            objectRecord: completionObject,
+          });
+        }
         }
       }
 
@@ -195,9 +281,12 @@ export async function ingestWorkerEvents(
 
       const summary = parseIngestionSummary(ingestionRecord.summary);
       const parsedMetadata = jsonObjectSchema.safeParse(summary);
+      const titleFromItem = scopedIngestionItem.title?.trim() ?? "";
       const titleFromEvent =
         typeof event.payload.title === "string" ? event.payload.title.trim() : "";
-      const title = summary.title.primary || titleFromEvent;
+      const titleFromSummary =
+        typeof summary.title.primary === "string" ? summary.title.primary.trim() : "";
+      const title = titleFromItem || titleFromEvent || titleFromSummary;
 
       itemCompletionObject = await findObjectBySourceIngestionItem({
         tenantId: ingestionRecord.tenantId,
@@ -231,6 +320,15 @@ export async function ingestWorkerEvents(
           ingestion_item_id: event.ingestion_item_id,
           expected_object_id: itemCompletionObject.objectId,
           received_object_id: event.object_id,
+        });
+      }
+
+      if (itemCompletionObject) {
+        await populateObjectMetadataPagesFromIngestion({
+          tenantId: ingestionRecord.tenantId,
+          ingestionId: ingestionRecord.id,
+          ingestionItemId: event.ingestion_item_id,
+          objectRecord: itemCompletionObject,
         });
       }
     }

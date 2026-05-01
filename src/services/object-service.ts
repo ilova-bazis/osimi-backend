@@ -59,6 +59,7 @@ import {
     type ArtifactKind,
     type ObjectListSort,
     updateObjectAccessPolicy,
+    updateObjectMetadataPages,
     updateObjectTitle,
     type ObjectArtifactRecord,
     type ObjectRecord,
@@ -69,6 +70,10 @@ import {
     createObjectArtifactUploadToken,
     parseObjectArtifactUploadToken,
 } from "../storage/staging.ts";
+import {
+    authorizeWorkerLeaseForArchiveRequest,
+    type AuthorizedWorkerArchiveRequestLease,
+} from "../auth/worker-archive-request.ts";
 import {
     authorizeWorkerLeaseForDownloadRequest,
     createDownloadRequestLeaseToken,
@@ -154,6 +159,18 @@ interface SyncAvailableFileCandidate {
     isAvailable: boolean;
 }
 
+function isPageOcrVariant(variant: string | null): variant is string {
+    return variant !== null && /^page_\d{4}$/.test(variant);
+}
+
+function isCombinedOcrVariant(variant: string | null): variant is string | null {
+    return variant === null || (variant !== null && variant.startsWith("full_"));
+}
+
+function extractPageNumberFromVariant(variant: string): number {
+    return parseInt(variant.replace(/^page_0*/, ""), 10);
+}
+
 function selectAutoRequestCandidate(params: {
     files: SyncAvailableFileCandidate[];
     artifactKind: ArtifactKind;
@@ -182,33 +199,92 @@ function selectAutoRequestCandidate(params: {
         })[0];
 }
 
+function selectCombinedOcrCandidate(
+    files: SyncAvailableFileCandidate[],
+): SyncAvailableFileCandidate | undefined {
+    const candidates = files.filter(
+        (file) =>
+            file.artifactKind === "ocr_text" &&
+            file.isAvailable &&
+            isCombinedOcrVariant(file.variant),
+    );
+
+    if (candidates.length === 0) {
+        return undefined;
+    }
+
+    return candidates
+        .slice()
+        .sort((left, right) => {
+            const leftIsFullV1 = left.variant === "full_v1";
+            const rightIsFullV1 = right.variant === "full_v1";
+            const leftIsNull = left.variant === null;
+            const rightIsNull = right.variant === null;
+
+            if (leftIsFullV1 && !rightIsFullV1) return -1;
+            if (!leftIsFullV1 && rightIsFullV1) return 1;
+            if (leftIsNull && !rightIsNull) return -1;
+            if (!leftIsNull && rightIsNull) return 1;
+
+            return left.archiveFileKey.localeCompare(right.archiveFileKey);
+        })[0];
+}
+
+function selectPageOcrCandidates(
+    files: SyncAvailableFileCandidate[],
+): SyncAvailableFileCandidate[] {
+    return files.filter(
+        (file) =>
+            file.artifactKind === "ocr_text" &&
+            file.isAvailable &&
+            isPageOcrVariant(file.variant),
+    );
+}
+
 async function enqueueAutoArtifactRequestsFromSnapshot(params: {
     tenantId: string;
     objectId: string;
     objectType: ObjectRecord["type"];
     files: SyncAvailableFileCandidate[];
 }): Promise<void> {
-    const selectedCandidates = AUTO_REQUEST_ARTIFACT_KINDS.filter((artifactKind) =>
-        canAutoRequestArtifactKindForObjectType({
-            artifactKind,
-            objectType: params.objectType,
-        }),
-    )
-        .map((artifactKind) => ({
-            artifactKind,
-            candidate: selectAutoRequestCandidate({
+    const selectedCandidates: Array<{
+        artifactKind: ArtifactKind;
+        candidate: SyncAvailableFileCandidate;
+    }> = [];
+
+    for (const artifactKind of AUTO_REQUEST_ARTIFACT_KINDS) {
+        if (
+            !canAutoRequestArtifactKindForObjectType({
+                artifactKind,
+                objectType: params.objectType,
+            })
+        ) {
+            continue;
+        }
+
+        if (artifactKind === "ocr_text") {
+            const combinedCandidate = selectCombinedOcrCandidate(params.files);
+            if (combinedCandidate) {
+                selectedCandidates.push({
+                    artifactKind,
+                    candidate: combinedCandidate,
+                });
+            }
+
+            const pageCandidates = selectPageOcrCandidates(params.files);
+            for (const candidate of pageCandidates) {
+                selectedCandidates.push({ artifactKind, candidate });
+            }
+        } else {
+            const candidate = selectAutoRequestCandidate({
                 files: params.files,
                 artifactKind,
-            }),
-        }))
-        .filter(
-        (
-            item,
-        ): item is {
-            artifactKind: ArtifactKind;
-            candidate: SyncAvailableFileCandidate;
-        } => item.candidate !== undefined,
-    );
+            });
+            if (candidate) {
+                selectedCandidates.push({ artifactKind, candidate });
+            }
+        }
+    }
 
     if (selectedCandidates.length === 0) {
         return;
@@ -229,22 +305,75 @@ async function enqueueAutoArtifactRequestsFromSnapshot(params: {
     });
 
     for (const { artifactKind, candidate } of selectedCandidates) {
-        const hasArtifact = existingArtifacts.some(
-            (artifact) => artifact.kind === artifactKind,
-        );
+        const candidateIsPageOcr =
+            artifactKind === "ocr_text" && isPageOcrVariant(candidate.variant);
+        const candidateIsCombinedOcr =
+            artifactKind === "ocr_text" && isCombinedOcrVariant(candidate.variant);
+
+        let hasArtifact: boolean;
+        if (candidateIsPageOcr) {
+            hasArtifact = existingArtifacts.some(
+                (artifact) =>
+                    artifact.kind === artifactKind &&
+                    artifact.variant === candidate.variant,
+            );
+        } else if (candidateIsCombinedOcr) {
+            hasArtifact = existingArtifacts.some(
+                (artifact) =>
+                    artifact.kind === artifactKind &&
+                    isCombinedOcrVariant(artifact.variant),
+            );
+        } else {
+            hasArtifact = existingArtifacts.some(
+                (artifact) => artifact.kind === artifactKind,
+            );
+        }
 
         if (hasArtifact) {
             continue;
         }
 
-        const hasActiveRequest = existingRequests.some(
-            (request) =>
-                request.actionType === "artifact_fetch" &&
-                parseArtifactFetchActionPayload(request).artifact_kind ===
-                    artifactKind &&
-                (request.status === "PENDING" ||
-                    request.status === "PROCESSING"),
-        );
+        let hasActiveRequest: boolean;
+        if (candidateIsPageOcr) {
+            hasActiveRequest = existingRequests.some((request) => {
+                if (
+                    request.actionType !== "artifact_fetch" ||
+                    request.status !== "PENDING" &&
+                        request.status !== "PROCESSING"
+                ) {
+                    return false;
+                }
+                const payload = parseArtifactFetchActionPayload(request);
+                return (
+                    payload.artifact_kind === artifactKind &&
+                    payload.variant === candidate.variant
+                );
+            });
+        } else if (candidateIsCombinedOcr) {
+            hasActiveRequest = existingRequests.some((request) => {
+                if (
+                    request.actionType !== "artifact_fetch" ||
+                    request.status !== "PENDING" &&
+                        request.status !== "PROCESSING"
+                ) {
+                    return false;
+                }
+                const payload = parseArtifactFetchActionPayload(request);
+                return (
+                    payload.artifact_kind === artifactKind &&
+                    isCombinedOcrVariant(payload.variant)
+                );
+            });
+        } else {
+            hasActiveRequest = existingRequests.some(
+                (request) =>
+                    request.actionType === "artifact_fetch" &&
+                    parseArtifactFetchActionPayload(request).artifact_kind ===
+                        artifactKind &&
+                    (request.status === "PENDING" ||
+                        request.status === "PROCESSING"),
+            );
+        }
 
         if (hasActiveRequest) {
             continue;
@@ -279,6 +408,15 @@ async function enqueueAutoArtifactRequestsFromSnapshot(params: {
                     variant: selectedAvailableFile.variant,
                 }),
             });
+
+            if (
+                params.objectType === "IMAGE" &&
+                selectedAvailableFile.artifactKind === "thumbnail"
+            ) {
+                console.info(
+                    `artifact_auto_request_created object_id=${params.objectId} tenant_id=${params.tenantId} artifact_kind=${selectedAvailableFile.artifactKind} variant=${selectedAvailableFile.variant ?? "null"} available_file_id=${selectedAvailableFile.id} archive_file_key=${selectedAvailableFile.archiveFileKey}`,
+                );
+            }
         } catch (error) {
             if (!isActiveArchiveRequestDedupeViolation(error)) {
                 throw error;
@@ -1107,7 +1245,7 @@ interface ArchiveRequestListItemDto {
     tenant_id: string;
     target_type: ArchiveRequestTargetType;
     target_id: string;
-    action_type: "object_resync" | "artifact_fetch";
+    action_type: ArchiveRequestRecord["actionType"];
     action_payload?: JsonObject;
     requested_by: string;
     dedupe_key: string | null;
@@ -1554,10 +1692,98 @@ export async function replaceObjectAvailableFilesSnapshot(params: {
         files,
     });
 
+    await reconcileObjectMetadataPagesFromAvailableFiles({
+        tenantId: object.tenantId,
+        objectId: params.objectId,
+        files,
+    });
+
     return {
         object_id: params.objectId,
         synced_files: syncedFiles,
     };
+}
+
+async function reconcileObjectMetadataPagesFromAvailableFiles(params: {
+    tenantId: string;
+    objectId: string;
+    files: SyncAvailableFileCandidate[];
+}): Promise<void> {
+    const pageFiles = params.files.filter(
+        (file) =>
+            file.isAvailable &&
+            isPageOcrVariant(file.variant),
+    );
+
+    if (pageFiles.length === 0) {
+        return;
+    }
+
+    const objectRecord = await findObjectById({
+        tenantId: params.tenantId,
+        objectId: params.objectId,
+    });
+
+    if (!objectRecord) {
+        return;
+    }
+
+    const currentPages = getMetadataPages(objectRecord.metadata) ?? [];
+    const pagesByNumber = new Map(currentPages.map((page) => [page.page_number, page]));
+
+    for (const file of pageFiles) {
+        const pageNumber =
+            typeof file.metadata.page_number === "number" &&
+            Number.isInteger(file.metadata.page_number) &&
+            file.metadata.page_number > 0
+                ? file.metadata.page_number
+                : extractPageNumberFromVariant(file.variant!);
+
+        const existing = pagesByNumber.get(pageNumber);
+        if (existing) {
+            if (
+                typeof file.metadata.label === "string" &&
+                existing.label !== file.metadata.label
+            ) {
+                existing.label = file.metadata.label;
+            }
+        } else {
+            pagesByNumber.set(pageNumber, {
+                page_number: pageNumber,
+                label:
+                    typeof file.metadata.label === "string"
+                        ? file.metadata.label
+                        : String(pageNumber),
+                image_artifact_id: null,
+                ocr_text_artifact_id: null,
+            });
+        }
+    }
+
+    const newPages = Array.from(pagesByNumber.values()).sort(
+        (left, right) => left.page_number - right.page_number,
+    );
+
+    const hasChanges =
+        currentPages.length !== newPages.length ||
+        currentPages.some((page, index) => {
+            const other = newPages[index];
+            if (!other) return true;
+            return (
+                page.page_number !== other.page_number ||
+                page.label !== other.label ||
+                page.image_artifact_id !== other.image_artifact_id ||
+                page.ocr_text_artifact_id !== other.ocr_text_artifact_id
+            );
+        });
+
+    if (hasChanges) {
+        await updateObjectMetadataPages({
+            tenantId: params.tenantId,
+            objectId: params.objectId,
+            pages: newPages,
+        });
+    }
 }
 
 function downloadRequestLeaseTtlSeconds(): number {
@@ -1628,6 +1854,10 @@ export async function leaseNextObjectDownloadRequest(params: {
     }
 
     const payload = parseArtifactFetchActionPayload(lease.request);
+
+    console.info(
+        `📦 artifact_fetch_leased request_id=${lease.request.id} worker_id=${params.workerId ?? "unknown"} object_id=${lease.request.targetId} tenant_id=${lease.request.tenantId} artifact_kind=${payload.artifact_kind} variant=${payload.variant ?? "null"} available_file_id=${payload.available_file_id}`,
+    );
 
     const leaseToken = createDownloadRequestLeaseToken({
         request_id: lease.request.id,
@@ -1763,26 +1993,36 @@ export async function presignObjectArtifactUpload(params: {
         leaseToken: params.body.lease_token,
     });
 
+    return buildArtifactUploadPresignResponse({
+        lease: authorizedLease,
+        body: params.body,
+    });
+}
+
+function buildArtifactUploadPresignResponse(params: {
+    lease: AuthorizedWorkerDownloadRequestLease;
+    body: WorkerPresignObjectArtifactUploadBody;
+}): WorkerPresignObjectArtifactUploadResponse {
     const expiresAt = new Date(
         Date.now() + workerUploadTtlSeconds() * 1000,
     ).toISOString();
     const storageKey = buildObjectArtifactStorageKey({
-        tenantId: authorizedLease.tenantId,
-        objectId: authorizedLease.objectId,
-        requestId: authorizedLease.requestId,
-        artifactKind: authorizedLease.artifactKind,
-        variant: authorizedLease.variant,
+        tenantId: params.lease.tenantId,
+        objectId: params.lease.objectId,
+        requestId: params.lease.requestId,
+        artifactKind: params.lease.artifactKind,
+        variant: params.lease.variant,
         extension:
             params.body.extension ||
             extensionFromContentType(params.body.content_type),
     });
 
     const uploadToken = createObjectArtifactUploadToken({
-        request_id: authorizedLease.requestId,
-        object_id: authorizedLease.objectId,
-        tenant_id: authorizedLease.tenantId,
-        artifact_kind: authorizedLease.artifactKind,
-        variant: authorizedLease.variant,
+        request_id: params.lease.requestId,
+        object_id: params.lease.objectId,
+        tenant_id: params.lease.tenantId,
+        artifact_kind: params.lease.artifactKind,
+        variant: params.lease.variant,
         storage_key: storageKey,
         content_type: params.body.content_type,
         size_bytes: params.body.size_bytes,
@@ -1791,13 +2031,81 @@ export async function presignObjectArtifactUpload(params: {
 
     return {
         upload_token: uploadToken,
-        upload_url: `/api/object-download-requests/uploads/${uploadToken}`,
+        upload_url: `/api/archive-requests/uploads/${uploadToken}`,
         storage_key: storageKey,
         expires_at: expiresAt,
         headers: {
             "content-type": params.body.content_type,
             "content-length": params.body.size_bytes,
         },
+    };
+}
+
+export async function authorizeArtifactFetchArchiveRequestLease(params: {
+    requestId: string;
+    leaseToken: string;
+    requireActiveLease?: boolean;
+}): Promise<AuthorizedWorkerDownloadRequestLease> {
+    const authorizedLease = await authorizeWorkerLeaseForArchiveRequest({
+        requestId: params.requestId,
+        leaseToken: params.leaseToken,
+        requireActiveLease: params.requireActiveLease,
+    });
+
+    return await resolveArtifactFetchLeaseContext(authorizedLease);
+}
+
+export async function presignArchiveRequestArtifactUpload(params: {
+    requestId: string;
+    body: WorkerPresignObjectArtifactUploadBody;
+}): Promise<WorkerPresignObjectArtifactUploadResponse> {
+    const authorizedLease = await authorizeArtifactFetchArchiveRequestLease({
+        requestId: params.requestId,
+        leaseToken: params.body.lease_token,
+    });
+
+    return buildArtifactUploadPresignResponse({
+        lease: authorizedLease,
+        body: params.body,
+    });
+}
+
+async function resolveArtifactFetchLeaseContext(
+    authorizedLease: AuthorizedWorkerArchiveRequestLease,
+): Promise<AuthorizedWorkerDownloadRequestLease> {
+    if (authorizedLease.actionType !== "artifact_fetch") {
+        throw new ConflictError(
+            `Archive request '${authorizedLease.requestId}' is not an artifact_fetch request.`,
+        );
+    }
+
+    if (authorizedLease.targetType !== "object") {
+        throw new ConflictError(
+            `Archive request '${authorizedLease.requestId}' does not target an object.`,
+        );
+    }
+
+    const request = await findArchiveRequestById({
+        requestId: authorizedLease.requestId,
+    });
+
+    if (!request) {
+        throw new NotFoundError(
+            `Archive request '${authorizedLease.requestId}' was not found.`,
+        );
+    }
+
+    const payload = parseArtifactFetchActionPayload(request);
+
+    return {
+        requestId: authorizedLease.requestId,
+        leaseId: authorizedLease.leaseId,
+        leaseTokenId: authorizedLease.leaseTokenId,
+        objectId: authorizedLease.targetId,
+        tenantId: authorizedLease.tenantId,
+        artifactKind: payload.artifact_kind,
+        variant: payload.variant,
+        workerId: authorizedLease.workerId,
     };
 }
 
@@ -1863,7 +2171,7 @@ async function resolveArtifactForCompletion(params: {
         upload.variant !== params.lease.variant
     ) {
         throw new ValidationError(
-            "Upload token does not match download request lease context.",
+            "Upload token does not match artifact fetch lease context.",
         );
     }
 
@@ -1910,6 +2218,81 @@ async function resolveArtifactForCompletion(params: {
     }
 }
 
+async function applyArtifactCompletionSideEffects(params: {
+    lease: AuthorizedWorkerDownloadRequestLease;
+    artifact: ObjectArtifactRecord;
+}): Promise<void> {
+    if (
+        params.artifact.kind !== "ocr_text" ||
+        !isPageOcrVariant(params.artifact.variant)
+    ) {
+        return;
+    }
+
+    const pageNumber = extractPageNumberFromVariant(params.artifact.variant);
+    const objectRecord = await findObjectById({
+        tenantId: params.lease.tenantId,
+        objectId: params.lease.objectId,
+    });
+
+    if (!objectRecord) {
+        return;
+    }
+
+    const currentPages = getMetadataPages(objectRecord.metadata) ?? [];
+    const existingPage = currentPages.find(
+        (page) => page.page_number === pageNumber,
+    );
+
+    if (existingPage) {
+        existingPage.ocr_text_artifact_id = params.artifact.id;
+    } else {
+        currentPages.push({
+            page_number: pageNumber,
+            label: String(pageNumber),
+            image_artifact_id: null,
+            ocr_text_artifact_id: params.artifact.id,
+        });
+        currentPages.sort((left, right) => left.page_number - right.page_number);
+    }
+
+    await updateObjectMetadataPages({
+        tenantId: params.lease.tenantId,
+        objectId: params.lease.objectId,
+        pages: currentPages,
+    });
+}
+
+export async function finalizeArtifactFetchArchiveRequest(params: {
+    requestId: string;
+    leaseToken: string;
+    uploadToken: string;
+}): Promise<{
+    lease: AuthorizedWorkerDownloadRequestLease;
+    artifact: ObjectArtifactRecord;
+}> {
+    const authorizedLease = await authorizeArtifactFetchArchiveRequestLease({
+        requestId: params.requestId,
+        leaseToken: params.leaseToken,
+        requireActiveLease: false,
+    });
+
+    const artifact = await resolveArtifactForCompletion({
+        lease: authorizedLease,
+        uploadToken: params.uploadToken,
+    });
+
+    await applyArtifactCompletionSideEffects({
+        lease: authorizedLease,
+        artifact,
+    });
+
+    return {
+        lease: authorizedLease,
+        artifact,
+    };
+}
+
 export async function completeObjectDownloadRequestByWorker(params: {
     requestId: string;
     body: WorkerCompleteObjectDownloadRequestBody;
@@ -1923,6 +2306,11 @@ export async function completeObjectDownloadRequestByWorker(params: {
     const artifact = await resolveArtifactForCompletion({
         lease: authorizedLease,
         uploadToken: params.body.upload_token,
+    });
+
+    await applyArtifactCompletionSideEffects({
+        lease: authorizedLease,
+        artifact,
     });
 
     const request = await findArchiveRequestById({ requestId: params.requestId });

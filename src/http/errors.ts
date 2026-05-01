@@ -7,6 +7,9 @@ export type ErrorCode =
   | "NOT_FOUND"
   | "METHOD_NOT_ALLOWED"
   | "CONFLICT"
+  | "REVISION_CONFLICT"
+  | "LOCKED"
+  | "VALIDATION_FAILED"
   | "CONFIGURATION_ERROR"
   | "INTERNAL_SERVER_ERROR";
 
@@ -67,6 +70,24 @@ export class MethodNotAllowedError extends AppError {
 export class ConflictError extends AppError {
   constructor(message: string, details?: unknown) {
     super(409, "CONFLICT", message, { details });
+  }
+}
+
+export class RevisionConflictError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super(409, "REVISION_CONFLICT", message, { details });
+  }
+}
+
+export class LockedError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super(423, "LOCKED", message, { details });
+  }
+}
+
+export class UnprocessableEntityError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super(422, "VALIDATION_FAILED", message, { details });
   }
 }
 

@@ -477,7 +477,7 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
 
       expect(objectRows.length).toBe(1);
       expect(objectRows[0]?.type).toBe("DOCUMENT");
-      expect(objectRows[0]?.title).toBe("Summary-driven title");
+      expect(objectRows[0]?.title).toBe("Events Item 001");
       expect(objectRows[0]?.language_code).toBe("en");
       expect(objectRows[0]?.access_level).toBe("family");
       expect(objectRows[0]?.embargo_kind).toBe("timed");

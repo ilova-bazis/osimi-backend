@@ -951,6 +951,794 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
         expect(viewerPatchResponse.status).toBe(403);
     });
 
+    test("returns object edit payload with metadata foundation", async () => {
+        const app = createTestApp();
+
+        const response = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectIdTwo}/edit`, {
+                headers: {
+                    authorization: `Bearer ${operatorToken}`,
+                },
+            }),
+        );
+
+        expect(response.status).toBe(200);
+        const body = (await response.json()) as {
+            object_id: string;
+            media_type: string;
+            revision: number;
+            draft: { updated_at: string; updated_by: string | null } | null;
+            metadata: {
+                title: string;
+                publication_date: string;
+                date_precision: string;
+                date_approximate: boolean;
+                language: string | null;
+                tags: string[];
+                people: string[];
+                description: string | null;
+            };
+            rights: {
+                access_level: string;
+                rights_note: string | null;
+                sensitivity_note: string | null;
+            };
+            capabilities: {
+                can_edit_metadata: boolean;
+                can_curate_text: boolean;
+                can_submit_review: boolean;
+            };
+            curation_payload: {
+                kind: "document";
+                machine_ocr_artifact_id: string | null;
+                page_count: number | null;
+                pages: Array<{
+                    page_number: number;
+                    label: string | null;
+                    machine_text: string;
+                    curated_text: string | null;
+                    status?: string;
+                }>;
+            };
+        };
+
+        expect(body.object_id).toBe(tenantOneObjectIdTwo);
+        expect(body.media_type).toBe("document");
+        expect(body.revision).toBe(0);
+        expect(body.draft).toBeNull();
+        expect(body.metadata).toEqual({
+            title: "Project Ledger",
+            publication_date: "",
+            date_precision: "none",
+            date_approximate: false,
+            language: "en",
+            tags: ["finance"],
+            people: [],
+            description: null,
+        });
+        expect(body.rights).toEqual({
+            access_level: "private",
+            rights_note: null,
+            sensitivity_note: null,
+        });
+        expect(body.capabilities).toEqual({
+            can_edit_metadata: true,
+            can_curate_text: true,
+            can_submit_review: true,
+        });
+        expect(body.curation_payload.kind).toBe("document");
+        expect(body.curation_payload.machine_ocr_artifact_id).toBeNull();
+        expect(body.curation_payload.page_count).toBeNull();
+        expect(body.curation_payload.pages).toEqual([]);
+    });
+
+    test("supports document OCR page editing through edit payload and curation write", async () => {
+        const app = createTestApp();
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        const pageOneArtifactId = "60000000-0000-4000-8000-000000000881";
+        const pageTwoArtifactId = "60000000-0000-4000-8000-000000000882";
+        const pageOneStorageKey = `tenants/${tenantOneId}/objects/${tenantOneObjectIdTwo}/artifacts/ocr-page-1.txt`;
+        const pageTwoStorageKey = `tenants/${tenantOneId}/objects/${tenantOneObjectIdTwo}/artifacts/ocr-page-2.txt`;
+
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+                INSERT INTO object_artifacts (id, object_id, kind, variant, storage_key, content_type, size_bytes)
+                VALUES
+                    (
+                        ${pageOneArtifactId},
+                        ${tenantOneObjectIdTwo},
+                        ${"ocr_text"}::artifact_kind,
+                        ${"page-1"},
+                        ${pageOneStorageKey},
+                        ${"text/plain"},
+                        ${20}
+                    ),
+                    (
+                        ${pageTwoArtifactId},
+                        ${tenantOneObjectIdTwo},
+                        ${"ocr_text"}::artifact_kind,
+                        ${"page-2"},
+                        ${pageTwoStorageKey},
+                        ${"text/plain"},
+                        ${22}
+                    )
+                ON CONFLICT (storage_key)
+                DO NOTHING
+            `;
+            await sql`
+                UPDATE objects
+                SET metadata = COALESCE(metadata, '{}'::jsonb) || ${{page_count: 2, pages: [
+                        {
+                            page_number: 1,
+                            label: "1",
+                            ocr_text_artifact_id: pageOneArtifactId,
+                        },
+                        {
+                            page_number: 2,
+                            label: "2",
+                            ocr_text_artifact_id: pageTwoArtifactId,
+                        },
+                    ]}}
+                WHERE object_id = ${tenantOneObjectIdTwo}
+            `;
+        } finally {
+            await sql.close();
+        }
+
+        await mkdir(dirname(join(stagingRoot, pageOneStorageKey)), { recursive: true });
+        await Bun.write(join(stagingRoot, pageOneStorageKey), "machine page 1\n");
+        await Bun.write(join(stagingRoot, pageTwoStorageKey), "machine page 2\n");
+
+        const initialEditResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectIdTwo}/edit`, {
+                headers: {
+                    authorization: `Bearer ${operatorToken}`,
+                },
+            }),
+        );
+
+        expect(initialEditResponse.status).toBe(200);
+        const initialEditBody = (await initialEditResponse.json()) as {
+            revision: number;
+            curation_payload: {
+                kind: string;
+                machine_ocr_artifact_id: string | null;
+                page_count: number | null;
+                pages: Array<{
+                    page_number: number;
+                    label: string | null;
+                    machine_text: string;
+                    curated_text: string | null;
+                    status?: string;
+                }>;
+            };
+        };
+
+        expect(initialEditBody.revision).toBe(0);
+        expect(initialEditBody.curation_payload.kind).toBe("document");
+        if (initialEditBody.curation_payload.kind !== "document") {
+            throw new Error("Expected document curation payload");
+        }
+        expect(initialEditBody.curation_payload.machine_ocr_artifact_id).toBe(
+            pageOneArtifactId,
+        );
+        expect(initialEditBody.curation_payload.page_count).toBe(2);
+        expect(initialEditBody.curation_payload.pages).toEqual([
+            {
+                page_number: 1,
+                label: "1",
+                machine_text: "machine page 1\n",
+                curated_text: null,
+                status: "machine",
+            },
+            {
+                page_number: 2,
+                label: "2",
+                machine_text: "machine page 2\n",
+                curated_text: null,
+                status: "machine",
+            },
+        ]);
+
+        const updateResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectIdTwo}/curation/document`,
+                {
+                    method: "PUT",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 0,
+                        pages: [
+                            {
+                                page_number: 1,
+                                curated_text: "curated page 1",
+                            },
+                            {
+                                page_number: 2,
+                                curated_text: "curated page 2",
+                            },
+                        ],
+                    }),
+                },
+            ),
+        );
+
+        expect(updateResponse.status).toBe(200);
+        const updateBody = (await updateResponse.json()) as {
+            object_id: string;
+            revision: number;
+            updated_count: number;
+            updated_at: string;
+        };
+        expect(updateBody.object_id).toBe(tenantOneObjectIdTwo);
+        expect(updateBody.revision).toBe(1);
+        expect(updateBody.updated_count).toBe(2);
+        expect(Date.parse(updateBody.updated_at)).not.toBeNaN();
+
+        const updatedEditResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectIdTwo}/edit`, {
+                headers: {
+                    authorization: `Bearer ${operatorToken}`,
+                },
+            }),
+        );
+
+        expect(updatedEditResponse.status).toBe(200);
+        const updatedEditBody = (await updatedEditResponse.json()) as {
+            revision: number;
+            curation_payload: {
+                kind: string;
+                pages: Array<{
+                    page_number: number;
+                    label: string | null;
+                    machine_text: string;
+                    curated_text: string | null;
+                    status?: string;
+                }>;
+            };
+        };
+        expect(updatedEditBody.revision).toBe(1);
+        expect(updatedEditBody.curation_payload.kind).toBe("document");
+        expect(updatedEditBody.curation_payload.pages).toEqual([
+            {
+                page_number: 1,
+                label: "1",
+                machine_text: "machine page 1\n",
+                curated_text: "curated page 1",
+                status: "edited",
+            },
+            {
+                page_number: 2,
+                label: "2",
+                machine_text: "machine page 2\n",
+                curated_text: "curated page 2",
+                status: "edited",
+            },
+        ]);
+
+        const historyResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectIdTwo}/curation/history`,
+                {
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                    },
+                },
+            ),
+        );
+
+        expect(historyResponse.status).toBe(200);
+        const historyBody = (await historyResponse.json()) as {
+            events: Array<{
+                type: string;
+                revision_before: number;
+                revision_after: number;
+                payload: { page_numbers?: number[] };
+            }>;
+        };
+        expect(historyBody.events[0]?.type).toBe("DOCUMENT_PAGE_UPDATED");
+        expect(historyBody.events[0]?.revision_before).toBe(0);
+        expect(historyBody.events[0]?.revision_after).toBe(1);
+        expect(historyBody.events[0]?.payload.page_numbers).toEqual([1, 2]);
+
+        const cleanupSql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await cleanupSql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await cleanupSql`
+                DELETE FROM object_curated_document_pages WHERE object_id = ${tenantOneObjectIdTwo}
+            `;
+            await cleanupSql`
+                DELETE FROM object_edit_events WHERE object_id = ${tenantOneObjectIdTwo}
+            `;
+            await cleanupSql`
+                UPDATE object_edit_revisions SET revision = 0, updated_at = now(), updated_by = NULL
+                WHERE object_id = ${tenantOneObjectIdTwo}
+            `;
+            await cleanupSql`
+                UPDATE objects
+                SET metadata = ${{source: "scanner-b"}},
+                    curation_state = ${"needs_review"}::object_curation_state,
+                    updated_at = ${"2026-02-12T12:00:00.000Z"}::timestamptz
+                WHERE object_id = ${tenantOneObjectIdTwo}
+            `;
+            await cleanupSql`
+                DELETE FROM object_artifacts WHERE object_id = ${tenantOneObjectIdTwo}
+            `;
+        } finally {
+            await cleanupSql.close();
+        }
+    });
+
+    test("submits document OCR curation as curation_apply request", async () => {
+        const app = createTestApp();
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        const pageOneArtifactId = "60000000-0000-4000-8000-000000000883";
+        const pageOneStorageKey = `tenants/${tenantOneId}/objects/${tenantOneObjectId}/artifacts/ocr-submit-page-1.txt`;
+
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+                INSERT INTO object_artifacts (id, object_id, kind, variant, storage_key, content_type, size_bytes)
+                VALUES (
+                    ${pageOneArtifactId},
+                    ${tenantOneObjectId},
+                    ${"ocr_text"}::artifact_kind,
+                    ${"page-1"},
+                    ${pageOneStorageKey},
+                    ${"text/plain"},
+                    ${20}
+                )
+                ON CONFLICT (storage_key)
+                DO NOTHING
+            `;
+            await sql`
+                UPDATE objects
+                SET metadata = COALESCE(metadata, '{}'::jsonb) || ${{page_count: 1, pages: [
+                        {
+                            page_number: 1,
+                            label: "1",
+                            ocr_text_artifact_id: pageOneArtifactId,
+                        },
+                    ]}}
+                WHERE object_id = ${tenantOneObjectId}
+            `;
+        } finally {
+            await sql.close();
+        }
+
+        await mkdir(dirname(join(stagingRoot, pageOneStorageKey)), { recursive: true });
+        await Bun.write(join(stagingRoot, pageOneStorageKey), "machine submit page 1\n");
+
+        const saveResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/document`,
+                {
+                    method: "PUT",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 0,
+                        pages: [
+                            {
+                                page_number: 1,
+                                curated_text: "curated submit page 1",
+                            },
+                        ],
+                    }),
+                },
+            ),
+        );
+        expect(saveResponse.status).toBe(200);
+
+        const submitResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/submit`,
+                {
+                    method: "POST",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 1,
+                        review_note: "Ready for archive apply.",
+                    }),
+                },
+            ),
+        );
+
+        expect(submitResponse.status).toBe(200);
+        const submitBody = (await submitResponse.json()) as {
+            object_id: string;
+            revision: number;
+            curation_state: string;
+            request: {
+                id: string;
+                action_type: string;
+                status: string;
+            };
+            submitted_at: string;
+            submitted_by: string;
+        };
+
+        expect(submitBody.object_id).toBe(tenantOneObjectId);
+        expect(submitBody.revision).toBe(2);
+        expect(submitBody.curation_state).toBe("review_in_progress");
+        expect(submitBody.request.action_type).toBe("curation_apply");
+        expect(submitBody.request.status).toBe("PENDING");
+        expect(Date.parse(submitBody.submitted_at)).not.toBeNaN();
+        expect(submitBody.submitted_by).toBe(
+            "10000000-0000-0000-0000-000000000001",
+        );
+
+        const historyResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/history`,
+                {
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                    },
+                },
+            ),
+        );
+        expect(historyResponse.status).toBe(200);
+        const historyBody = (await historyResponse.json()) as {
+            events: Array<{
+                type: string;
+                revision_before: number;
+                revision_after: number;
+                payload: { request_id?: string; review_note?: string | null };
+            }>;
+        };
+        expect(historyBody.events[0]?.type).toBe("CURATION_SUBMITTED");
+        expect(historyBody.events[0]?.revision_before).toBe(1);
+        expect(historyBody.events[0]?.revision_after).toBe(2);
+        expect(historyBody.events[0]?.payload.request_id).toBe(
+            submitBody.request.id,
+        );
+        expect(historyBody.events[0]?.payload.review_note).toBe(
+            "Ready for archive apply.",
+        );
+
+        const verifySql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await verifySql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            const archiveRows = await verifySql<
+                Array<{
+                    id: string;
+                    target_id: string;
+                    action_type: "curation_apply";
+                    requested_by: string;
+                    dedupe_key: string | null;
+                    status: "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED" | "CANCELED";
+                }>
+            >`
+                SELECT id, target_id, action_type, requested_by, dedupe_key, status
+                FROM archive_requests
+                WHERE id = ${submitBody.request.id}
+                LIMIT 1
+            `;
+
+            expect(archiveRows).toHaveLength(1);
+            expect(archiveRows[0]?.target_id).toBe(tenantOneObjectId);
+            expect(archiveRows[0]?.action_type).toBe("curation_apply");
+            expect(archiveRows[0]?.requested_by).toBe(submitBody.submitted_by);
+            expect(archiveRows[0]?.dedupe_key).toContain(`${tenantOneObjectId}:ocr_curated:`);
+            expect(archiveRows[0]?.status).toBe("PENDING");
+        } finally {
+            await verifySql.close();
+        }
+
+        const cleanupSql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await cleanupSql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await cleanupSql`
+                DELETE FROM archive_requests WHERE tenant_id = ${tenantOneId}
+                    AND action_type = ${"curation_apply"}::archive_request_action_type
+            `;
+            await cleanupSql`
+                DELETE FROM object_curated_document_pages WHERE object_id = ${tenantOneObjectId}
+            `;
+            await cleanupSql`
+                DELETE FROM object_edit_events WHERE object_id = ${tenantOneObjectId}
+            `;
+            await cleanupSql`
+                UPDATE object_edit_revisions SET revision = 0, updated_at = now(), updated_by = NULL
+                WHERE object_id = ${tenantOneObjectId}
+            `;
+            await cleanupSql`
+                UPDATE objects
+                SET metadata = ${{source: "scanner-a"}},
+                    curation_state = ${"needs_review"}::object_curation_state,
+                    updated_at = ${"2026-02-09T10:00:00.000Z"}::timestamptz
+                WHERE object_id = ${tenantOneObjectId}
+            `;
+            await cleanupSql`
+                DELETE FROM object_artifacts WHERE object_id = ${tenantOneObjectId}
+                    AND storage_key LIKE '%ocr-submit-page%'
+            `;
+        } finally {
+            await cleanupSql.close();
+        }
+    });
+
+    test("updates object metadata with revisioning and records history", async () => {
+        const app = createTestApp();
+
+        const patchResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/metadata`,
+                {
+                    method: "PATCH",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 0,
+                        metadata: {
+                            title: "Edited Metadata Title",
+                            publication_date: "1987-06-14",
+                            date_precision: "day",
+                            date_approximate: true,
+                            language: "Tajik",
+                            tags: ["Oral History", "Migration"],
+                            people: ["Zarina T.", "M. Davlatov"],
+                            description: "Updated description",
+                        },
+                        rights: {
+                            rights_note: "Updated rights note",
+                            sensitivity_note: "Updated sensitivity note",
+                        },
+                    }),
+                },
+            ),
+        );
+
+        expect(patchResponse.status).toBe(200);
+        const patchBody = (await patchResponse.json()) as {
+            object_id: string;
+            revision: number;
+            curation_state: string;
+            updated_at: string;
+        };
+        expect(patchBody.object_id).toBe(tenantOneObjectId);
+        expect(patchBody.revision).toBe(1);
+        expect(patchBody.curation_state).toBe("needs_review");
+        expect(Date.parse(patchBody.updated_at)).not.toBeNaN();
+
+        const editResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit`, {
+                headers: {
+                    authorization: `Bearer ${operatorToken}`,
+                },
+            }),
+        );
+
+        expect(editResponse.status).toBe(200);
+        const editBody = (await editResponse.json()) as {
+            revision: number;
+            draft: { updated_by: string | null } | null;
+            metadata: {
+                title: string;
+                publication_date: string;
+                date_precision: string;
+                date_approximate: boolean;
+                language: string | null;
+                tags: string[];
+                people: string[];
+                description: string | null;
+            };
+            rights: {
+                access_level: string;
+                rights_note: string | null;
+                sensitivity_note: string | null;
+            };
+        };
+
+        expect(editBody.revision).toBe(1);
+        expect(editBody.draft?.updated_by).toBe(
+            "10000000-0000-0000-0000-000000000001",
+        );
+        expect(editBody.metadata).toEqual({
+            title: "Edited Metadata Title",
+            publication_date: "1987-06-14",
+            date_precision: "day",
+            date_approximate: true,
+            language: "Tajik",
+            tags: ["migration", "oral history"],
+            people: ["Zarina T.", "M. Davlatov"],
+            description: "Updated description",
+        });
+        expect(editBody.rights).toEqual({
+            access_level: "private",
+            rights_note: "Updated rights note",
+            sensitivity_note: "Updated sensitivity note",
+        });
+
+        const historyResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/history`,
+                {
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                    },
+                },
+            ),
+        );
+
+        expect(historyResponse.status).toBe(200);
+        const historyBody = (await historyResponse.json()) as {
+            object_id: string;
+            events: Array<{
+                type: string;
+                revision_before: number;
+                revision_after: number;
+            }>;
+            next_cursor: string | null;
+        };
+
+        expect(historyBody.object_id).toBe(tenantOneObjectId);
+        expect(historyBody.events).toHaveLength(2);
+        expect(historyBody.events.map((event) => event.type).sort()).toEqual([
+            "METADATA_UPDATED",
+            "RIGHTS_UPDATED",
+        ]);
+        expect(historyBody.events[0]?.revision_before).toBe(0);
+        expect(historyBody.events[0]?.revision_after).toBe(1);
+        expect(historyBody.next_cursor).toBeNull();
+    });
+
+    test("rejects stale object metadata revision", async () => {
+        const app = createTestApp();
+
+        await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/metadata`,
+                {
+                    method: "PATCH",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 0,
+                        metadata: {
+                            title: "Prime metadata revision",
+                            publication_date: "",
+                            date_precision: "none",
+                            date_approximate: false,
+                            language: null,
+                            tags: [],
+                            people: [],
+                            description: null,
+                        },
+                        rights: {
+                            rights_note: null,
+                            sensitivity_note: null,
+                        },
+                    }),
+                },
+            ),
+        );
+
+        const response = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/metadata`,
+                {
+                    method: "PATCH",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 0,
+                        metadata: {
+                            title: "Stale edit",
+                            publication_date: "",
+                            date_precision: "none",
+                            date_approximate: false,
+                            language: null,
+                            tags: [],
+                            people: [],
+                            description: null,
+                        },
+                        rights: {
+                            rights_note: null,
+                            sensitivity_note: null,
+                        },
+                    }),
+                },
+            ),
+        );
+
+        expect(response.status).toBe(409);
+        const body = (await response.json()) as {
+            error: {
+                code: string;
+                details: { latest_revision: number };
+            };
+        };
+
+        expect(body.error.code).toBe("REVISION_CONFLICT");
+        expect(body.error.details.latest_revision).toBe(1);
+    });
+
+    test("rejects invalid document OCR page updates", async () => {
+        const app = createTestApp();
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+                UPDATE objects
+                SET metadata = COALESCE(metadata, '{}'::jsonb) || ${{page_count: 1, pages: [
+                        {
+                            page_number: 1,
+                            label: "1",
+                            ocr_text_artifact_id: null,
+                        },
+                    ]}}
+                WHERE object_id = ${tenantOneObjectId}
+            `;
+        } finally {
+            await sql.close();
+        }
+
+        const editResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit`, {
+                headers: {
+                    authorization: `Bearer ${operatorToken}`,
+                },
+            }),
+        );
+        const editBody = (await editResponse.json()) as { revision: number };
+
+        const response = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/document`,
+                {
+                    method: "PUT",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: editBody.revision,
+                        pages: [
+                            {
+                                page_number: 999,
+                                curated_text: "invalid page",
+                            },
+                        ],
+                    }),
+                },
+            ),
+        );
+
+        expect(response.status).toBe(422);
+        const body = (await response.json()) as {
+            error: {
+                code: string;
+                details: Array<{ path: string; code: string; page_number: number }>;
+            };
+        };
+        expect(body.error.code).toBe("VALIDATION_FAILED");
+        expect(body.error.details).toEqual([
+            {
+                path: "pages",
+                code: "INVALID_PAGE_NUMBER",
+                page_number: 999,
+            },
+        ]);
+    });
+
     test("returns resolved thumbnail_artifact_id in patch responses", async () => {
         const app = createTestApp();
         const sql = createSqlClient(TEST_DATABASE_URL!);
@@ -2431,19 +3219,21 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
             | {
                   request_id: string;
                   lease_token: string;
-                  artifact_kind: string;
-                  object_id: string;
+                  action_type: string;
+                  target_id: string;
               }
             | null = null;
 
         for (let attempt = 0; attempt < 20; attempt += 1) {
             const leaseResponse = await app.fetch(
-                new Request("http://localhost/api/object-download-requests/lease", {
+                new Request("http://localhost/api/archive-requests/lease", {
                     method: "POST",
                     headers: {
                         "x-worker-auth-token": "worker-secret",
                         "x-worker-id": "worker-artifact-flow",
+                        "content-type": "application/json",
                     },
+                    body: JSON.stringify({ action_type: "artifact_fetch" }),
                 }),
             );
 
@@ -2452,8 +3242,8 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
                 request: {
                     request_id: string;
                     lease_token: string;
-                    artifact_kind: string;
-                    object_id: string;
+                    action_type: string;
+                    target_id: string;
                 } | null;
             };
 
@@ -2470,7 +3260,7 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
 
             const releaseResponse = await app.fetch(
                 new Request(
-                    `http://localhost/api/object-download-requests/${leaseBody.request.request_id}/lease/release`,
+                    `http://localhost/api/archive-requests/${leaseBody.request.request_id}/lease/release`,
                     {
                         method: "POST",
                         headers: {
@@ -2489,12 +3279,12 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
 
         expect(leasedRequest).not.toBeNull();
         expect(leasedRequest?.request_id).toBe(createBody.request.id);
-        expect(leasedRequest?.artifact_kind).toBe("web_version");
-        expect(leasedRequest?.object_id).toBe(tenantOneObjectIdTwo);
+        expect(leasedRequest?.action_type).toBe("artifact_fetch");
+        expect(leasedRequest?.target_id).toBe(tenantOneObjectIdTwo);
 
         const presignResponse = await app.fetch(
             new Request(
-                `http://localhost/api/object-download-requests/${leasedRequest!.request_id}/artifacts/presign`,
+                `http://localhost/api/archive-requests/${leasedRequest!.request_id}/artifacts/presign`,
                 {
                     method: "POST",
                     headers: {
@@ -2530,9 +3320,27 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
 
         expect(uploadResponse.status).toBe(200);
 
+        const missingUploadTokenResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/archive-requests/${leasedRequest!.request_id}/complete`,
+                {
+                    method: "POST",
+                    headers: {
+                        "x-worker-auth-token": "worker-secret",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        lease_token: leasedRequest!.lease_token,
+                    }),
+                },
+            ),
+        );
+
+        expect(missingUploadTokenResponse.status).toBe(400);
+
         const completeResponse = await app.fetch(
             new Request(
-                `http://localhost/api/object-download-requests/${leasedRequest!.request_id}/complete`,
+                `http://localhost/api/archive-requests/${leasedRequest!.request_id}/complete`,
                 {
                     method: "POST",
                     headers: {
@@ -2550,10 +3358,11 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
         expect(completeResponse.status).toBe(200);
         const completeBody = (await completeResponse.json()) as {
             status: string;
-            artifact: { kind: string };
+            request: { status: string; action_type: string };
         };
         expect(completeBody.status).toBe("completed");
-        expect(completeBody.artifact.kind).toBe("web_version");
+        expect(completeBody.request.status).toBe("COMPLETED");
+        expect(completeBody.request.action_type).toBe("artifact_fetch");
 
         const listRequestsResponse = await app.fetch(
             new Request(
@@ -2716,6 +3525,7 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
                     },
                     body: JSON.stringify({
                         lease_token: heartbeatBody.request.lease_token,
+                        upload_token: "ignored-for-object-resync",
                     }),
                 },
             ),

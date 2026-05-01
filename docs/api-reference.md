@@ -48,9 +48,7 @@ On non-2xx responses, JSON errors follow this shape:
 
 `error.details` is optional and included only when provided by the server.
 
-Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NOT_ALLOWED`, `CONFLICT`, `CONFIGURATION_ERROR`, `INTERNAL_SERVER_ERROR`.
-
-Planned addition: `LOCKED` (for HTTP `423` state-based non-deliverable conditions).
+Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NOT_ALLOWED`, `CONFLICT`, `REVISION_CONFLICT`, `LOCKED`, `VALIDATION_FAILED`, `CONFIGURATION_ERROR`, `INTERNAL_SERVER_ERROR`.
 
 ---
 
@@ -419,11 +417,10 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - Preconditions:
   - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
   - ingestion has not started processing (no active lease)
-  - request body must include at least one updatable field
 - 200 response:
   - `ingestion` (Ingestion Schema)
 - Error behavior:
-  - `400 BAD_REQUEST` for invalid body/field validation or empty patch body
+  - `400 BAD_REQUEST` for invalid body/field validation
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when ingestion does not exist in tenant scope
@@ -1168,7 +1165,7 @@ Example response:
   - `sort` (optional; currently `created_at_desc` only)
   - `target_type` (optional `object|ingestion`)
   - `target_id` (optional string; requires `target_type`; for `target_type=object` must match `OBJ-YYYYMMDD-XXXXXX`)
-  - `action_type` (optional `object_resync|artifact_fetch`)
+  - `action_type` (optional `object_resync|artifact_fetch|curation_apply`)
   - `status` (optional; can be repeated and/or comma-separated; values `PENDING|PROCESSING|COMPLETED|FAILED|CANCELED`)
   - `active_only` (optional boolean; when `true`, equivalent to filtering `PENDING|PROCESSING`)
     - precedence: when `active_only=true`, backend ignores explicit `status` filters and uses `PENDING|PROCESSING`
@@ -1194,12 +1191,473 @@ Example response:
 - Body:
   - `title` (required string, non-empty)
 - Notes:
-  - `metadata` patching is intentionally not supported in this phase.
+  - legacy title-only endpoint retained for backward compatibility
+  - new editing clients SHOULD use `GET /api/objects/:object_id/edit` and `PATCH /api/objects/:object_id/metadata`
 - 200 response:
   - `object` (Base Object Schema)
   - includes resolved `thumbnail_artifact_id` (`null` when no thumbnail artifact exists)
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:object_id` format or invalid body
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when object does not exist in tenant scope
+
+### GET `/api/objects/:object_id/edit`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Purpose:
+  - backend object editing read model
+  - returns editable first-class metadata, rights fields, edit lock state, and current capabilities
+  - current implementation includes metadata editing plus document OCR page curation payloads for document objects
+  - **auto-acquires an edit lock** for the requesting user (or extends an existing lock held by the same user)
+- 200 response:
+  - `object_id`
+  - `media_type` (`document|image|audio|video|other`)
+  - `curation_state`
+  - `lock`:
+    - `locked` (boolean)
+    - `locked_by` (user id or `null`)
+    - `locked_until` (ISO timestamp or `null`)
+    - when another user holds the lock, `capabilities` are all `false`
+  - `draft` (`null` before first user edit, otherwise `{ updated_at, updated_by }`)
+    - `updated_by` is currently a user id or `null`
+  - `metadata`:
+    - `title`
+    - `publication_date`
+    - `date_precision` (`none|year|month|day`)
+    - `date_approximate`
+    - `language`
+    - `tags[]`
+    - `people[]`
+    - `description`
+  - `rights`:
+    - `access_level`
+    - `rights_note`
+    - `sensitivity_note`
+    - `access_level` is read-only in this contract
+  - `capabilities`:
+    - `can_edit_metadata`
+    - `can_curate_text`
+    - `can_submit_review`
+  - `curation_payload`:
+    - for `document`:
+      - `kind = document`
+      - `machine_ocr_artifact_id` (string or `null`; `null` when no OCR artifact exists)
+      - `page_count` (integer or `null`; `null` when no valid page count in metadata)
+      - `pages[]` (`page_number`, `label` (string or `null`), `machine_text`, `curated_text` (string or `null`), `status`)
+    - for non-document types:
+      - `kind` (`image|audio|video|other`)
+- Example response:
+
+```json
+{
+  "object_id": "OBJ-20260213-ABC123",
+  "media_type": "document",
+  "curation_state": "needs_review",
+  "lock": {
+    "locked": true,
+    "locked_by": "10000000-0000-0000-0000-000000000001",
+    "locked_until": "2026-04-21T23:00:00.000Z"
+  },
+  "draft": {
+    "updated_at": "2026-04-14T10:32:44.000Z",
+    "updated_by": "10000000-0000-0000-0000-000000000001"
+  },
+  "metadata": {
+    "title": "Edited Metadata Title",
+    "publication_date": "1987-06-14",
+    "date_precision": "day",
+    "date_approximate": true,
+    "language": "Tajik",
+    "tags": ["migration", "oral history"],
+    "people": ["Zarina T.", "M. Davlatov"],
+    "description": "Updated description"
+  },
+  "rights": {
+    "access_level": "private",
+    "rights_note": "Updated rights note",
+    "sensitivity_note": "Updated sensitivity note"
+  },
+  "capabilities": {
+    "can_edit_metadata": true,
+    "can_curate_text": true,
+    "can_submit_review": true
+  },
+  "curation_payload": {
+    "kind": "document",
+    "machine_ocr_artifact_id": "60000000-0000-4000-8000-000000000881",
+    "page_count": 2,
+    "pages": [
+      {
+        "page_number": 1,
+        "label": "1",
+        "machine_text": "Machine OCR page 1...",
+        "curated_text": null,
+        "status": "machine"
+      },
+      {
+        "page_number": 2,
+        "label": "2",
+        "machine_text": "Machine OCR page 2...",
+        "curated_text": "Curated OCR page 2...",
+        "status": "edited"
+      }
+    ]
+  }
+}
+```
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid `:object_id` format
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when object does not exist in tenant scope
+  - `423 LOCKED` when another user holds the edit lock (returned with current lock info in response body)
+
+### PATCH `/api/objects/:object_id/metadata`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Purpose:
+  - updates backend-managed first-class object editing metadata and rights notes
+- Body:
+  - `metadata`:
+    - `title` (required non-empty string)
+    - `publication_date` (required string; normalized to `""` when `date_precision = none`)
+    - `date_precision` (`none|year|month|day`, required)
+    - `date_approximate` (required boolean; normalized to `false` when `date_precision = none`)
+    - `language` (nullable string)
+    - `tags[]` (required array of non-empty strings; normalized lowercase, de-duplicated before normalization)
+    - `people[]` (required array of non-empty strings; de-duplicated after trimming)
+    - `description` (nullable string)
+  - `rights`:
+    - `rights_note` (nullable non-empty string when provided)
+    - `sensitivity_note` (nullable non-empty string when provided)
+- Example request:
+
+```json
+{
+  "metadata": {
+    "title": "Edited Metadata Title",
+    "publication_date": "1987-06-14",
+    "date_precision": "day",
+    "date_approximate": true,
+    "language": "Tajik",
+    "tags": ["Oral History", "Migration"],
+    "people": ["Zarina T.", "M. Davlatov"],
+    "description": "Updated description"
+  },
+  "rights": {
+    "rights_note": "Updated rights note",
+    "sensitivity_note": "Updated sensitivity note"
+  }
+}
+```
+- 200 response:
+  - `object_id`
+  - `curation_state`
+  - `updated_at`
+- Example success response:
+
+```json
+{
+  "object_id": "OBJ-20260213-ABC123",
+  "curation_state": "needs_review",
+  "updated_at": "2026-04-14T10:38:52.000Z"
+}
+```
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid `:object_id` format
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when object does not exist in tenant scope
+  - `423 LOCKED` when another user holds the edit lock
+  - `422 VALIDATION_FAILED` for invalid metadata payload
+- Example `423 LOCKED`:
+
+```json
+{
+  "request_id": "uuid",
+  "error": {
+    "code": "LOCKED",
+    "message": "Object is currently being edited by another user.",
+    "details": {
+      "locked_by": "10000000-0000-0000-0000-000000000002",
+      "locked_until": "2026-04-21T23:00:00.000Z"
+    }
+  }
+}
+```
+- 200 response:
+  - `object_id`
+  - `revision`
+  - `curation_state`
+  - `updated_at`
+- Example success response:
+
+```json
+{
+  "object_id": "OBJ-20260213-ABC123",
+  "revision": 2,
+  "curation_state": "needs_review",
+  "updated_at": "2026-04-14T10:38:52.000Z"
+}
+```
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid `:object_id` format
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when object does not exist in tenant scope
+  - `409 REVISION_CONFLICT` with `error.details.latest_revision` when request revision is stale
+  - `422 VALIDATION_FAILED` for invalid metadata payload
+- Example `409 REVISION_CONFLICT`:
+
+```json
+{
+  "request_id": "uuid",
+  "error": {
+    "code": "REVISION_CONFLICT",
+    "message": "Object edit revision is stale.",
+    "details": {
+      "object_id": "OBJ-20260213-ABC123",
+      "latest_revision": 2
+    }
+  }
+}
+```
+- Example `422 VALIDATION_FAILED`:
+
+```json
+{
+  "request_id": "uuid",
+  "error": {
+    "code": "VALIDATION_FAILED",
+    "message": "Validation failed.",
+    "details": [
+      {
+        "path": "metadata.publication_date",
+        "code": "INVALID"
+      }
+    ]
+  }
+}
+```
+
+### PUT `/api/objects/:object_id/curation/document`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Purpose:
+  - saves curated OCR text page-by-page for one document object
+- Body:
+  - `pages[]` (required, non-empty):
+    - `page_number` (required positive integer)
+    - `curated_text` (required string; may be empty)
+- Rules:
+  - valid only for document objects
+  - only submitted pages are updated
+  - duplicate `page_number` values in one request are rejected
+  - page numbers must exist in the current document page projection
+- Example request:
+
+```json
+{
+  "pages": [
+    {
+      "page_number": 1,
+      "curated_text": "Curated page 1 text..."
+    },
+    {
+      "page_number": 2,
+      "curated_text": "Curated page 2 text..."
+    }
+  ]
+}
+```
+- 200 response:
+  - `object_id`
+  - `updated_count` (integer >= 1)
+  - `updated_at`
+- Example success response:
+
+```json
+{
+  "object_id": "OBJ-20260213-ABC123",
+  "updated_count": 2,
+  "updated_at": "2026-04-14T11:00:00.000Z"
+}
+```
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid `:object_id` format
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when object does not exist in tenant scope
+  - `423 LOCKED` when another user holds the edit lock
+  - `409 CONFLICT` when object is not a document
+  - `422 VALIDATION_FAILED` for invalid page payload or invalid page numbers
+- Example `422 VALIDATION_FAILED`:
+
+```json
+{
+  "request_id": "uuid",
+  "error": {
+    "code": "VALIDATION_FAILED",
+    "message": "Validation failed.",
+    "details": [
+      {
+        "path": "pages",
+        "code": "INVALID_PAGE_NUMBER",
+        "page_number": 999
+      }
+    ]
+  }
+}
+```
+
+### POST `/api/objects/:object_id/curation/submit`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Purpose:
+  - submits current OCR curation state for archive-side apply
+  - creates a `curation_apply` archive request with archive-compatible payload
+- Body:
+  - `review_note` (nullable string)
+- Rules:
+  - currently supported for document OCR curation only
+  - backend assembles the current OCR document text and enqueues `curation_apply`
+  - `dedupe_key` on the archive request uses `idempotency_key` format: `<object_id>:<curated_kind>:<YYYYMMDD>:vpsrev-<revision_after>`
+  - same `idempotency_key` = retry of same submit; different key on same day = new submit writing to same archive day-file
+  - `source_ref.url` is a relative VPS path; archive worker resolves it against its configured VPS base URL
+- Example request:
+
+```json
+{
+  "review_note": "Ready for archive apply."
+}
+```
+- 200 response:
+  - `object_id`
+  - `curation_state`
+  - `request` (`id`, `action_type`, `status`)
+  - `submitted_at`
+  - `submitted_by`
+- Example success response:
+
+```json
+{
+  "object_id": "OBJ-20260213-ABC123",
+  "curation_state": "review_in_progress",
+  "request": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "action_type": "curation_apply",
+    "status": "PENDING"
+  },
+  "submitted_at": "2026-04-14T11:15:00.000Z",
+  "submitted_by": "10000000-0000-0000-0000-000000000001"
+}
+```
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid `:object_id` format
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when object does not exist in tenant scope
+  - `423 LOCKED` when another user holds the edit lock
+  - `409 CONFLICT` when object is not a document or when document OCR projection is unavailable
+  - `422 VALIDATION_FAILED` for invalid payload
+
+### DELETE `/api/objects/:object_id/edit-lock`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Purpose:
+  - explicitly releases the edit lock held by the current user
+  - should be called when the client closes the editor
+- 200 response:
+  - `object_id`
+  - `released` (boolean; `true` if lock was released, `false` if user did not hold the lock)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid `:object_id` format
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when object does not exist in tenant scope
+
+### GET `/api/objects/:object_id/curation/history`
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- Query params:
+  - `limit` (optional int `1..200`, default `50`)
+  - `cursor` (optional pagination cursor)
+- 200 response:
+  - `object_id`
+  - `events[]`:
+    - `id`
+    - `type` (`METADATA_UPDATED|RIGHTS_UPDATED|DOCUMENT_PAGE_UPDATED|CURATION_SUBMITTED`)
+    - `actor_user_id`
+    - `at`
+    - `revision_before` (integer or `null`)
+    - `revision_after` (integer or `null`)
+    - `payload`
+  - `next_cursor` (`string|null`)
+- Notes:
+  - history describes backend edit actions, not archive artifact version history
+  - `revision_before` and `revision_after` may be `null` for edits made after the revision counter was removed from the client API
+  - `CURATION_SUBMITTED` payload includes `request_id`, `review_note`, `archive_curated_kind`, `archive_target_version`, `archive_idempotency_key`
+- Example response:
+
+```json
+{
+  "object_id": "OBJ-20260213-ABC123",
+  "events": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "type": "RIGHTS_UPDATED",
+      "actor_user_id": "10000000-0000-0000-0000-000000000001",
+      "at": "2026-04-14T10:38:52.000Z",
+      "revision_before": 1,
+      "revision_after": 2,
+      "payload": {
+        "fields": ["rights_note", "sensitivity_note"]
+      }
+    },
+    {
+      "id": "33333333-3333-4333-8333-333333333333",
+      "type": "DOCUMENT_PAGE_UPDATED",
+      "actor_user_id": "10000000-0000-0000-0000-000000000001",
+      "at": "2026-04-14T10:39:30.000Z",
+      "revision_before": 2,
+      "revision_after": 3,
+      "payload": {
+        "page_numbers": [1, 2]
+      }
+    },
+    {
+      "id": "22222222-2222-4222-8222-222222222222",
+      "type": "METADATA_UPDATED",
+      "actor_user_id": "10000000-0000-0000-0000-000000000001",
+      "at": "2026-04-14T10:38:52.000Z",
+      "revision_before": 1,
+      "revision_after": 2,
+      "payload": {
+        "fields": [
+          "title",
+          "publication_date",
+          "date_precision",
+          "date_approximate",
+          "language",
+          "tags",
+          "people",
+          "description"
+        ]
+      }
+    }
+  ],
+  "next_cursor": null
+}
+```
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/query params
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when object does not exist in tenant scope
@@ -1324,13 +1782,14 @@ Worker-only object endpoints are documented in `## Worker APIs`:
 - `POST /api/archive-requests/:id/lease/release`
 - `POST /api/archive-requests/:id/complete`
 - `POST /api/archive-requests/:id/fail`
-- `POST /api/object-download-requests/lease`
-- `POST /api/object-download-requests/:id/lease/heartbeat`
-- `POST /api/object-download-requests/:id/lease/release`
-- `POST /api/object-download-requests/:id/artifacts/presign`
-- `PUT /api/object-download-requests/uploads/:token`
-- `POST /api/object-download-requests/:id/complete`
-- `POST /api/object-download-requests/:id/fail`
+- `POST /api/object-download-requests/lease` (deprecated compatibility route)
+- `POST /api/object-download-requests/:id/lease/heartbeat` (deprecated compatibility route)
+- `POST /api/object-download-requests/:id/lease/release` (deprecated compatibility route)
+- `POST /api/object-download-requests/:id/artifacts/presign` (deprecated compatibility route)
+- `PUT /api/archive-requests/uploads/:token`
+- `PUT /api/object-download-requests/uploads/:token` (deprecated compatibility route)
+- `POST /api/object-download-requests/:id/complete` (deprecated compatibility route)
+- `POST /api/object-download-requests/:id/fail` (deprecated compatibility route)
 
 ### GET `/api/objects/:object_id/artifacts/:artifact_id/download`
 
@@ -1390,8 +1849,8 @@ Worker-only object endpoints are documented in `## Worker APIs`:
   - `embargo_kind` (`none|timed|curation_state`, required)
   - `embargo_until` (ISO timestamp, required when `embargo_kind=timed`)
   - `embargo_curation_state` (`needs_review|review_in_progress|reviewed|curation_failed`, required when `embargo_kind=curation_state`)
-  - `rights_note` (optional string, nullable)
-  - `sensitivity_note` (optional string, nullable)
+  - `rights_note` (optional non-empty string when provided, nullable)
+  - `sensitivity_note` (optional non-empty string when provided, nullable)
 - 200 response:
   - `object` (Base Object Schema + `ingest_manifest` nullable)
   - includes resolved `thumbnail_artifact_id` (`null` when no thumbnail artifact exists)
@@ -1407,7 +1866,7 @@ Worker-only object endpoints are documented in `## Worker APIs`:
 - Roles: `viewer`, `archiver`, `admin`
 - Body:
   - `requested_level` (`family|private`, required)
-  - `reason` (optional string)
+  - `reason` (optional non-empty string when provided)
 - 201 response:
   - `request`:
     - `id`, `object_id`, `requester_user_id`, `requested_level`, `reason`, `status`, `created_at`, `updated_at`
@@ -1440,7 +1899,7 @@ Worker-only object endpoints are documented in `## Worker APIs`:
 - Auth: Bearer token
 - Roles: `admin`
 - Body:
-  - `decision_note` (optional string)
+  - `decision_note` (optional non-empty string when provided)
   - Empty request body is allowed.
 - 200 response:
   - `request` (status becomes `APPROVED`)
@@ -1459,7 +1918,7 @@ Worker-only object endpoints are documented in `## Worker APIs`:
 - Auth: Bearer token
 - Roles: `admin`
 - Body:
-  - `decision_note` (optional string)
+  - `decision_note` (optional non-empty string when provided)
   - Empty request body is allowed.
 - 200 response:
   - `request` (status becomes `REJECTED`)
@@ -1689,7 +2148,7 @@ Integration guides for archive worker teams:
 - Optional: `x-worker-id`
 - Body:
   - optional JSON object
-  - `action_type` (optional enum): `object_resync|artifact_fetch`
+  - `action_type` (optional enum): `object_resync|artifact_fetch|curation_apply`
 - `tenant_id` is not accepted in request body
 - Behavior:
   - sweeps expired archive-request leases before selecting next request
@@ -1741,7 +2200,11 @@ Integration guides for archive worker teams:
 - Auth: `x-worker-auth-token`
 - Body:
   - `lease_token` (required non-empty string)
+  - `upload_token` (optional non-empty string)
 - `tenant_id` is not accepted in request body
+- Behavior:
+  - for `artifact_fetch`, `upload_token` is required
+  - for non-`artifact_fetch` actions, `upload_token` is ignored when present
 - 200 response:
   - `status: "completed"`
   - `request` (`id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`)
@@ -1749,6 +2212,29 @@ Integration guides for archive worker teams:
   - `400 BAD_REQUEST` for invalid path/body
   - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
   - `409 CONFLICT` when lease is no longer active
+  - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
+
+### POST `/api/archive-requests/:id/artifacts/presign`
+
+- Auth: `x-worker-auth-token`
+- Body:
+  - `lease_token` (required non-empty string)
+  - `content_type` (required non-empty string)
+  - `size_bytes` (required integer >= 0)
+  - `extension` (required non-empty string)
+- Behavior:
+  - supported for `artifact_fetch` requests only
+  - upload token TTL is 15 minutes
+- 200 response:
+  - `upload_token`
+  - `upload_url` (for `PUT` upload)
+  - `storage_key`
+  - `expires_at`
+  - `headers` (`content-type`, `content-length` where `content-length` is a JSON number)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body
+  - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
+  - `409 CONFLICT` when lease is no longer active or request action is not `artifact_fetch`
   - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
 
 ### POST `/api/archive-requests/:id/fail`
@@ -1785,6 +2271,8 @@ Integration guides for archive worker teams:
       - `ocr` = backend/internal OCR artifact kind
       - `ocr_text` = normalized OCR text artifact kind used by viewer contracts and auto-request defaults
     - `variant` (optional nullable string, non-empty when present)
+      - per-page OCR convention: `page_0001`, `page_0002`, etc.
+      - combined OCR convention: `full_v1` or `null`
     - `display_name` (required string, non-empty)
     - `content_type` (optional nullable string, non-empty when present)
     - `size_bytes` (optional nullable number, integer >= 0)
@@ -1794,10 +2282,15 @@ Integration guides for archive worker teams:
 - Behavior:
   - tenant is resolved internally from `object_id`
   - Replaces object snapshot by archive key: upserts provided entries and marks omitted entries unavailable.
-  - Auto-request side effect: backend attempts to auto-queue one `artifact_fetch` request per configured default kind (`thumbnail`, `ocr_text`, `web_version`) when corresponding available entries are present.
+  - Auto-request side effect: backend attempts to auto-queue `artifact_fetch` requests for configured default kinds (`thumbnail`, `ocr_text`, `web_version`) when corresponding available entries are present.
     - `web_version` auto-request currently applies only to `IMAGE` objects.
-  - Auto-request suppression: per kind, backend skips auto-queue when artifact already exists or an active request (`PENDING`/`PROCESSING`) already exists.
-  - Auto-request selection priority: for each kind, prefer `variant = null`; otherwise choose lexicographically lowest `archive_file_key`.
+  - **Per-page OCR**: when `artifact_kind = "ocr_text"` and `variant` matches `page_0001`, `page_0002`, etc., backend auto-queues a separate `artifact_fetch` request for each page variant.
+  - **Combined OCR**: when `artifact_kind = "ocr_text"` and `variant` is `null` or starts with `full_`, backend auto-queues one combined `artifact_fetch`. Selection priority: prefers `full_v1`, then `null`, then lexicographically lowest `archive_file_key`.
+  - Auto-request suppression:
+    - For combined OCR and non-OCR kinds: skip when any artifact of that kind already exists, or when any active request for that kind exists.
+    - For per-page OCR: skip only when the specific `(kind, variant)` artifact already exists, or when an active request for that exact `(kind, variant)` exists.
+  - Page metadata side effect: when per-page OCR entries include `metadata.page_number` and/or `metadata.label`, backend updates `objects.metadata.pages` to reflect page structure. If `metadata.pages` does not yet exist, it is created from the available files entries.
+  - Artifact completion side effect: when a per-page OCR artifact download completes, backend updates the matching `metadata.pages[].ocr_text_artifact_id` by page number.
 - 200 response:
   - `object_id`
   - `synced_files` (number)
@@ -1807,7 +2300,40 @@ Integration guides for archive worker teams:
   - `404 NOT_FOUND` when object does not exist
   - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
 
+### PUT `/api/internal/objects/:object_id/object-text-manifest`
+
+- Auth: `x-worker-auth-token`
+- Path:
+  - `:object_id` (format: `OBJ-YYYYMMDD-XXXXXX`)
+- Body:
+  - `object_text_manifest` (required object):
+    - `object_id` (required string; must match path `:object_id`)
+    - `media_type` (required enum: `document|audio|video|photo|other`)
+    - `projection_version` (required string; opaque object-level change token)
+    - `generated_at` (required RFC3339 timestamp)
+    - `text_artifacts[]` (required array, may be empty):
+      - `kind` (required string)
+      - `version` (required string)
+      - `is_active` (required boolean)
+      - `metadata` (optional object)
+- Behavior:
+  - tenant is resolved internally from `object_id`
+  - replaces current object text manifest snapshot for that object
+  - VPS should treat artifact identity as `kind + version`
+  - at most one `text_artifacts[]` entry per `kind` may have `is_active = true`
+  - archive-local file paths are not part of this public worker payload
+- 200 response:
+  - `object_id`
+  - `status: "ok"`
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body
+  - `401 UNAUTHORIZED` for missing/invalid worker auth token
+  - `404 NOT_FOUND` when object does not exist
+  - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
+
 ### POST `/api/object-download-requests/lease`
+
+Deprecated compatibility route. New archive workers should use `POST /api/archive-requests/lease` with `{"action_type":"artifact_fetch"}`.
 
 - Auth: `x-worker-auth-token`
 - Optional: `x-worker-id`
@@ -1827,6 +2353,8 @@ Integration guides for archive worker teams:
 
 ### POST `/api/object-download-requests/:id/lease/heartbeat`
 
+Deprecated compatibility route. New archive workers should use `POST /api/archive-requests/:id/lease/heartbeat`.
+
 - Auth: `x-worker-auth-token`
 - Body:
   - `lease_token` (required non-empty string)
@@ -1842,6 +2370,8 @@ Integration guides for archive worker teams:
 
 ### POST `/api/object-download-requests/:id/lease/release`
 
+Deprecated compatibility route. New archive workers should use `POST /api/archive-requests/:id/lease/release`.
+
 - Auth: `x-worker-auth-token`
 - Body:
   - `lease_token` (required non-empty string)
@@ -1854,6 +2384,8 @@ Integration guides for archive worker teams:
   - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
 
 ### POST `/api/object-download-requests/:id/artifacts/presign`
+
+Deprecated compatibility route. New archive workers should use `POST /api/archive-requests/:id/artifacts/presign`.
 
 - Auth: `x-worker-auth-token`
 - Body:
@@ -1875,7 +2407,7 @@ Integration guides for archive worker teams:
   - `409 CONFLICT` when lease is no longer active
   - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
 
-### PUT `/api/object-download-requests/uploads/:token`
+### PUT `/api/archive-requests/uploads/:token`
 
 - Auth: none (signed token in path)
 - Required headers:
@@ -1888,7 +2420,13 @@ Integration guides for archive worker teams:
   - `400 BAD_REQUEST` for header/body constraint mismatch
   - `401 UNAUTHORIZED` for invalid/expired signed token
 
+### PUT `/api/object-download-requests/uploads/:token`
+
+Deprecated compatibility route. New archive workers should use `PUT /api/archive-requests/uploads/:token`.
+
 ### POST `/api/object-download-requests/:id/complete`
+
+Deprecated compatibility route. New archive workers should use `POST /api/archive-requests/:id/complete` with both `lease_token` and `upload_token` for `artifact_fetch`.
 
 - Auth: `x-worker-auth-token`
 - Body:

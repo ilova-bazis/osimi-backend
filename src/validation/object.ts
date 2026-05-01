@@ -3,7 +3,10 @@ import { z } from "zod";
 
 import type { JsonObject } from "./ingestion.ts";
 import { jsonObjectSchema } from "./ingestion.ts";
-import { mapZodErrorToValidation } from "./zod-errors.ts";
+import {
+    mapZodErrorToUnprocessable,
+    mapZodErrorToValidation,
+} from "./zod-errors.ts";
 
 const OBJECT_ID_PATTERN = /^OBJ-[0-9]{8}-[A-Z0-9]+$/;
 
@@ -82,7 +85,219 @@ export const archiveRequestTargetTypeSchema = z.enum(["object", "ingestion"]);
 export const archiveRequestActionTypeSchema = z.enum([
     "object_resync",
     "artifact_fetch",
+    "curation_apply",
 ]);
+
+export const objectDatePrecisionSchema = z.enum(["none", "year", "month", "day"]);
+
+const nonEmptyStringArraySchema = z
+    .array(z.string().trim().min(1))
+    .transform((values) => [...new Set(values)]);
+
+const nullableTrimmedStringSchema = z
+    .string()
+    .trim()
+    .transform((value) => (value.length === 0 ? null : value))
+    .nullable();
+
+const objectEditMetadataSchema = z
+    .strictObject({
+        title: z.string().trim().min(1),
+        publication_date: z.string().trim(),
+        date_precision: objectDatePrecisionSchema,
+        date_approximate: z.boolean(),
+        language: nullableTrimmedStringSchema,
+        tags: nonEmptyStringArraySchema,
+        people: nonEmptyStringArraySchema,
+        description: nullableTrimmedStringSchema,
+    })
+    .superRefine((value, context) => {
+        if (value.date_precision === "none") {
+            return;
+        }
+
+        const patternByPrecision = {
+            year: /^\d{4}$/,
+            month: /^\d{4}-\d{2}$/,
+            day: /^\d{4}-\d{2}-\d{2}$/,
+        } as const;
+
+        if (!patternByPrecision[value.date_precision].test(value.publication_date)) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "publication_date does not match date_precision.",
+                path: ["publication_date"],
+            });
+        }
+    })
+    .transform((value) => ({
+        ...value,
+        publication_date:
+            value.date_precision === "none" ? "" : value.publication_date,
+        date_approximate:
+            value.date_precision === "none" ? false : value.date_approximate,
+        tags: value.tags.map((tag) => tag.toLowerCase()),
+    }));
+
+const objectEditRightsSchema = z.strictObject({
+    rights_note: nullableTrimmedStringSchema,
+    sensitivity_note: nullableTrimmedStringSchema,
+});
+
+export const patchObjectMetadataBodySchema = z.strictObject({
+    metadata: objectEditMetadataSchema,
+    rights: objectEditRightsSchema,
+});
+
+export const submitObjectCurationBodySchema = z.strictObject({
+    review_note: nullableTrimmedStringSchema,
+});
+
+const documentCurationPageSchema = z.strictObject({
+    page_number: z.number().int().positive(),
+    label: z.string().nullable().optional(),
+    machine_text: z.string(),
+    curated_text: z.string().nullable(),
+    status: z.enum(["machine", "edited"]).optional(),
+});
+
+export const putDocumentCurationBodySchema = z
+    .strictObject({
+        pages: z.array(
+            z.strictObject({
+                page_number: z.number().int().positive(),
+                curated_text: z.string(),
+            }),
+        ).min(1),
+    })
+    .superRefine((value, context) => {
+        const seen = new Set<number>();
+        for (const [index, page] of value.pages.entries()) {
+            if (seen.has(page.page_number)) {
+                context.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: "Duplicate page_number is not allowed.",
+                    path: ["pages", index, "page_number"],
+                });
+            }
+
+            seen.add(page.page_number);
+        }
+    });
+
+const objectEditMediaTypeSchema = z.enum([
+    "document",
+    "image",
+    "audio",
+    "video",
+    "other",
+]);
+
+const objectEditCurationStateSchema = z.enum([
+    "needs_review",
+    "review_in_progress",
+    "reviewed",
+    "curation_failed",
+]);
+
+const objectEditDraftSchema = z.object({
+    updated_at: z.string(),
+    updated_by: z.string().nullable(),
+});
+
+const objectEditCapabilitiesSchema = z.object({
+    can_edit_metadata: z.boolean(),
+    can_curate_text: z.boolean(),
+    can_submit_review: z.boolean(),
+});
+
+const objectEditDocumentCurationPayloadSchema = z.object({
+    kind: z.literal("document"),
+    machine_ocr_artifact_id: z.string().nullable(),
+    page_count: z.number().int().positive().nullable(),
+    pages: z.array(documentCurationPageSchema),
+});
+
+const objectEditGenericCurationPayloadSchema = z.object({
+    kind: z.enum(["image", "audio", "video", "other"]),
+});
+
+const objectEditCurationPayloadSchema = z.discriminatedUnion("kind", [
+    objectEditDocumentCurationPayloadSchema,
+    objectEditGenericCurationPayloadSchema,
+]);
+
+const objectEditLockSchema = z.object({
+    locked: z.boolean(),
+    locked_by: z.string().nullable(),
+    locked_until: z.string().nullable(),
+});
+
+const objectEditResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    media_type: objectEditMediaTypeSchema,
+    curation_state: objectEditCurationStateSchema,
+    lock: objectEditLockSchema,
+    draft: objectEditDraftSchema.nullable(),
+    metadata: objectEditMetadataSchema,
+    rights: objectEditRightsSchema.extend({
+        access_level: accessLevelSchema,
+    }),
+    capabilities: objectEditCapabilitiesSchema,
+    curation_payload: objectEditCurationPayloadSchema,
+});
+
+const patchObjectMetadataResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    curation_state: objectEditCurationStateSchema,
+    updated_at: z.string(),
+});
+
+const putDocumentCurationResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    updated_count: z.number().int().min(1),
+    updated_at: z.string(),
+});
+
+const submitObjectCurationResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    curation_state: objectEditCurationStateSchema,
+    request: z.object({
+        id: z.uuid(),
+        action_type: z.literal("curation_apply"),
+        status: z.enum(["PENDING", "PROCESSING", "COMPLETED", "FAILED", "CANCELED"]),
+    }),
+    submitted_at: z.string(),
+    submitted_by: z.string(),
+});
+
+const objectEditHistoryEventTypeSchema = z.enum([
+    "METADATA_UPDATED",
+    "RIGHTS_UPDATED",
+    "DOCUMENT_PAGE_UPDATED",
+    "CURATION_SUBMITTED",
+]);
+
+const objectEditHistoryEventSchema = z.object({
+    id: z.uuid(),
+    type: objectEditHistoryEventTypeSchema,
+    actor_user_id: z.string().nullable(),
+    at: z.string(),
+    revision_before: z.number().int().min(0).nullable(),
+    revision_after: z.number().int().min(0).nullable(),
+    payload: jsonObjectSchema,
+});
+
+export const objectEditHistoryResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    events: z.array(objectEditHistoryEventSchema),
+    next_cursor: z.string().nullable(),
+});
+
+const objectEditHistoryCursorSchema = z.strictObject({
+    created_at: z.iso.datetime({ offset: true }),
+    id: z.uuid(),
+});
 
 export const embargoKindSchema = z.enum(["none", "timed", "curation_state"]);
 
@@ -371,6 +586,7 @@ export const workerFailObjectDownloadRequestBodySchema = z.strictObject({
 
 export const workerCompleteArchiveRequestBodySchema = z.strictObject({
     lease_token: z.string().trim().min(1),
+    upload_token: z.string().trim().min(1).optional(),
 });
 
 export const workerFailArchiveRequestBodySchema = z.strictObject({
@@ -961,8 +1177,15 @@ export interface ArchiveRequestListQuery {
     statuses?: Array<z.infer<typeof archiveRequestStatusSchema>>;
     includePayload: boolean;
 }
+export interface ObjectEditHistoryQuery {
+    limit: number;
+    cursor?: z.infer<typeof objectEditHistoryCursorSchema>;
+}
 export type ObjectCursorPayload = z.infer<typeof objectCursorPayloadSchema>;
 export type PatchObjectTitleBody = z.infer<typeof patchObjectTitleBodySchema>;
+export type PatchObjectMetadataBody = z.infer<typeof patchObjectMetadataBodySchema>;
+export type PutDocumentCurationBody = z.infer<typeof putDocumentCurationBodySchema>;
+export type SubmitObjectCurationBody = z.infer<typeof submitObjectCurationBodySchema>;
 export type WorkerPresignObjectArtifactUploadBody = z.infer<
     typeof workerPresignObjectArtifactUploadBodySchema
 >;
@@ -1004,6 +1227,7 @@ export type ObjectListResponse = z.infer<typeof objectListResponseSchema>;
 export type ObjectDto = z.infer<typeof objectDtoSchema>;
 export type ObjectListItem = z.infer<typeof objectListItemSchema>;
 export type ObjectDetailResponse = z.infer<typeof objectDetailResponseSchema>;
+export type ObjectEditResponse = z.infer<typeof objectEditResponseSchema>;
 export type ObjectViewer = z.infer<typeof objectViewerSchema>;
 export type ObjectViewerArtifactRef = z.infer<typeof objectViewerArtifactRefSchema>;
 export type ObjectViewerPrimarySource = z.infer<
@@ -1021,6 +1245,15 @@ export type ObjectArtifactsResponse = z.infer<
 >;
 export type PatchObjectTitleResponse = z.infer<
     typeof patchObjectTitleResponseSchema
+>;
+export type PatchObjectMetadataResponse = z.infer<
+    typeof patchObjectMetadataResponseSchema
+>;
+export type PutDocumentCurationResponse = z.infer<
+    typeof putDocumentCurationResponseSchema
+>;
+export type SubmitObjectCurationResponse = z.infer<
+    typeof submitObjectCurationResponseSchema
 >;
 export type CreateObjectDownloadRequestResponse = z.infer<
     typeof createObjectDownloadRequestResponseSchema
@@ -1104,6 +1337,9 @@ export type UpsertAccessAssignmentResponse = z.infer<
 >;
 export type DeleteAccessAssignmentResponse = z.infer<
     typeof deleteAccessAssignmentResponseSchema
+>;
+export type ObjectEditHistoryResponse = z.infer<
+    typeof objectEditHistoryResponseSchema
 >;
 
 export function parseObjectIdParam(value: string): string {
@@ -1223,12 +1459,73 @@ export function parseArchiveRequestListQuery(url: URL): ArchiveRequestListQuery 
     return parsed.data;
 }
 
+export function parseObjectEditHistoryQuery(url: URL): ObjectEditHistoryQuery {
+    const limit = z.coerce.number().int().min(1).max(200).default(50).safeParse(
+        url.searchParams.get("limit") ?? undefined,
+    );
+
+    if (!limit.success) {
+        throw mapZodErrorToValidation(limit.error);
+    }
+
+    const rawCursor = url.searchParams.get("cursor") ?? undefined;
+    if (!rawCursor) {
+        return {
+            limit: limit.data,
+        };
+    }
+
+    const decoded = decodeCursor<JsonObject>(rawCursor);
+    const parsedCursor = objectEditHistoryCursorSchema.safeParse(decoded);
+    if (!parsedCursor.success) {
+        throw mapZodErrorToValidation(parsedCursor.error);
+    }
+
+    return {
+        limit: limit.data,
+        cursor: parsedCursor.data,
+    };
+}
+
 export function parsePatchObjectTitleBody(
     value: unknown,
 ): PatchObjectTitleBody {
     const parsed = patchObjectTitleBodySchema.safeParse(value);
     if (!parsed.success) {
         throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parsePatchObjectMetadataBody(
+    value: unknown,
+): PatchObjectMetadataBody {
+    const parsed = patchObjectMetadataBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToUnprocessable(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parsePutDocumentCurationBody(
+    value: unknown,
+): PutDocumentCurationBody {
+    const parsed = putDocumentCurationBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToUnprocessable(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseSubmitObjectCurationBody(
+    value: unknown,
+): SubmitObjectCurationBody {
+    const parsed = submitObjectCurationBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToUnprocessable(parsed.error);
     }
 
     return parsed.data;
@@ -1382,5 +1679,66 @@ export function parseObjectMetadata(value: unknown): JsonObject {
     if (!parsed.success) {
         throw mapZodErrorToValidation(parsed.error);
     }
+    return parsed.data;
+}
+
+const objectTextManifestArtifactSchema = z.strictObject({
+    kind: z.string().trim().min(1),
+    version: z.string().trim().min(1),
+    is_active: z.boolean(),
+    metadata: jsonObjectSchema.optional(),
+});
+
+const objectTextManifestMediaTypeSchema = z.enum([
+    "document",
+    "audio",
+    "video",
+    "photo",
+    "other",
+]);
+
+export const replaceObjectTextManifestBodySchema = z.strictObject({
+    object_text_manifest: z
+        .strictObject({
+            object_id: objectIdParamSchema,
+            media_type: objectTextManifestMediaTypeSchema,
+            projection_version: z.string().trim().min(1),
+            generated_at: z.iso.datetime({ offset: true }),
+            text_artifacts: z.array(objectTextManifestArtifactSchema),
+        })
+        .superRefine((manifest, context) => {
+            const activeKinds = new Set<string>();
+
+            for (const [index, artifact] of manifest.text_artifacts.entries()) {
+                if (!artifact.is_active) {
+                    continue;
+                }
+
+                if (activeKinds.has(artifact.kind)) {
+                    context.addIssue({
+                        code: z.ZodIssueCode.custom,
+                        message: `Multiple active text artifacts are not allowed for kind '${artifact.kind}'.`,
+                        path: ["text_artifacts", index, "is_active"],
+                    });
+                    continue;
+                }
+
+                activeKinds.add(artifact.kind);
+            }
+        }),
+});
+
+export type ReplaceObjectTextManifestBody = z.infer<
+    typeof replaceObjectTextManifestBodySchema
+>;
+
+export function parseReplaceObjectTextManifestBody(
+    value: unknown,
+): ReplaceObjectTextManifestBody {
+    const parsed = replaceObjectTextManifestBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
     return parsed.data;
 }

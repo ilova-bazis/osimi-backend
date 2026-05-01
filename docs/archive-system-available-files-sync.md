@@ -428,7 +428,7 @@ Success:
 ```json
 {
   "upload_token": "<signed-upload-token>",
-  "upload_url": "/api/object-download-requests/uploads/<signed-upload-token>",
+  "upload_url": "/api/archive-requests/uploads/<signed-upload-token>",
   "storage_key": "tenants/.../objects/.../artifacts/<request-id>-pdf.txt",
   "expires_at": "2026-03-05T10:30:30.000Z",
   "headers": {
@@ -442,7 +442,7 @@ Upload token TTL is 15 minutes.
 
 ### 4.5 Upload bytes
 
-`PUT /api/object-download-requests/uploads/:token`
+`PUT /api/archive-requests/uploads/:token`
 
 Auth:
 
@@ -570,14 +570,14 @@ Success:
 
 ## 6) Canonical Worker Sequence
 
-1. `POST /api/object-download-requests/lease`
+1. `POST /api/archive-requests/lease` with `{"action_type":"artifact_fetch"}`
 2. if `request = null` -> poll loop
-3. optional periodic `POST /api/object-download-requests/:id/lease/heartbeat` while processing
-4. `POST /api/object-download-requests/:id/artifacts/presign`
-5. `PUT /api/object-download-requests/uploads/:token` with exact headers/body
-6. `POST /api/object-download-requests/:id/complete`
-7. on unrecoverable processing failure instead of completion: `POST /api/object-download-requests/:id/fail`
-8. on graceful abandonment: `POST /api/object-download-requests/:id/lease/release`
+3. optional periodic `POST /api/archive-requests/:id/lease/heartbeat` while processing
+4. `POST /api/archive-requests/:id/artifacts/presign`
+5. `PUT /api/archive-requests/uploads/:token` with exact headers/body
+6. `POST /api/archive-requests/:id/complete` with `lease_token` and `upload_token`
+7. on unrecoverable processing failure instead of completion: `POST /api/archive-requests/:id/fail`
+8. on graceful abandonment: `POST /api/archive-requests/:id/lease/release`
 
 ---
 

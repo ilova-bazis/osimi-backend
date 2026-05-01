@@ -1,8 +1,12 @@
-import { ConflictError } from "../http/errors.ts";
+import { ConflictError, ValidationError } from "../http/errors.ts";
 import {
   authorizeWorkerLeaseForArchiveRequest,
   createArchiveRequestLeaseToken,
 } from "../auth/worker-archive-request.ts";
+import {
+  finalizeArtifactFetchArchiveRequest,
+  presignArchiveRequestArtifactUpload,
+} from "./object-service.ts";
 import {
   completeArchiveRequest,
   extendArchiveRequestLease,
@@ -15,6 +19,11 @@ import {
   type ArchiveRequestTargetType,
 } from "../repos/archive-request-repo.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
+import type {
+  WorkerCompleteArchiveRequestBody,
+  WorkerPresignObjectArtifactUploadBody,
+  WorkerPresignObjectArtifactUploadResponse,
+} from "../validation/object.ts";
 
 const DEFAULT_ARCHIVE_REQUEST_LEASE_TTL_SECONDS = 60 * 5;
 
@@ -86,6 +95,13 @@ export interface WorkerFailArchiveRequestResponse {
   status: "failed";
   request_id: string;
   retryable: boolean;
+}
+
+export async function presignArchiveRequestArtifactByWorker(params: {
+  requestId: string;
+  body: WorkerPresignObjectArtifactUploadBody;
+}): Promise<WorkerPresignObjectArtifactUploadResponse> {
+  return await presignArchiveRequestArtifactUpload(params);
 }
 
 function archiveRequestLeaseTtlSeconds(): number {
@@ -225,12 +241,26 @@ export async function releaseArchiveRequestLeaseByToken(params: {
 
 export async function completeArchiveRequestByWorker(params: {
   requestId: string;
-  leaseToken: string;
+  body: WorkerCompleteArchiveRequestBody;
 }): Promise<WorkerCompleteArchiveRequestResponse> {
   const authorizedLease = await authorizeWorkerLeaseForArchiveRequest({
     requestId: params.requestId,
-    leaseToken: params.leaseToken,
+    leaseToken: params.body.lease_token,
   });
+
+  if (authorizedLease.actionType === "artifact_fetch") {
+    if (!params.body.upload_token) {
+      throw new ValidationError(
+        "Field 'upload_token' is required when completing artifact_fetch requests.",
+      );
+    }
+
+    await finalizeArtifactFetchArchiveRequest({
+      requestId: params.requestId,
+      leaseToken: params.body.lease_token,
+      uploadToken: params.body.upload_token,
+    });
+  }
 
   const completed = await completeArchiveRequest({
     requestId: authorizedLease.requestId,

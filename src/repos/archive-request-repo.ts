@@ -1,6 +1,10 @@
 import { withSchemaClient } from "../db/client.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
 
+export interface ArchiveRequestSqlExecutor {
+  <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T>;
+}
+
 export type ArchiveRequestStatus =
   | "PENDING"
   | "PROCESSING"
@@ -10,7 +14,10 @@ export type ArchiveRequestStatus =
 
 export type ArchiveRequestTargetType = "object" | "ingestion";
 
-export type ArchiveRequestActionType = "object_resync" | "artifact_fetch";
+export type ArchiveRequestActionType =
+  | "object_resync"
+  | "artifact_fetch"
+  | "curation_apply";
 
 interface ArchiveRequestRow {
   id: string;
@@ -83,6 +90,23 @@ export interface ListArchiveRequestsResult {
   filteredCount: number;
 }
 
+export interface CreateArchiveRequestParams {
+  tenantId: string;
+  targetType: ArchiveRequestTargetType;
+  targetId: string;
+  actionType: ArchiveRequestActionType;
+  actionPayload: JsonObject;
+  requestedBy: string;
+  dedupeKey?: string | null;
+  requestId?: string;
+}
+
+export interface FindActiveArchiveRequestByDedupeKeyParams {
+  tenantId: string;
+  actionType: ArchiveRequestActionType;
+  dedupeKey: string;
+}
+
 function mapArchiveRequest(row: ArchiveRequestRow): ArchiveRequestRecord {
   return {
     id: row.id,
@@ -107,17 +131,11 @@ function mapArchiveRequest(row: ArchiveRequestRow): ArchiveRequestRecord {
   };
 }
 
-export async function createArchiveRequest(params: {
-  tenantId: string;
-  targetType: ArchiveRequestTargetType;
-  targetId: string;
-  actionType: ArchiveRequestActionType;
-  actionPayload: JsonObject;
-  requestedBy: string;
-  dedupeKey?: string | null;
-}): Promise<ArchiveRequestRecord> {
-  const rows = await withSchemaClient(async (sql) => {
-    return await sql<ArchiveRequestRow[]>`
+export async function createArchiveRequestWithExecutor(
+  executor: ArchiveRequestSqlExecutor,
+  params: CreateArchiveRequestParams,
+): Promise<ArchiveRequestRecord> {
+  const rows = await executor<ArchiveRequestRow[]>`
       INSERT INTO archive_requests (
         id,
         tenant_id,
@@ -130,7 +148,7 @@ export async function createArchiveRequest(params: {
         status
       )
       VALUES (
-        ${crypto.randomUUID()},
+        ${params.requestId ?? crypto.randomUUID()},
         ${params.tenantId},
         ${params.targetType}::archive_request_target_type,
         ${params.targetId},
@@ -145,9 +163,16 @@ export async function createArchiveRequest(params: {
                 lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
                 created_at, updated_at, completed_at
     `;
-  });
 
   return mapArchiveRequest(rows[0]!);
+}
+
+export async function createArchiveRequest(
+  params: CreateArchiveRequestParams,
+): Promise<ArchiveRequestRecord> {
+  return await withSchemaClient(async (sql) => {
+    return await createArchiveRequestWithExecutor(sql, params);
+  });
 }
 
 export async function findArchiveRequestById(params: {
@@ -169,13 +194,11 @@ export async function findArchiveRequestById(params: {
   return row ? mapArchiveRequest(row) : undefined;
 }
 
-export async function findActiveArchiveRequestByDedupeKey(params: {
-  tenantId: string;
-  actionType: ArchiveRequestActionType;
-  dedupeKey: string;
-}): Promise<ArchiveRequestRecord | undefined> {
-  const rows = await withSchemaClient(async (sql) => {
-    return await sql<ArchiveRequestRow[]>`
+export async function findActiveArchiveRequestByDedupeKeyWithExecutor(
+  executor: ArchiveRequestSqlExecutor,
+  params: FindActiveArchiveRequestByDedupeKeyParams,
+): Promise<ArchiveRequestRecord | undefined> {
+  const rows = await executor<ArchiveRequestRow[]>`
       SELECT id, tenant_id, target_type, target_id, action_type, action_payload,
              requested_by, dedupe_key, status, failure_reason, failure_details,
              lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
@@ -188,10 +211,17 @@ export async function findActiveArchiveRequestByDedupeKey(params: {
       ORDER BY req.created_at DESC, req.id DESC
       LIMIT 1
     `;
-  });
 
   const row = rows[0];
   return row ? mapArchiveRequest(row) : undefined;
+}
+
+export async function findActiveArchiveRequestByDedupeKey(
+  params: FindActiveArchiveRequestByDedupeKeyParams,
+): Promise<ArchiveRequestRecord | undefined> {
+  return await withSchemaClient(async (sql) => {
+    return await findActiveArchiveRequestByDedupeKeyWithExecutor(sql, params);
+  });
 }
 
 export async function listArchiveRequestsByTarget(params: {
