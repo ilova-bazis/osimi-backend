@@ -46,7 +46,9 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
     const sql = createSqlClient(TEST_DATABASE_URL!);
     const keepStorageKey = "tenants/t1/ingestions/i-keep/original/f-keep.txt";
     const cleanupCompletedStorageKey = "tenants/t1/ingestions/i-completed/original/f-completed.txt";
+    const cleanupCompletedPreviewKey = "tenants/t1/ingestions/i-completed/preview/f-completed.jpg";
     const cleanupFailedStorageKey = "tenants/t1/ingestions/i-failed/original/f-failed.txt";
+    const cleanupFailedPreviewKey = "tenants/t1/ingestions/i-failed/preview/f-failed.jpg";
 
     try {
       await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
@@ -133,6 +135,7 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
           content_type,
           size_bytes,
           storage_key,
+          preview_storage_key,
           status,
           checksum_sha256
         )
@@ -144,6 +147,7 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
             ${"text/plain"},
             ${4},
             ${keepStorageKey},
+            ${null},
             ${"UPLOADED"}::ingestion_file_status,
             ${"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
           ),
@@ -154,6 +158,7 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
             ${"text/plain"},
             ${4},
             ${cleanupCompletedStorageKey},
+            ${cleanupCompletedPreviewKey},
             ${"UPLOADED"}::ingestion_file_status,
             ${"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
           ),
@@ -164,6 +169,7 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
             ${"text/plain"},
             ${4},
             ${cleanupFailedStorageKey},
+            ${cleanupFailedPreviewKey},
             ${"UPLOADED"}::ingestion_file_status,
             ${"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
           )
@@ -181,14 +187,26 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
         { databaseUrl: TEST_DATABASE_URL, dbSchema: schema, stagingRoot },
         () => resolveStagingPath(cleanupFailedStorageKey),
       );
+      const completedPreviewPath = runWithRuntimeConfig(
+        { databaseUrl: TEST_DATABASE_URL, dbSchema: schema, stagingRoot },
+        () => resolveStagingPath(cleanupCompletedPreviewKey),
+      );
+      const failedPreviewPath = runWithRuntimeConfig(
+        { databaseUrl: TEST_DATABASE_URL, dbSchema: schema, stagingRoot },
+        () => resolveStagingPath(cleanupFailedPreviewKey),
+      );
 
       await mkdir(dirname(keepPath), { recursive: true });
       await mkdir(dirname(completedPath), { recursive: true });
       await mkdir(dirname(failedPath), { recursive: true });
+      await mkdir(dirname(completedPreviewPath), { recursive: true });
+      await mkdir(dirname(failedPreviewPath), { recursive: true });
 
       await Bun.write(keepPath, "keep");
       await Bun.write(completedPath, "done");
       await Bun.write(failedPath, "fail");
+      await Bun.write(completedPreviewPath, "donep");
+      await Bun.write(failedPreviewPath, "failp");
 
       const result = await runWithRuntimeConfig(
         { databaseUrl: TEST_DATABASE_URL, dbSchema: schema, stagingRoot },
@@ -205,6 +223,8 @@ describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
       expect(await Bun.file(keepPath).exists()).toBe(true);
       expect(await Bun.file(completedPath).exists()).toBe(false);
       expect(await Bun.file(failedPath).exists()).toBe(false);
+      expect(await Bun.file(completedPreviewPath).exists()).toBe(false);
+      expect(await Bun.file(failedPreviewPath).exists()).toBe(false);
     } finally {
       await sql.close();
     }

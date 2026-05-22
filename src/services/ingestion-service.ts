@@ -8,17 +8,25 @@ import {
 } from "../http/errors.ts";
 import { decodeCursor, encodeCursor } from "../http/pagination.ts";
 import {
+  claimNextPendingIngestionPreview,
   createIngestion,
   createIngestionFile,
   deleteIngestionFile,
   deleteIngestion,
   findIngestionById,
+  findClaimedIngestionPreview,
   findIngestionFileById,
   listIngestionFiles,
   listIngestions,
+  markIngestionFilePreviewFailed,
+  markIngestionFilePreviewPending,
+  markIngestionFilePreviewReady,
+  markIngestionFilePreviewUnsupported,
   markIngestionFileUploaded,
   updateIngestionDetails,
   updateIngestionFileProcessingOverrides,
+  updateIngestionPreviewUpload,
+  type ClaimedIngestionPreviewRecord,
   updateIngestionStatus,
   type IngestionFileRecord,
   type IngestionRecord,
@@ -30,7 +38,9 @@ import {
 } from "../domain/ingestions/state-machine.ts";
 import type { AuthenticatedContext } from "../auth/guards.ts";
 import {
+  buildIngestionPreviewStorageKey,
   buildStagingStorageKey,
+  createDownloadToken,
   createUploadToken,
   parseUploadToken,
   resolveStagingPath,
@@ -41,10 +51,16 @@ import {
   MEDIA_KINDS,
   MIME_ALIASES,
   MIME_ALLOWLIST,
+  type MediaKind,
   getMediaKindForMime,
   normalizeMime,
-  type MediaKind,
 } from "../domain/ingestions/capabilities.ts";
+import {
+  getAllowedItemKindsForClassificationType,
+  getAllowedMediaKindsForItemKind,
+  isClassificationTypeCompatibleWithItemKind,
+  isItemKindCompatibleWithMediaKind,
+} from "../domain/ingestions/compatibility.ts";
 import { hasActiveLease } from "../repos/lease-repo.ts";
 import {
   type CancelIngestionResponse,
@@ -58,8 +74,10 @@ import {
   type DeleteIngestionResponse,
   type GetIngestionResponse,
   type IngestionCapabilitiesResponse,
+  type IngestItemKind,
   type IngestionDto,
   type IngestionFileDto,
+  type IngestionClassificationType,
   type IngestionListQuery,
   type IngestionListResult,
   type JsonObject,
@@ -71,6 +89,13 @@ import {
   type UploadFileBySignedTokenResponse,
   type UpdateIngestionBody,
   type UpdateIngestionResponse,
+  type WorkerClaimIngestionPreviewResponse,
+  type WorkerCompleteIngestionPreviewBody,
+  type WorkerCompleteIngestionPreviewResponse,
+  type WorkerFailIngestionPreviewBody,
+  type WorkerFailIngestionPreviewResponse,
+  type WorkerPresignIngestionPreviewUploadBody,
+  type WorkerPresignIngestionPreviewUploadResponse,
   parseIngestionCursorPayload,
   parseIngestionFileProcessingOverrides,
   parseJsonObject,
@@ -78,6 +103,18 @@ import {
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/i;
 const ONE_HOUR_MS = 60 * 60 * 1000;
+const PREVIEW_CLAIM_TIMEOUT_MINUTES = 15;
+const PREVIEW_DOWNLOAD_TTL_MS = 5 * 60 * 1000;
+const MAX_INGESTION_PREVIEW_SIZE_BYTES = 5 * 1024 * 1024;
+const MAX_INGESTION_PREVIEW_DIMENSION_PIXELS = 2048;
+const INGESTION_PREVIEW_SOURCE_KINDS = new Set<MediaKind>(["image", "video"]);
+const INGESTION_PREVIEW_OUTPUT_CONTENT_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "image/avif",
+]);
 
 interface CursorPayload {
   created_at: string;
@@ -107,6 +144,54 @@ function requireMediaKind(contentType: string): MediaKind {
   }
 
   return kind;
+}
+
+function assertClassificationTypeCompatibleWithItemKind(params: {
+  classificationType: IngestionClassificationType;
+  itemKind: IngestItemKind;
+}): void {
+  if (
+    isClassificationTypeCompatibleWithItemKind({
+      classificationType: params.classificationType,
+      itemKind: params.itemKind,
+    })
+  ) {
+    return;
+  }
+
+  throw new ConflictError(
+    `Classification type '${params.classificationType}' is incompatible with item kind '${params.itemKind}'.`,
+    {
+      classification_type: params.classificationType,
+      item_kind: params.itemKind,
+      allowed_item_kinds: [
+        ...getAllowedItemKindsForClassificationType(params.classificationType),
+      ],
+    },
+  );
+}
+
+function assertItemKindCompatibleWithMediaKind(params: {
+  itemKind: IngestItemKind;
+  mediaKind: MediaKind;
+}): void {
+  if (
+    isItemKindCompatibleWithMediaKind({
+      itemKind: params.itemKind,
+      mediaKind: params.mediaKind,
+    })
+  ) {
+    return;
+  }
+
+  throw new ConflictError(
+    `Item kind '${params.itemKind}' is incompatible with uploaded ${params.mediaKind} files.`,
+    {
+      item_kind: params.itemKind,
+      actual_media_kind: params.mediaKind,
+      allowed_media_kinds: [...getAllowedMediaKindsForItemKind(params.itemKind)],
+    },
+  );
 }
 
 function mapTransitionError(error: unknown): never {
@@ -159,6 +244,8 @@ function serializeIngestion(record: IngestionRecord): IngestionDto {
 }
 
 function serializeFile(record: IngestionFileRecord): IngestionFileDto {
+  const previewStatus = serializePreviewStatus(record);
+
   return {
     id: record.id,
     ingestion_id: record.ingestionId,
@@ -168,6 +255,18 @@ function serializeFile(record: IngestionFileRecord): IngestionFileDto {
     storage_key: record.storageKey,
     status: record.status,
     checksum_sha256: record.checksumSha256 ?? null,
+    preview: {
+      status: previewStatus,
+      content_type: record.previewContentType ?? null,
+      size_bytes: record.previewSizeBytes ?? null,
+      width: record.previewWidth ?? null,
+      height: record.previewHeight ?? null,
+      url:
+        previewStatus === "ready"
+          ? `/api/ingestions/${record.ingestionId}/files/${record.id}/preview`
+          : null,
+      error: record.previewError ?? null,
+    },
     processing_overrides: parseIngestionFileProcessingOverrides(
       record.processingOverrides,
     ),
@@ -177,10 +276,95 @@ function serializeFile(record: IngestionFileRecord): IngestionFileDto {
   };
 }
 
+function getIngestionPreviewSourceKind(contentType: string): MediaKind | undefined {
+  const normalized = normalizeMime(contentType);
+  const kind = getMediaKindForMime(normalized);
+
+  return kind && INGESTION_PREVIEW_SOURCE_KINDS.has(kind) ? kind : undefined;
+}
+
+function supportsIngestionPreview(contentType: string): boolean {
+  return getIngestionPreviewSourceKind(contentType) !== undefined;
+}
+
+function serializePreviewStatus(
+  record: IngestionFileRecord,
+): IngestionFileDto["preview"]["status"] {
+  if (record.previewStatus === "processing") {
+    return "pending";
+  }
+
+  return record.previewStatus ??
+    (supportsIngestionPreview(record.contentType) ? "pending" : "unsupported");
+}
+
+function previewExtensionFromContentType(contentType: string): string {
+  const normalized = normalizeMime(contentType);
+
+  if (normalized === "image/jpeg") {
+    return "jpg";
+  }
+
+  if (normalized === "image/png") {
+    return "png";
+  }
+
+  if (normalized === "image/webp") {
+    return "webp";
+  }
+
+  if (normalized === "image/gif") {
+    return "gif";
+  }
+
+  if (normalized === "image/avif") {
+    return "avif";
+  }
+
+  return "bin";
+}
+
+function normalizePreviewOutputContentType(contentType: string): string {
+  const normalized = normalizeMime(contentType);
+
+  if (!INGESTION_PREVIEW_OUTPUT_CONTENT_TYPES.has(normalized)) {
+    throw new ValidationError("Unsupported preview output content type.", {
+      content_type: normalized,
+      allowed_content_types: [...INGESTION_PREVIEW_OUTPUT_CONTENT_TYPES],
+    });
+  }
+
+  return normalized;
+}
+
+function assertPreviewSizeAllowed(sizeBytes: number): void {
+  if (sizeBytes > MAX_INGESTION_PREVIEW_SIZE_BYTES) {
+    throw new ValidationError("Preview file exceeds maximum allowed size.", {
+      max_size_bytes: MAX_INGESTION_PREVIEW_SIZE_BYTES,
+      size_bytes: sizeBytes,
+    });
+  }
+}
+
+function assertPreviewDimensionAllowed(field: "width" | "height", value: number): void {
+  if (value > MAX_INGESTION_PREVIEW_DIMENSION_PIXELS) {
+    throw new ValidationError(`Preview ${field} exceeds maximum allowed dimension.`, {
+      field,
+      max_dimension_pixels: MAX_INGESTION_PREVIEW_DIMENSION_PIXELS,
+      value,
+    });
+  }
+}
+
 export async function createIngestionDraft(params: {
   auth: AuthenticatedContext;
   body: CreateIngestionBody;
 }): Promise<CreateIngestionDraftResponse> {
+  assertClassificationTypeCompatibleWithItemKind({
+    classificationType: params.body.classification_type,
+    itemKind: params.body.item_kind,
+  });
+
   const ingestion = await createIngestion({
     id: crypto.randomUUID(),
     batchLabel: params.body.batch_label,
@@ -312,6 +496,14 @@ export async function updateIngestion(params: {
   ) {
     throw new ValidationError("Request body must include at least one field.");
   }
+
+  const nextClassificationType =
+    params.body.classification_type ?? ingestion.classificationType;
+  const nextItemKind = params.body.item_kind ?? ingestion.itemKind;
+  assertClassificationTypeCompatibleWithItemKind({
+    classificationType: nextClassificationType,
+    itemKind: nextItemKind,
+  });
 
   const updated = await updateIngestionDetails({
     ingestionId: ingestion.id,
@@ -604,6 +796,10 @@ export async function commitUploadedFile(params: {
   });
 
   const fileKind = requireMediaKind(file.contentType);
+  assertItemKindCompatibleWithMediaKind({
+    itemKind: ingestion.itemKind,
+    mediaKind: fileKind,
+  });
   const otherKinds = new Set<MediaKind>();
 
   for (const other of files) {
@@ -676,8 +872,18 @@ export async function commitUploadedFile(params: {
     );
   }
 
+  const previewUpdated = supportsIngestionPreview(updated.contentType)
+    ? await markIngestionFilePreviewPending({
+        fileId,
+        ingestionId: params.ingestionId,
+      })
+    : await markIngestionFilePreviewUnsupported({
+        fileId,
+        ingestionId: params.ingestionId,
+      });
+
   return {
-    file: serializeFile(updated),
+    file: serializeFile(previewUpdated ?? updated),
   };
 }
 
@@ -786,6 +992,9 @@ export async function removeIngestionFile(params: {
 
   const stagingPath = resolveStagingPath(file.storageKey);
   await rm(stagingPath, { force: true });
+  if (file.previewStorageKey) {
+    await rm(resolveStagingPath(file.previewStorageKey), { force: true });
+  }
 
   const deleted = await deleteIngestionFile({
     tenantId: params.auth.tenantId,
@@ -802,6 +1011,256 @@ export async function removeIngestionFile(params: {
   return {
     status: "deleted",
     file_id: file.id,
+  };
+}
+
+export async function streamIngestionFilePreview(params: {
+  auth: AuthenticatedContext;
+  ingestionId: string;
+  fileId: string;
+}): Promise<Response> {
+  const file = await findIngestionFileById({
+    tenantId: params.auth.tenantId,
+    ingestionId: params.ingestionId,
+    fileId: params.fileId,
+  });
+
+  if (!file) {
+    throw new NotFoundError(`Ingestion file '${params.fileId}' was not found.`);
+  }
+
+  if (file.previewStatus !== "ready" || !file.previewStorageKey) {
+    throw new NotFoundError(`Preview for ingestion file '${params.fileId}' was not found.`);
+  }
+
+  const previewFile = Bun.file(resolveStagingPath(file.previewStorageKey));
+  if (!(await previewFile.exists())) {
+    throw new NotFoundError(`Preview for ingestion file '${params.fileId}' was not found.`);
+  }
+
+  const headers = new Headers({
+    "content-type": file.previewContentType ?? "application/octet-stream",
+    "cache-control": "private, no-store",
+  });
+  if (file.previewSizeBytes !== undefined) {
+    headers.set("content-length", String(file.previewSizeBytes));
+  }
+
+  return new Response(previewFile, {
+    status: 200,
+    headers,
+  });
+}
+
+export async function claimNextIngestionPreview(params: {
+  workerId?: string;
+}): Promise<WorkerClaimIngestionPreviewResponse> {
+  const preview = await claimNextPendingIngestionPreview({
+    workerId: params.workerId,
+    claimTimeoutMinutes: PREVIEW_CLAIM_TIMEOUT_MINUTES,
+  });
+
+  if (!preview) {
+    return {
+      preview: null,
+    };
+  }
+
+  const downloadToken = createDownloadToken({
+    ingestion_id: preview.ingestionId,
+    file_id: preview.fileId,
+    tenant_id: preview.tenantId,
+    storage_key: preview.storageKey,
+    content_type: preview.contentType,
+    size_bytes: preview.sizeBytes,
+    expires_at: new Date(Date.now() + PREVIEW_DOWNLOAD_TTL_MS).toISOString(),
+  });
+
+  return {
+    preview: {
+      ingestion_id: preview.ingestionId,
+      file_id: preview.fileId,
+      tenant_id: preview.tenantId,
+      batch_label: preview.batchLabel,
+      filename: preview.filename,
+      content_type: preview.contentType,
+      size_bytes: preview.sizeBytes,
+      download_url: `/api/worker/downloads/${downloadToken}`,
+      claimed_by: preview.claimedBy ?? null,
+      claimed_at: preview.claimedAt?.toISOString() ?? null,
+    },
+  };
+}
+
+async function requireClaimedIngestionPreview(params: {
+  ingestionId: string;
+  fileId: string;
+  workerId?: string;
+}): Promise<ClaimedIngestionPreviewRecord> {
+  const preview = await findClaimedIngestionPreview({
+    ingestionId: params.ingestionId,
+    fileId: params.fileId,
+    workerId: params.workerId,
+  });
+
+  if (!preview) {
+    throw new ConflictError("Preview is not currently claimed by this worker.", {
+      ingestion_id: params.ingestionId,
+      file_id: params.fileId,
+    });
+  }
+
+  return preview;
+}
+
+export async function presignIngestionPreviewUpload(params: {
+  workerId?: string;
+  ingestionId: string;
+  fileId: string;
+  body: WorkerPresignIngestionPreviewUploadBody;
+}): Promise<WorkerPresignIngestionPreviewUploadResponse> {
+  const preview = await requireClaimedIngestionPreview({
+    ingestionId: params.ingestionId,
+    fileId: params.fileId,
+    workerId: params.workerId,
+  });
+  const contentType = normalizePreviewOutputContentType(params.body.content_type);
+  assertPreviewSizeAllowed(params.body.size_bytes);
+  const expiresAt = new Date(Date.now() + ONE_HOUR_MS).toISOString();
+  const storageKey = buildIngestionPreviewStorageKey({
+    tenantId: preview.tenantId,
+    ingestionId: preview.ingestionId,
+    fileId: preview.fileId,
+    extension: previewExtensionFromContentType(contentType),
+  });
+  const uploadToken = createUploadToken({
+    ingestion_id: preview.ingestionId,
+    file_id: preview.fileId,
+    tenant_id: preview.tenantId,
+    storage_key: storageKey,
+    content_type: contentType,
+    size_bytes: params.body.size_bytes,
+    expires_at: expiresAt,
+  });
+
+  const updated = await updateIngestionPreviewUpload({
+    ingestionId: preview.ingestionId,
+    fileId: preview.fileId,
+    workerId: params.workerId,
+    storageKey,
+    contentType,
+  });
+
+  if (!updated) {
+    throw new ConflictError("Preview upload could not be prepared.", {
+      ingestion_id: preview.ingestionId,
+      file_id: preview.fileId,
+    });
+  }
+
+  return {
+    upload_token: uploadToken,
+    upload_url: `/api/uploads/${uploadToken}`,
+    storage_key: storageKey,
+    expires_at: expiresAt,
+    headers: {
+      "content-type": contentType,
+      "content-length": params.body.size_bytes,
+    },
+  };
+}
+
+export async function completeIngestionPreview(params: {
+  workerId?: string;
+  ingestionId: string;
+  fileId: string;
+  body: WorkerCompleteIngestionPreviewBody;
+}): Promise<WorkerCompleteIngestionPreviewResponse> {
+  const preview = await requireClaimedIngestionPreview({
+    ingestionId: params.ingestionId,
+    fileId: params.fileId,
+    workerId: params.workerId,
+  });
+  const upload = parseUploadToken(params.body.upload_token);
+  normalizePreviewOutputContentType(upload.content_type);
+  assertPreviewSizeAllowed(upload.size_bytes);
+  assertPreviewDimensionAllowed("width", params.body.width);
+  assertPreviewDimensionAllowed("height", params.body.height);
+
+  if (
+    upload.ingestion_id !== preview.ingestionId ||
+    upload.file_id !== preview.fileId ||
+    upload.tenant_id !== preview.tenantId
+  ) {
+    throw new ValidationError("Upload token does not match claimed preview context.");
+  }
+
+  const previewFile = Bun.file(resolveStagingPath(upload.storage_key));
+  if (!(await previewFile.exists())) {
+    throw new NotFoundError("Uploaded preview file was not found.");
+  }
+
+  const updated = await markIngestionFilePreviewReady({
+    ingestionId: preview.ingestionId,
+    fileId: preview.fileId,
+    workerId: params.workerId,
+    storageKey: upload.storage_key,
+    contentType: upload.content_type,
+    sizeBytes: upload.size_bytes,
+    width: params.body.width,
+    height: params.body.height,
+  });
+
+  if (!updated) {
+    throw new ConflictError("Preview completion could not be recorded.", {
+      ingestion_id: preview.ingestionId,
+      file_id: preview.fileId,
+    });
+  }
+
+  return {
+    status: "ready",
+    ingestion_id: preview.ingestionId,
+    file_id: preview.fileId,
+  };
+}
+
+export async function failIngestionPreview(params: {
+  workerId?: string;
+  ingestionId: string;
+  fileId: string;
+  body: WorkerFailIngestionPreviewBody;
+}): Promise<WorkerFailIngestionPreviewResponse> {
+  const preview = await requireClaimedIngestionPreview({
+    ingestionId: params.ingestionId,
+    fileId: params.fileId,
+    workerId: params.workerId,
+  });
+  const updated = await markIngestionFilePreviewFailed({
+    ingestionId: preview.ingestionId,
+    fileId: preview.fileId,
+    workerId: params.workerId,
+    error: {
+      message: params.body.error.message,
+      ...(params.body.error.code ? { code: params.body.error.code } : {}),
+      ...(params.body.error.retryable !== undefined
+        ? { retryable: params.body.error.retryable }
+        : {}),
+      ...(params.body.error.details ? { details: params.body.error.details } : {}),
+    },
+  });
+
+  if (!updated) {
+    throw new ConflictError("Preview failure could not be recorded.", {
+      ingestion_id: preview.ingestionId,
+      file_id: preview.fileId,
+    });
+  }
+
+  return {
+    status: "failed",
+    ingestion_id: preview.ingestionId,
+    file_id: preview.fileId,
   };
 }
 
@@ -852,6 +1311,9 @@ export async function deleteIngestionRecord(params: {
   for (const file of files) {
     const stagingPath = resolveStagingPath(file.storageKey);
     await rm(stagingPath, { force: true });
+    if (file.previewStorageKey) {
+      await rm(resolveStagingPath(file.previewStorageKey), { force: true });
+    }
   }
 
   const deleted = await deleteIngestion({

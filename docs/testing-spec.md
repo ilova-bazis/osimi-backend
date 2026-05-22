@@ -33,10 +33,20 @@ This document defines the required tests for the Osimi backend control plane (VP
 - Targeted lease conflict: requesting `POST /api/ingestions/:id/lease` for an actively leased ingestion returns conflict (no takeover)
 - Signed URL constraints: method/TTL/content-type/content-length enforced
 - Upload commit checksum validation (SHA-256)
+- Ingestion create/update rejects incompatible `classification_type` and `item_kind` combinations
+- File commit rejects media kinds incompatible with ingestion `item_kind`
+- Item create/update rejects incompatible `classification_type` and effective `item_kind` combinations
+- File-to-item linking rejects media kinds incompatible with the item's effective `item_kind`
+- Committed image/video uploads expose `preview.status = pending` until a preview is ready
+- Unsupported upload media expose `preview.status = unsupported`
+- Worker-generated ingestion previews reject unsupported thumbnail output MIME types, oversized files, and missing dimensions
+- Ingestion preview fetch serves staged preview bytes only when preview status is ready and tenant auth passes
+- Worker preview claim/report flow is duplicate-safe enough for a single claimed job at a time and can recover claimed preview jobs after timeout
 - Worker download checksum mismatch emits `FILE_FAILED`
 - Event ingestion idempotency by `event_id`
 - Event ordering tolerance (out-of-order delivery)
 - Staging retention rules by ingestion state
+- Staging retention removes temporary preview derivatives alongside original staged files
 - Stuck attention for `UPLOADING` and `PROCESSING`
 - Tenant scoping on all endpoints
 

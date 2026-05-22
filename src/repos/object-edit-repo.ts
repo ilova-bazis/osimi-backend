@@ -113,17 +113,20 @@ export interface ListObjectEditEventsResult {
 export type UpdateCuratedDocumentPagesResult =
   | { status: "not_found" }
   | { status: "invalid_media_type" }
+  | { status: "revision_conflict"; latestRevision: number }
   | { status: "invalid_page_numbers"; invalidPageNumbers: number[] }
   | { status: "updated"; record: ObjectEditRecord; updatedCount: number };
 
 export type SubmitDocumentCurationResult =
   | { status: "not_found" }
   | { status: "invalid_media_type" }
+  | { status: "revision_conflict"; latestRevision: number }
   | { status: "deduped"; record: ObjectEditRecord; request: SubmittedCurationRequestRecord }
   | { status: "submitted"; record: ObjectEditRecord; request: SubmittedCurationRequestRecord };
 
 export type UpdateObjectEditMetadataResult =
   | { status: "not_found" }
+  | { status: "revision_conflict"; latestRevision: number }
   | { status: "updated"; record: ObjectEditRecord };
 
 export type AcquireObjectEditLockResult =
@@ -505,6 +508,7 @@ export async function updateObjectEditMetadata(params: {
   tenantId: string;
   objectId: string;
   actorUserId: string;
+  revision: number;
   title: string;
   publicationDate: string;
   datePrecision: "none" | "year" | "month" | "day";
@@ -542,6 +546,12 @@ export async function updateObjectEditMetadata(params: {
       `;
 
       const currentRevision = revisionRows[0]?.revision ?? 0;
+      if (currentRevision !== params.revision) {
+        return {
+          status: "revision_conflict",
+          latestRevision: currentRevision,
+        };
+      }
       const nextRevision = currentRevision + 1;
 
       const normalizedTags = normalizeList(params.tags).map((value) => value.toLowerCase());
@@ -724,6 +734,7 @@ export async function updateCuratedDocumentPages(params: {
   tenantId: string;
   objectId: string;
   actorUserId: string;
+  revision: number;
   pages: Array<{ pageNumber: number; curatedText: string }>;
 }): Promise<UpdateCuratedDocumentPagesResult> {
   return await withSchemaClient(async (sql) => {
@@ -755,6 +766,12 @@ export async function updateCuratedDocumentPages(params: {
         LIMIT 1
       `;
       const currentRevision = revisionRows[0]?.revision ?? 0;
+      if (currentRevision !== params.revision) {
+        return {
+          status: "revision_conflict",
+          latestRevision: currentRevision,
+        };
+      }
       const nextRevision = currentRevision + 1;
 
       const existingPageNumbers = getMetadataDocumentPageNumbers(currentRow.metadata);
@@ -842,6 +859,7 @@ export async function submitDocumentCuration(params: {
   tenantId: string;
   objectId: string;
   actorUserId: string;
+  revision: number;
   requestId: string;
   idempotencyKey: string;
   actionPayload: JsonObject;
@@ -901,6 +919,12 @@ export async function submitDocumentCuration(params: {
         LIMIT 1
       `;
       const currentRevision = revisionRows[0]?.revision ?? 0;
+      if (currentRevision !== params.revision) {
+        return {
+          status: "revision_conflict",
+          latestRevision: currentRevision,
+        };
+      }
       const nextRevision = currentRevision + 1;
       const nextCurationState =
         currentRow.curation_state === "needs_review"

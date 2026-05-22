@@ -1,0 +1,23 @@
+- Separate flow from VPS events?
+  - Yes, treat them as complementary.
+  - ARTIFACT_CREATED = delta/audit signal (“something was created”).
+  - PUT /api/internal/objects/:object_id/available-files = authoritative full availability snapshot used by user download-request UX.
+  - Keep both: event for timeline/observability, snapshot for deterministic requestability.
+  - I would like to emit this event upon completion of the pipelines that create derivatives such as ocr, trasncript, or event thumbnails.
+- tenant_id source
+  - the backend system is designed to be multi-tenant, but the archive system does not care about tenant, because it is only responsible for storing files for one tenant.
+  - perhaps we should provide tenant-slug (whish is unique)
+- archive_file_key naming
+  - Use stable logical IDs, not transient storage paths.
+  - Good pattern: <artifact_kind>[:variant]:v<version>
+    - examples: original:v1, pdf:access:v1, ocr_text:tg:v1, thumbnail:sm:v1
+  - If pipeline.derivatives.json already has stable IDs, reuse those IDs as archive_file_key (recommended).
+- When to sync
+  - Sync on material availability changes (event-driven), plus periodic reconciliation.
+  - Practical rule:
+    1) after each stage that adds/removes downloadable artifacts (derivatives done, OCR done, transcript ready, cleanup/removal),
+    2) plus periodic full sync (e.g. hourly) as safety against missed events.
+- Event vs endpoint — replace or complement?
+  - Complement.
+  - Don’t replace snapshot sync with events.
+  - Events are not sufficient for full truth after retries/missed deliveries; snapshot endpoint is the source of current state.

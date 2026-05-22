@@ -41,6 +41,41 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
         });
     }
 
+    async function resetObjectEditState(params: {
+        objectId: string;
+        metadata: Record<string, unknown>;
+        curationState?: string;
+        updatedAtIso: string;
+    }) {
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+                DELETE FROM object_curated_document_pages WHERE object_id = ${params.objectId}
+            `;
+            await sql`
+                DELETE FROM object_edit_events WHERE object_id = ${params.objectId}
+            `;
+            await sql`
+                INSERT INTO object_edits (object_id, revision, updated_at, updated_by)
+                VALUES (${params.objectId}, 0, now(), NULL)
+                ON CONFLICT (object_id)
+                DO UPDATE SET revision = 0, updated_at = now(), updated_by = NULL
+            `;
+            await sql`
+                UPDATE objects
+                SET metadata = ${params.metadata},
+                    curation_state = ${
+                        params.curationState ?? "needs_review"
+                    }::object_curation_state,
+                    updated_at = ${params.updatedAtIso}::timestamptz
+                WHERE object_id = ${params.objectId}
+            `;
+        } finally {
+            await sql.close();
+        }
+    }
+
     beforeAll(async () => {
         schema = `objects_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
         stagingRoot = await mkdtemp(join(tmpdir(), "osimi-objects-staging-"));
@@ -1255,8 +1290,10 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
                 DELETE FROM object_edit_events WHERE object_id = ${tenantOneObjectIdTwo}
             `;
             await cleanupSql`
-                UPDATE object_edit_revisions SET revision = 0, updated_at = now(), updated_by = NULL
-                WHERE object_id = ${tenantOneObjectIdTwo}
+                INSERT INTO object_edits (object_id, revision, updated_at, updated_by)
+                VALUES (${tenantOneObjectIdTwo}, 0, now(), NULL)
+                ON CONFLICT (object_id)
+                DO UPDATE SET revision = 0, updated_at = now(), updated_by = NULL
             `;
             await cleanupSql`
                 UPDATE objects
@@ -1449,8 +1486,10 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
                 DELETE FROM object_edit_events WHERE object_id = ${tenantOneObjectId}
             `;
             await cleanupSql`
-                UPDATE object_edit_revisions SET revision = 0, updated_at = now(), updated_by = NULL
-                WHERE object_id = ${tenantOneObjectId}
+                INSERT INTO object_edits (object_id, revision, updated_at, updated_by)
+                VALUES (${tenantOneObjectId}, 0, now(), NULL)
+                ON CONFLICT (object_id)
+                DO UPDATE SET revision = 0, updated_at = now(), updated_by = NULL
             `;
             await cleanupSql`
                 UPDATE objects
@@ -1470,6 +1509,12 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
 
     test("updates object metadata with revisioning and records history", async () => {
         const app = createTestApp();
+
+        await resetObjectEditState({
+            objectId: tenantOneObjectId,
+            metadata: { source: "scanner-a" },
+            updatedAtIso: "2026-02-09T10:00:00.000Z",
+        });
 
         const patchResponse = await app.fetch(
             new Request(
@@ -1597,6 +1642,12 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
 
     test("rejects stale object metadata revision", async () => {
         const app = createTestApp();
+
+        await resetObjectEditState({
+            objectId: tenantOneObjectId,
+            metadata: { source: "scanner-a" },
+            updatedAtIso: "2026-02-09T10:00:00.000Z",
+        });
 
         await app.fetch(
             new Request(

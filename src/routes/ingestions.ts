@@ -39,6 +39,7 @@ import {
   removeIngestionFile as removeIngestionFileRecord,
   restoreIngestion as restoreIngestionRecord,
   retryIngestion as retryIngestionRecord,
+  streamIngestionFilePreview as streamIngestionFilePreviewRecord,
   submitIngestion as submitIngestionRecord,
   updateIngestion as updateIngestionRecord,
   updateIngestionFileOverrides as updateIngestionFileOverridesRecord,
@@ -259,6 +260,35 @@ const commitFileRoute: RouteDefinition = {
         body,
       }),
     );
+  },
+};
+
+const getIngestionFilePreviewRoute: RouteDefinition = {
+  method: "GET",
+  path: "/api/ingestions/:id/files/:fileId/preview",
+  handler: async (request, context) => {
+    const auth = requireRole(context, ["viewer", "archiver", "admin"]);
+    const pathname = new URL(request.url).pathname;
+    const ingestionId = parseIngestionIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/([^/]+)\/files\/[^/]+\/preview$/,
+        "id",
+      ),
+    );
+    const fileId = parseIngestionFileIdParam(
+      extractPathParam(
+        pathname,
+        /^\/api\/ingestions\/[^/]+\/files\/([^/]+)\/preview$/,
+        "fileId",
+      ),
+    );
+
+    return await streamIngestionFilePreviewRecord({
+      auth,
+      ingestionId,
+      fileId,
+    });
   },
 };
 
@@ -558,6 +588,7 @@ export const ingestionRoutes: RouteDefinition[] = [
   removeFileRoute,
   updateFileOverridesRoute,
   commitFileRoute,
+  getIngestionFilePreviewRoute,
   submitIngestionRoute,
   cancelIngestionRoute,
   restoreIngestionRoute,

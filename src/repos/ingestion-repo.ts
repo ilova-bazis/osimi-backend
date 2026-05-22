@@ -6,8 +6,8 @@ import type {
   IngestionClassificationType,
   IngestItemKind,
   IngestionFileProcessingOverrides,
-  IngestionPipelinePreset,
   JsonObject,
+  IngestionPipelinePreset,
 } from "../validation/ingestion.ts";
 import type { IngestionSummary } from "../validation/catalog.ts";
 
@@ -43,6 +43,22 @@ interface IngestionFileRow {
   storage_key: string;
   status: IngestionFileStatus;
   checksum_sha256: string | null;
+  preview_status:
+    | "pending"
+    | "processing"
+    | "ready"
+    | "failed"
+    | "unsupported"
+    | null;
+  preview_claimed_by: string | null;
+  preview_claimed_at: Date | null;
+  preview_storage_key: string | null;
+  preview_content_type: string | null;
+  preview_size_bytes: DbInt | null;
+  preview_width: number | null;
+  preview_height: number | null;
+  preview_error: JsonObject | null;
+  preview_generated_at: Date | null;
   processing_overrides: IngestionFileProcessingOverrides;
   error: JsonObject;
   created_at: Date;
@@ -83,6 +99,16 @@ export interface IngestionFileRecord {
   storageKey: string;
   status: IngestionFileStatus;
   checksumSha256?: string;
+  previewStatus?: "pending" | "processing" | "ready" | "failed" | "unsupported";
+  previewClaimedBy?: string;
+  previewClaimedAt?: Date;
+  previewStorageKey?: string;
+  previewContentType?: string;
+  previewSizeBytes?: number;
+  previewWidth?: number;
+  previewHeight?: number;
+  previewError?: JsonObject;
+  previewGeneratedAt?: Date;
   processingOverrides: IngestionFileProcessingOverrides;
   error: JsonObject;
   createdAt: Date;
@@ -95,6 +121,46 @@ export interface StagingCleanupCandidate {
   status: IngestionStatus;
   updatedAt: Date;
   storageKey: string;
+  previewStorageKey?: string;
+}
+
+export interface ClaimedIngestionPreviewRecord {
+  ingestionId: string;
+  tenantId: string;
+  batchLabel: string;
+  fileId: string;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  storageKey: string;
+  claimedBy?: string;
+  claimedAt?: Date;
+}
+
+function mapClaimedIngestionPreview(row: {
+  ingestion_id: string;
+  tenant_id: string;
+  batch_label: string;
+  file_id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: DbInt;
+  storage_key: string;
+  preview_claimed_by: string | null;
+  preview_claimed_at: Date | null;
+}): ClaimedIngestionPreviewRecord {
+  return {
+    ingestionId: row.ingestion_id,
+    tenantId: row.tenant_id,
+    batchLabel: row.batch_label,
+    fileId: row.file_id,
+    filename: row.filename,
+    contentType: row.content_type,
+    sizeBytes: toSafeNumberFromDbInt(row.size_bytes, "ingestion_files.size_bytes"),
+    storageKey: row.storage_key,
+    claimedBy: row.preview_claimed_by ?? undefined,
+    claimedAt: row.preview_claimed_at ? new Date(row.preview_claimed_at) : undefined,
+  };
 }
 
 export interface StuckIngestionRecord {
@@ -145,6 +211,19 @@ function mapIngestionFile(row: IngestionFileRow): IngestionFileRecord {
     storageKey: row.storage_key,
     status: row.status,
     checksumSha256: row.checksum_sha256 ?? undefined,
+    previewStatus: row.preview_status ?? undefined,
+    previewClaimedBy: row.preview_claimed_by ?? undefined,
+    previewClaimedAt: row.preview_claimed_at ? new Date(row.preview_claimed_at) : undefined,
+    previewStorageKey: row.preview_storage_key ?? undefined,
+    previewContentType: row.preview_content_type ?? undefined,
+    previewSizeBytes:
+      row.preview_size_bytes === null
+        ? undefined
+        : toSafeNumberFromDbInt(row.preview_size_bytes, "ingestion_files.preview_size_bytes"),
+    previewWidth: row.preview_width ?? undefined,
+    previewHeight: row.preview_height ?? undefined,
+    previewError: row.preview_error ?? undefined,
+    previewGeneratedAt: row.preview_generated_at ? new Date(row.preview_generated_at) : undefined,
     processingOverrides: row.processing_overrides,
     error: row.error,
     createdAt: new Date(row.created_at),
@@ -158,6 +237,7 @@ function mapStagingCleanupCandidate(row: {
   status: IngestionStatus;
   updated_at: Date;
   storage_key: string;
+  preview_storage_key: string | null;
 }): StagingCleanupCandidate {
   return {
     ingestionId: row.ingestion_id,
@@ -165,6 +245,7 @@ function mapStagingCleanupCandidate(row: {
     status: row.status,
     updatedAt: new Date(row.updated_at),
     storageKey: row.storage_key,
+    previewStorageKey: row.preview_storage_key ?? undefined,
   };
 }
 
@@ -429,7 +510,8 @@ export async function createIngestionFile(params: {
       )
       VALUES (${params.id}, ${params.ingestionId}, ${params.filename}, ${params.contentType}, ${params.sizeBytes}, ${params.storageKey}, 'PENDING')
       RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
-        processing_overrides, error, created_at, updated_at
+        preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
+        preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
     `;
   });
 
@@ -452,6 +534,16 @@ export async function findIngestionFileById(params: {
         file.storage_key,
         file.status,
         file.checksum_sha256,
+        file.preview_status,
+        file.preview_claimed_by,
+        file.preview_claimed_at,
+        file.preview_storage_key,
+        file.preview_content_type,
+        file.preview_size_bytes,
+        file.preview_width,
+        file.preview_height,
+        file.preview_error,
+        file.preview_generated_at,
         file.processing_overrides,
         file.error,
         file.created_at,
@@ -484,6 +576,16 @@ export async function listIngestionFiles(params: {
         file.storage_key,
         file.status,
         file.checksum_sha256,
+        file.preview_status,
+        file.preview_claimed_by,
+        file.preview_claimed_at,
+        file.preview_storage_key,
+        file.preview_content_type,
+        file.preview_size_bytes,
+        file.preview_width,
+        file.preview_height,
+        file.preview_error,
+        file.preview_generated_at,
         file.processing_overrides,
         file.error,
         file.created_at,
@@ -514,7 +616,8 @@ export async function markIngestionFileUploaded(params: {
         AND ingestion_id = ${params.ingestionId}
         AND status = 'PENDING'
       RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
-        processing_overrides, error, created_at, updated_at
+        preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
+        preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
     `;
   });
 
@@ -542,6 +645,66 @@ export async function deleteIngestionFile(params: {
   return rows.length > 0;
 }
 
+export async function markIngestionFilePreviewPending(params: {
+  ingestionId: string;
+  fileId: string;
+}): Promise<IngestionFileRecord | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionFileRow[]>`
+      UPDATE ingestion_files
+      SET preview_status = 'pending',
+          preview_claimed_by = null,
+          preview_claimed_at = null,
+          preview_storage_key = null,
+          preview_content_type = null,
+          preview_size_bytes = null,
+          preview_width = null,
+          preview_height = null,
+          preview_error = null,
+          preview_generated_at = null,
+          updated_at = now()
+      WHERE id = ${params.fileId}
+        AND ingestion_id = ${params.ingestionId}
+      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
+        preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
+        preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapIngestionFile(row) : undefined;
+}
+
+export async function markIngestionFilePreviewUnsupported(params: {
+  ingestionId: string;
+  fileId: string;
+}): Promise<IngestionFileRecord | undefined> {
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionFileRow[]>`
+      UPDATE ingestion_files
+      SET preview_status = 'unsupported',
+          preview_claimed_by = null,
+          preview_claimed_at = null,
+          preview_storage_key = null,
+          preview_content_type = null,
+          preview_size_bytes = null,
+          preview_width = null,
+          preview_height = null,
+          preview_error = null,
+          preview_generated_at = null,
+          updated_at = now()
+      WHERE id = ${params.fileId}
+        AND ingestion_id = ${params.ingestionId}
+      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
+        preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
+        preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapIngestionFile(row) : undefined;
+}
+
 export async function updateIngestionFileProcessingOverrides(params: {
   tenantId: string;
   ingestionId: string;
@@ -559,8 +722,10 @@ export async function updateIngestionFileProcessingOverrides(params: {
         AND ing.id = file.ingestion_id
         AND ing.tenant_id = ${params.tenantId}
       RETURNING file.id, file.ingestion_id, file.filename, file.content_type, file.size_bytes,
-        file.storage_key, file.status, file.checksum_sha256, file.processing_overrides,
-        file.error, file.created_at, file.updated_at
+        file.storage_key, file.status, file.checksum_sha256, file.preview_status,
+        file.preview_claimed_by, file.preview_claimed_at, file.preview_storage_key, file.preview_content_type, file.preview_size_bytes,
+        file.preview_width, file.preview_height, file.preview_error, file.preview_generated_at,
+        file.processing_overrides, file.error, file.created_at, file.updated_at
     `;
   });
 
@@ -596,6 +761,7 @@ export async function listStagingCleanupCandidates(params: {
         status: IngestionStatus;
         updated_at: Date;
         storage_key: string;
+        preview_storage_key: string | null;
       }>
     >`
       SELECT
@@ -603,7 +769,8 @@ export async function listStagingCleanupCandidates(params: {
         ing.tenant_id,
         ing.status,
         ing.updated_at,
-        file.storage_key
+        file.storage_key,
+        file.preview_storage_key
       FROM ingestions ing
       INNER JOIN ingestion_files file ON file.ingestion_id = ing.id
       WHERE (
@@ -682,4 +849,197 @@ export async function findIngestionWithCreator(params: {
 
   const row = rows[0];
   return row ? mapIngestionWithCreator(row) : undefined;
+}
+export async function claimNextPendingIngestionPreview(params: {
+  workerId?: string;
+  claimTimeoutMinutes: number;
+}): Promise<ClaimedIngestionPreviewRecord | undefined> {
+  const claimedBy = params.workerId?.trim() || "worker";
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<
+      Array<{
+        ingestion_id: string;
+        tenant_id: string;
+        batch_label: string;
+        file_id: string;
+        filename: string;
+        content_type: string;
+        size_bytes: DbInt;
+        storage_key: string;
+        preview_claimed_by: string | null;
+        preview_claimed_at: Date | null;
+      }>
+    >`
+      WITH candidate AS (
+        SELECT file.id
+        FROM ingestion_files file
+        INNER JOIN ingestions ing ON ing.id = file.ingestion_id
+        WHERE file.status = 'UPLOADED'
+          AND file.preview_status IN ('pending', 'processing')
+          AND ing.status IN ('DRAFT', 'UPLOADING', 'CANCELED')
+          AND (
+            file.preview_status = 'pending'
+            OR file.preview_claimed_at IS NULL
+            OR file.preview_claimed_at <= now() - (${params.claimTimeoutMinutes}::int * interval '1 minute')
+          )
+        ORDER BY file.updated_at ASC, file.id ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE ingestion_files file
+      SET preview_status = 'processing',
+          preview_claimed_by = ${claimedBy},
+          preview_claimed_at = now(),
+          updated_at = now()
+      FROM candidate, ingestions ing
+      WHERE file.id = candidate.id
+        AND ing.id = file.ingestion_id
+      RETURNING file.ingestion_id, ing.tenant_id, ing.batch_label, file.id AS file_id,
+        file.filename, file.content_type, file.size_bytes, file.storage_key,
+        file.preview_claimed_by, file.preview_claimed_at
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapClaimedIngestionPreview(row) : undefined;
+}
+
+export async function findClaimedIngestionPreview(params: {
+  ingestionId: string;
+  fileId: string;
+  workerId?: string;
+}): Promise<ClaimedIngestionPreviewRecord | undefined> {
+  const claimedBy = params.workerId?.trim() || "worker";
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<
+      Array<{
+        ingestion_id: string;
+        tenant_id: string;
+        batch_label: string;
+        file_id: string;
+        filename: string;
+        content_type: string;
+        size_bytes: DbInt;
+        storage_key: string;
+        preview_claimed_by: string | null;
+        preview_claimed_at: Date | null;
+      }>
+    >`
+      SELECT file.ingestion_id, ing.tenant_id, ing.batch_label, file.id AS file_id,
+        file.filename, file.content_type, file.size_bytes, file.storage_key,
+        file.preview_claimed_by, file.preview_claimed_at
+      FROM ingestion_files file
+      INNER JOIN ingestions ing ON ing.id = file.ingestion_id
+      WHERE file.ingestion_id = ${params.ingestionId}
+        AND file.id = ${params.fileId}
+        AND file.preview_status = 'processing'
+        AND file.preview_claimed_by = ${claimedBy}
+      LIMIT 1
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapClaimedIngestionPreview(row) : undefined;
+}
+
+export async function updateIngestionPreviewUpload(params: {
+  ingestionId: string;
+  fileId: string;
+  workerId?: string;
+  storageKey: string;
+  contentType: string;
+}): Promise<IngestionFileRecord | undefined> {
+  const claimedBy = params.workerId?.trim() || "worker";
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionFileRow[]>`
+      UPDATE ingestion_files
+      SET preview_storage_key = ${params.storageKey},
+          preview_content_type = ${params.contentType},
+          updated_at = now()
+      WHERE id = ${params.fileId}
+        AND ingestion_id = ${params.ingestionId}
+        AND preview_status = 'processing'
+        AND preview_claimed_by = ${claimedBy}
+      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
+        preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
+        preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapIngestionFile(row) : undefined;
+}
+
+export async function markIngestionFilePreviewReady(params: {
+  ingestionId: string;
+  fileId: string;
+  workerId?: string;
+  storageKey: string;
+  contentType: string;
+  sizeBytes: number;
+  width?: number;
+  height?: number;
+}): Promise<IngestionFileRecord | undefined> {
+  const claimedBy = params.workerId?.trim() || "worker";
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionFileRow[]>`
+      UPDATE ingestion_files
+      SET preview_status = 'ready',
+          preview_claimed_by = null,
+          preview_claimed_at = null,
+          preview_storage_key = ${params.storageKey},
+          preview_content_type = ${params.contentType},
+          preview_size_bytes = ${params.sizeBytes},
+          preview_width = ${params.width ?? null},
+          preview_height = ${params.height ?? null},
+          preview_error = null,
+          preview_generated_at = now(),
+          updated_at = now()
+      WHERE id = ${params.fileId}
+        AND ingestion_id = ${params.ingestionId}
+        AND preview_status = 'processing'
+        AND preview_claimed_by = ${claimedBy}
+      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
+        preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
+        preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapIngestionFile(row) : undefined;
+}
+
+export async function markIngestionFilePreviewFailed(params: {
+  ingestionId: string;
+  fileId: string;
+  workerId?: string;
+  error: JsonObject;
+}): Promise<IngestionFileRecord | undefined> {
+  const claimedBy = params.workerId?.trim() || "worker";
+  const rows = await withSchemaClient(async (sql) => {
+    return await sql<IngestionFileRow[]>`
+      UPDATE ingestion_files
+      SET preview_status = 'failed',
+          preview_claimed_by = null,
+          preview_claimed_at = null,
+          preview_storage_key = null,
+          preview_content_type = null,
+          preview_size_bytes = null,
+          preview_width = null,
+          preview_height = null,
+          preview_error = ${params.error},
+          preview_generated_at = null,
+          updated_at = now()
+      WHERE id = ${params.fileId}
+        AND ingestion_id = ${params.ingestionId}
+        AND preview_status = 'processing'
+        AND preview_claimed_by = ${claimedBy}
+      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
+        preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
+        preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapIngestionFile(row) : undefined;
 }

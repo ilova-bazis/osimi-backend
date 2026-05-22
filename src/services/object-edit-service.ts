@@ -3,6 +3,7 @@ import {
   ConflictError,
   LockedError,
   NotFoundError,
+  RevisionConflictError,
   UnprocessableEntityError,
 } from "../http/errors.ts";
 import type { AuthenticatedContext } from "../auth/guards.ts";
@@ -170,6 +171,7 @@ async function serializeObjectEdit(record: ObjectEditRecord): Promise<ObjectEdit
   return {
     object_id: record.objectId,
     media_type: mediaType,
+    revision: record.revision,
     curation_state: record.curationState,
     lock: {
       locked: record.lockedBy !== null && record.lockedUntil !== null && record.lockedUntil > new Date(),
@@ -272,6 +274,7 @@ export async function patchObjectMetadataForTenant(params: {
     tenantId: params.auth.tenantId,
     objectId: params.objectId,
     actorUserId: params.auth.userId,
+    revision: params.body.revision,
     title: params.body.metadata.title,
     publicationDate: params.body.metadata.publication_date,
     datePrecision: params.body.metadata.date_precision,
@@ -288,8 +291,15 @@ export async function patchObjectMetadataForTenant(params: {
     throw new NotFoundError(`Object '${params.objectId}' was not found.`);
   }
 
+  if (result.status === "revision_conflict") {
+    throw new RevisionConflictError("Object metadata revision is stale.", {
+      latest_revision: result.latestRevision,
+    });
+  }
+
   return {
     object_id: result.record.objectId,
+    revision: result.record.revision,
     curation_state: result.record.curationState,
     updated_at: (result.record.editUpdatedAt ?? result.record.updatedAt).toISOString(),
   };
@@ -318,6 +328,7 @@ export async function putDocumentCurationForTenant(params: {
     tenantId: params.auth.tenantId,
     objectId: params.objectId,
     actorUserId: params.auth.userId,
+    revision: params.body.revision,
     pages: params.body.pages.map((page) => ({
       pageNumber: page.page_number,
       curatedText: page.curated_text,
@@ -338,6 +349,12 @@ export async function putDocumentCurationForTenant(params: {
     );
   }
 
+  if (result.status === "revision_conflict") {
+    throw new RevisionConflictError("Document curation revision is stale.", {
+      latest_revision: result.latestRevision,
+    });
+  }
+
   if (result.status === "invalid_page_numbers") {
     throw new UnprocessableEntityError("Validation failed.", result.invalidPageNumbers.map((pageNumber) => ({
       path: "pages",
@@ -348,6 +365,7 @@ export async function putDocumentCurationForTenant(params: {
 
   return {
     object_id: result.record.objectId,
+    revision: result.record.revision,
     updated_count: result.updatedCount,
     updated_at: (result.record.editUpdatedAt ?? result.record.updatedAt).toISOString(),
   };
@@ -431,6 +449,7 @@ export async function submitObjectCurationForTenant(params: {
     tenantId: params.auth.tenantId,
     objectId: params.objectId,
     actorUserId: params.auth.userId,
+    revision: params.body.revision,
     requestId,
     idempotencyKey,
     actionPayload: {
@@ -461,8 +480,15 @@ export async function submitObjectCurationForTenant(params: {
     );
   }
 
+  if (result.status === "revision_conflict") {
+    throw new RevisionConflictError("Document curation revision is stale.", {
+      latest_revision: result.latestRevision,
+    });
+  }
+
   return {
     object_id: result.record.objectId,
+    revision: result.record.revision,
     curation_state: result.record.curationState,
     request: {
       id: result.request.id,

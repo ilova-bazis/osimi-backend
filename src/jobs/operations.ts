@@ -49,6 +49,9 @@ export async function runStagingRetentionSweep(config: StagingRetentionConfig): 
     }
 
     await rm(filePath, { force: true });
+    if (candidate.previewStorageKey) {
+      await rm(resolveStagingPath(candidate.previewStorageKey), { force: true });
+    }
     deleted += 1;
   }
 

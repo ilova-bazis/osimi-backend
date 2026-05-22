@@ -74,6 +74,16 @@ export function buildStagingStorageKey(params: {
   return `tenants/${params.tenantId}/ingestions/${params.ingestionId}/original/${params.fileId}-${safeStorageKeySegment(params.filename)}`;
 }
 
+export function buildIngestionPreviewStorageKey(params: {
+  tenantId: string;
+  ingestionId: string;
+  fileId: string;
+  extension: string;
+}): string {
+  const safeExtension = safeStorageKeySegment(params.extension).replace(/^\./, "");
+  return `tenants/${params.tenantId}/ingestions/${params.ingestionId}/preview/${params.fileId}.${safeExtension || "bin"}`;
+}
+
 export function buildObjectArtifactStorageKey(params: {
   tenantId: string;
   objectId: string;

@@ -198,6 +198,15 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - `storage_key` (string)
 - `status` (`PENDING|UPLOADED|VALIDATED|FAILED`)
 - `checksum_sha256` (string, nullable)
+- `preview` (object)
+  - `status` (`pending|ready|failed|unsupported`)
+  - `content_type` (string, nullable)
+  - `size_bytes` (number, nullable)
+  - `width` (number, nullable)
+  - `height` (number, nullable)
+  - `url` (string, nullable)
+  - `error` (JSON object, nullable)
+  - note: internal worker claim state is normalized back to `pending` in client-facing ingestion responses
 - `processing_overrides` (strict object):
   - optional keys: `ocr_text`, `audio_transcript`, `video_transcript`
   - each value: `{ enabled: boolean, language?: string }`
@@ -273,10 +282,18 @@ Ingestion response shapes in this section are authoritative with `src/validation
       - `notes` (`internal`, `public`)
 - 201 response:
   - `ingestion` (Ingestion Schema)
+- Compatibility rules:
+  - `classification_type` and `item_kind` must be semantically compatible
+  - current compatibility set:
+    - `newspaper_article|magazine_article|book_chapter|book|letter|report|manuscript|document` -> `scanned_document|document`
+    - `image` -> `photo`
+    - `speech|interview` -> `audio|video|scanned_document`
+    - `other` -> any `item_kind`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid body/field validation
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
+  - `409 CONFLICT` when `classification_type` and `item_kind` are incompatible
 
 ### GET `/api/ingestions`
 
@@ -303,11 +320,116 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - 200 response:
   - `ingestion` (Ingestion Schema)
   - `files[]` (array of Ingestion File Schema)
+  - preview behavior:
+    - image and video uploads return `preview.status = pending` after commit until a worker-generated thumbnail preview is uploaded back to VPS staging
+    - unsupported media return `preview.status = unsupported`
+    - `preview.url` is populated only when `preview.status = ready`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:id` format
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when ingestion does not exist in tenant scope
+
+### GET `/api/ingestions/:id/files/:fileId/preview`
+
+- Auth: Bearer token
+- Roles: `viewer`, `archiver`, `admin`
+- Purpose: stream a committed ingestion file preview from temporary VPS staging.
+- Preconditions:
+  - ingestion file exists in tenant scope
+  - `preview.status = ready`
+- 200 response:
+  - raw preview bytes with preview `Content-Type`
+- Notes:
+  - preview bytes are served from temporary VPS staging storage
+  - preview availability follows ingestion staging retention and cleanup rules
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path params
+  - `401 UNAUTHORIZED` for missing/invalid/expired session token
+  - `403 FORBIDDEN` when authenticated role is not allowed
+  - `404 NOT_FOUND` when ingestion/file does not exist in tenant scope or preview is not ready
+
+### POST `/api/worker/ingestion-previews/claim`
+
+- Auth: worker token (`x-worker-auth-token`)
+- Purpose: claim one committed ingestion file whose preview is pending so a worker can generate a temporary upload preview before final ingestion submission.
+- Behavior:
+  - returns at most one file per call
+  - only considers committed files with `status = UPLOADED`
+  - only considers ingestions still in upload-editable states (`DRAFT`, `UPLOADING`, `CANCELED`)
+  - may reclaim a stale in-progress preview job after the claim timeout elapses
+- 200 response:
+  - `preview` (`null` when no work available) or:
+    - `ingestion_id`
+    - `file_id`
+    - `tenant_id`
+    - `batch_label`
+    - `filename`
+    - `content_type`
+    - `size_bytes`
+    - `download_url` (short-lived worker download URL for the committed staged original)
+    - `claimed_by` (string, nullable)
+    - `claimed_at` (ISO timestamp string, nullable)
+- Error behavior:
+  - `401 UNAUTHORIZED` for missing/invalid worker token
+
+### POST `/api/worker/ingestion-previews/:id/files/:fileId/presign`
+
+- Auth: worker token (`x-worker-auth-token`)
+- Purpose: obtain a signed upload URL for a generated preview file belonging to a claimed ingestion preview job.
+- Body:
+  - `content_type` (string; generated thumbnail output MIME, currently one of `image/jpeg`, `image/png`, `image/webp`, `image/gif`, `image/avif`)
+  - `size_bytes` (number; maximum 5 MiB)
+  - `extension` (optional string; accepted for compatibility, storage extension is derived from validated `content_type`)
+- 200 response:
+  - `upload_token`
+  - `upload_url`
+  - `storage_key`
+  - `expires_at`
+  - `headers { content-type, content-length }`
+- Notes:
+  - `upload_url` uses the normal staged upload transport (`PUT /api/uploads/:token`)
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body shape
+  - `401 UNAUTHORIZED` for missing/invalid worker token
+  - `409 CONFLICT` when the preview is not currently claimed by that worker or upload preparation cannot be recorded
+
+### POST `/api/worker/ingestion-previews/:id/files/:fileId/complete`
+
+- Auth: worker token (`x-worker-auth-token`)
+- Purpose: mark a claimed preview job ready after uploading preview bytes.
+- Body:
+  - `upload_token` (string)
+  - `width` (number; generated thumbnail width, maximum 2048)
+  - `height` (number; generated thumbnail height, maximum 2048)
+- 200 response:
+  - `status = ready`
+  - `ingestion_id`
+  - `file_id`
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body shape or mismatched upload token context
+  - `401 UNAUTHORIZED` for missing/invalid worker token
+  - `404 NOT_FOUND` when uploaded preview bytes are missing from staging
+  - `409 CONFLICT` when the preview is not currently claimed by that worker or completion cannot be recorded
+
+### POST `/api/worker/ingestion-previews/:id/files/:fileId/fail`
+
+- Auth: worker token (`x-worker-auth-token`)
+- Purpose: mark a claimed preview job failed with structured error details.
+- Body:
+  - `error`
+    - `message` (string)
+    - `code` (optional string)
+    - `retryable` (optional boolean)
+    - `details` (optional object)
+- 200 response:
+  - `status = failed`
+  - `ingestion_id`
+  - `file_id`
+- Error behavior:
+  - `400 BAD_REQUEST` for invalid path/body shape
+  - `401 UNAUTHORIZED` for missing/invalid worker token
+  - `409 CONFLICT` when the preview is not currently claimed by that worker or failure cannot be recorded
 
 ### POST `/api/ingestions/:id/items`
 
@@ -323,6 +445,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - Preconditions:
   - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
   - ingestion has no active lease
+  - the effective `classification_type` and `item_kind` pair must be compatible (item override when provided, otherwise ingestion defaults)
 - 201 response:
   - `item` (Ingestion Item Schema)
 - Error behavior:
@@ -330,7 +453,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when ingestion does not exist in tenant scope
-  - `409 CONFLICT` when ingestion cannot be modified in current status or has active lease
+  - `409 CONFLICT` when ingestion cannot be modified in current status, has active lease, or the effective `classification_type`/`item_kind` pair is incompatible
 
 ### GET `/api/ingestions/:id/items`
 
@@ -357,6 +480,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - Preconditions:
   - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
   - ingestion has no active lease
+  - the effective `classification_type` and `item_kind` pair after patching must remain compatible
 - 200 response:
   - `items[]` (array of Ingestion Item Schema, ordered by `item_index`)
 - Error behavior:
@@ -395,7 +519,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when ingestion/item does not exist in tenant scope
-  - `409 CONFLICT` when ingestion cannot be modified in current status or has active lease
+  - `409 CONFLICT` when ingestion cannot be modified in current status, has active lease, or the effective `classification_type`/`item_kind` pair is incompatible
 
 ### PATCH `/api/ingestions/:id`
 
@@ -424,7 +548,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when ingestion does not exist in tenant scope
-  - `409 CONFLICT` when ingestion cannot be modified in current status or has active lease
+  - `409 CONFLICT` when ingestion cannot be modified in current status, has active lease, or the effective `classification_type`/`item_kind` pair is incompatible
 
 ### DELETE `/api/ingestions/:id`
 
@@ -491,6 +615,8 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - Preconditions:
   - ingestion is in `DRAFT` or `UPLOADING`
   - if ingestion is `CANCELED`, backend reopens it first (`DRAFT` or `UPLOADING`), then applies delete
+- Behavior:
+  - deleting a file also deletes any temporary preview derivative stored for that ingestion file
 - 200 response:
   - `status` = `deleted`
   - `file_id`
@@ -531,15 +657,25 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - Preconditions:
   - all ingestion files must share a single media kind (`image`, `audio`, `video`, `document`)
   - each file `content_type` must map to a supported media kind from ingestion capabilities
+  - file media kind must be compatible with ingestion `item_kind`
+    - `photo` -> `image`
+    - `audio` -> `audio`
+    - `video` -> `video`
+    - `scanned_document` -> `image|document`
+    - `document` -> `document`
+    - `other` -> any media kind
 - 200 response:
   - `file` (Ingestion File Schema)
+  - preview behavior:
+    - committed image/video files are marked `preview.status = pending`
+    - committed unsupported media are marked `preview.status = unsupported`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid path/body shape
     - includes unsupported ingestion file `content_type` values
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when ingestion or file does not exist in tenant scope
-  - `409 CONFLICT` for uncommittable state, missing staged upload, media-kind mismatch, size mismatch, or checksum mismatch
+  - `409 CONFLICT` for uncommittable state, missing staged upload, media-kind mismatch, item-kind/media-kind incompatibility, size mismatch, or checksum mismatch
 
 ### POST `/api/ingestions/:id/items/:itemId/files`
 
@@ -555,6 +691,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - Preconditions:
   - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
   - ingestion has no active lease
+  - file media kind must be compatible with the target item's effective `item_kind` (item override when set, otherwise ingestion `item_kind`)
 - 201 response:
   - `file` (Ingestion Item File Schema)
 - Error behavior:
@@ -562,7 +699,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when ingestion/item does not exist in tenant scope
-  - `409 CONFLICT` when ingestion cannot be modified in current status, has active lease, or ordering constraints are violated
+  - `409 CONFLICT` when ingestion cannot be modified in current status, has active lease, file media is incompatible with item kind, or ordering constraints are violated
 
 ### GET `/api/ingestions/:id/items/:itemId/files`
 

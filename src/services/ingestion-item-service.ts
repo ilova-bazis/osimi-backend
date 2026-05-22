@@ -1,4 +1,16 @@
 import {
+  getAllowedItemKindsForClassificationType,
+  getAllowedMediaKindsForItemKind,
+  isClassificationTypeCompatibleWithItemKind,
+  isItemKindCompatibleWithMediaKind,
+} from "../domain/ingestions/compatibility.ts";
+import {
+  getMediaKindForMime,
+  normalizeMime,
+  type MediaKind,
+} from "../domain/ingestions/capabilities.ts";
+import { findIngestionFileById } from "../repos/ingestion-repo.ts";
+import {
   ConflictError,
   NotFoundError,
   ValidationError,
@@ -25,6 +37,8 @@ import type {
   CreateIngestionItemResponse,
   IngestionItemDto,
   IngestionItemFileDto,
+  IngestItemKind,
+  IngestionClassificationType,
   ListIngestionItemFilesResponse,
   ListIngestionItemsResponse,
   ReorderIngestionItemsBody,
@@ -35,6 +49,68 @@ import type {
   UpdateIngestionItemResponse,
   JsonObject,
 } from "../validation/ingestion.ts";
+
+function assertClassificationTypeCompatibleWithItemKind(params: {
+  classificationType: IngestionClassificationType;
+  itemKind: IngestItemKind;
+}): void {
+  if (
+    isClassificationTypeCompatibleWithItemKind({
+      classificationType: params.classificationType,
+      itemKind: params.itemKind,
+    })
+  ) {
+    return;
+  }
+
+  throw new ConflictError(
+    `Classification type '${params.classificationType}' is incompatible with item kind '${params.itemKind}'.`,
+    {
+      classification_type: params.classificationType,
+      item_kind: params.itemKind,
+      allowed_item_kinds: [
+        ...getAllowedItemKindsForClassificationType(params.classificationType),
+      ],
+    },
+  );
+}
+
+function assertItemKindCompatibleWithMediaKind(params: {
+  itemKind: IngestItemKind;
+  mediaKind: MediaKind;
+}): void {
+  if (
+    isItemKindCompatibleWithMediaKind({
+      itemKind: params.itemKind,
+      mediaKind: params.mediaKind,
+    })
+  ) {
+    return;
+  }
+
+  throw new ConflictError(
+    `Item kind '${params.itemKind}' is incompatible with ${params.mediaKind} files.`,
+    {
+      item_kind: params.itemKind,
+      actual_media_kind: params.mediaKind,
+      allowed_media_kinds: [...getAllowedMediaKindsForItemKind(params.itemKind)],
+    },
+  );
+}
+
+function resolveEffectiveItemKind(params: {
+  itemKind?: IngestItemKind;
+  ingestionItemKind: IngestItemKind;
+}): IngestItemKind {
+  return params.itemKind ?? params.ingestionItemKind;
+}
+
+function resolveEffectiveClassificationType(params: {
+  classificationType?: IngestionClassificationType;
+  ingestionClassificationType: IngestionClassificationType;
+}): IngestionClassificationType {
+  return params.classificationType ?? params.ingestionClassificationType;
+}
 
 function serializeIngestionItem(record: IngestionItemRecord): IngestionItemDto {
   return {
@@ -182,6 +258,22 @@ export async function createIngestionItemForIngestion(params: {
     ingestionId: params.ingestionId,
   });
 
+  const ingestion = await findIngestionById(params.auth.tenantId, params.ingestionId);
+  if (!ingestion) {
+    throw new NotFoundError(`Ingestion '${params.ingestionId}' was not found.`);
+  }
+
+  assertClassificationTypeCompatibleWithItemKind({
+    classificationType: resolveEffectiveClassificationType({
+      classificationType: params.body.classification_type,
+      ingestionClassificationType: ingestion.classificationType,
+    }),
+    itemKind: resolveEffectiveItemKind({
+      itemKind: params.body.item_kind,
+      ingestionItemKind: ingestion.itemKind,
+    }),
+  });
+
   const item = await createIngestionItem({
     id: crypto.randomUUID(),
     tenantId: params.auth.tenantId,
@@ -229,6 +321,11 @@ export async function addIngestionFileToItem(params: {
     ingestionId: params.ingestionId,
   });
 
+  const ingestion = await findIngestionById(params.auth.tenantId, params.ingestionId);
+  if (!ingestion) {
+    throw new NotFoundError(`Ingestion '${params.ingestionId}' was not found.`);
+  }
+
   const item = await findIngestionItemById({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
@@ -237,6 +334,26 @@ export async function addIngestionFileToItem(params: {
 
   if (!item) {
     throw new NotFoundError(`Ingestion item '${params.ingestionItemId}' was not found.`);
+  }
+
+  const file = await findIngestionFileById({
+    tenantId: params.auth.tenantId,
+    ingestionId: params.ingestionId,
+    fileId: params.body.ingestion_file_id,
+  });
+  if (!file) {
+    throw new NotFoundError(`Ingestion file '${params.body.ingestion_file_id}' was not found.`);
+  }
+
+  const mediaKind = getMediaKindForMime(normalizeMime(file.contentType));
+  if (mediaKind) {
+    assertItemKindCompatibleWithMediaKind({
+      itemKind: resolveEffectiveItemKind({
+        itemKind: item.itemKind,
+        ingestionItemKind: ingestion.itemKind,
+      }),
+      mediaKind,
+    });
   }
 
   const linked = await createIngestionItemFile({
@@ -390,6 +507,23 @@ export async function updateIngestionItemMetadata(params: {
   if (!existingItem) {
     throw new NotFoundError(`Ingestion item '${params.ingestionItemId}' was not found.`);
   }
+
+  const ingestion = await findIngestionById(params.auth.tenantId, params.ingestionId);
+  if (!ingestion) {
+    throw new NotFoundError(`Ingestion '${params.ingestionId}' was not found.`);
+  }
+
+  assertClassificationTypeCompatibleWithItemKind({
+    classificationType: resolveEffectiveClassificationType({
+      classificationType:
+        params.body.classification_type ?? existingItem.classificationType,
+      ingestionClassificationType: ingestion.classificationType,
+    }),
+    itemKind: resolveEffectiveItemKind({
+      itemKind: params.body.item_kind ?? existingItem.itemKind,
+      ingestionItemKind: ingestion.itemKind,
+    }),
+  });
 
   const summaryPatch = buildSummaryPatch(params.body);
   const nextSummary = summaryPatch

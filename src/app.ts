@@ -1,5 +1,9 @@
 import { withRequestContext } from "./http/context.ts";
-import { MethodNotAllowedError, NotFoundError } from "./http/errors.ts";
+import {
+  createErrorResponse,
+  MethodNotAllowedError,
+  NotFoundError,
+} from "./http/errors.ts";
 import { routes as defaultRoutes } from "./routes/index.ts";
 import type { RouteDefinition } from "./routes/types.ts";
 import { runWithRuntimeConfig, type RuntimeConfig } from "./runtime/config.ts";
@@ -8,7 +12,7 @@ interface App {
   fetch: (request: Request) => Promise<Response>;
 }
 
-const ALLOWED_ORIGINS = new Set(["http://localhost:4444"]);
+const ALLOWED_ORIGINS = new Set(["http://localhost:4444", "http://localhost:5173"]);
 const ALLOWED_METHODS = "GET,POST,PATCH,PUT,DELETE,OPTIONS";
 const ALLOWED_HEADERS =
   "authorization,content-type,x-tenant-id,x-request-id,x-idempotency-key,x-worker-auth-token,x-worker-id";
@@ -126,7 +130,7 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
 
   return {
     async fetch(request: Request): Promise<Response> {
-      return runWithRuntimeConfig(runtimeConfig, () => {
+      return runWithRuntimeConfig(runtimeConfig, async () => {
         const corsHeaders = resolveCorsHeaders(request.headers.get("origin"));
 
         if (request.method.toUpperCase() === "OPTIONS") {
@@ -136,61 +140,69 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
           });
         }
 
-        return withRequestContext(request, async (context) => {
-          const url = new URL(request.url);
-          const pathname = normalizePath(url.pathname);
-          const method = request.method.toUpperCase();
-          const key = routeKey(method, pathname);
-          let handler = handlers.get(key);
+        let response: Response;
 
-          if (!handler) {
-            for (const route of dynamicRoutes) {
-              if (
-                route.method === method &&
-                pathMatches(route.path, pathname)
-              ) {
-                handler = route.handler;
-                break;
+        try {
+          response = await withRequestContext(request, async (context) => {
+            const url = new URL(request.url);
+            const pathname = normalizePath(url.pathname);
+            const method = request.method.toUpperCase();
+            const key = routeKey(method, pathname);
+            let handler = handlers.get(key);
+
+            if (!handler) {
+              for (const route of dynamicRoutes) {
+                if (
+                  route.method === method &&
+                  pathMatches(route.path, pathname)
+                ) {
+                  handler = route.handler;
+                  break;
+                }
               }
             }
-          }
 
-          if (!handler) {
-            let allowedMethods = methodsByPath.get(pathname);
+            if (!handler) {
+              let allowedMethods = methodsByPath.get(pathname);
 
-            if (!allowedMethods) {
-              const matchedMethods = new Set<string>();
+              if (!allowedMethods) {
+                const matchedMethods = new Set<string>();
 
-              for (const route of dynamicRoutes) {
-                if (pathMatches(route.path, pathname)) {
-                  matchedMethods.add(route.method);
+                for (const route of dynamicRoutes) {
+                  if (pathMatches(route.path, pathname)) {
+                    matchedMethods.add(route.method);
+                  }
+                }
+
+                if (matchedMethods.size > 0) {
+                  allowedMethods = matchedMethods;
                 }
               }
 
-              if (matchedMethods.size > 0) {
-                allowedMethods = matchedMethods;
+              if (allowedMethods) {
+                throw new MethodNotAllowedError(pathname, [...allowedMethods]);
               }
+
+              throw new NotFoundError(
+                `Route '${method} ${pathname}' was not found.`,
+              );
             }
 
-            if (allowedMethods) {
-              throw new MethodNotAllowedError(pathname, [...allowedMethods]);
-            }
+            return await handler(request, context);
+          });
+        } catch (error) {
+          const fallbackRequestId = crypto.randomUUID();
+          response = createErrorResponse(error, fallbackRequestId);
+          response.headers.set("x-request-id", fallbackRequestId);
+        }
 
-            throw new NotFoundError(
-              `Route '${method} ${pathname}' was not found.`,
-            );
+        if (corsHeaders) {
+          for (const [key, value] of Object.entries(corsHeaders)) {
+            response.headers.set(key, value);
           }
+        }
 
-          const response = await handler(request, context);
-
-          if (corsHeaders) {
-            for (const [key, value] of Object.entries(corsHeaders)) {
-              response.headers.set(key, value);
-            }
-          }
-
-          return response;
-        });
+        return response;
       });
     },
   };

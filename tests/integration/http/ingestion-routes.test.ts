@@ -1,6 +1,6 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { sql as sqlIdentifier } from "bun";
@@ -69,8 +69,101 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
         databaseUrl: TEST_DATABASE_URL,
         dbSchema: schema,
         stagingRoot,
+        workerAuthToken: "worker-secret",
       },
     });
+  }
+
+  function workerHeaders(workerId = "preview-worker") {
+    return {
+      "x-worker-auth-token": "worker-secret",
+      "x-worker-id": workerId,
+    };
+  }
+
+  async function createCommittedFile(params: {
+    app: ReturnType<typeof createTestApp>;
+    ingestionId: string;
+    filename: string;
+    contentType: string;
+    payload: string;
+  }): Promise<{ fileId: string }> {
+    const presignResponse = await params.app.fetch(
+      new Request(`http://localhost/api/ingestions/${params.ingestionId}/files/presign`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          filename: params.filename,
+          content_type: params.contentType,
+          size_bytes: params.payload.length,
+        }),
+      }),
+    );
+
+    expect(presignResponse.status).toBe(201);
+    const presignBody = (await presignResponse.json()) as {
+      file_id: string;
+      upload_url: string;
+    };
+
+    const uploadResponse = await params.app.fetch(
+      new Request(`http://localhost${presignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": params.contentType,
+          "content-length": String(params.payload.length),
+        },
+        body: params.payload,
+      }),
+    );
+
+    expect(uploadResponse.status).toBe(200);
+
+    const commitResponse = await params.app.fetch(
+      new Request(`http://localhost/api/ingestions/${params.ingestionId}/files/commit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          file_id: presignBody.file_id,
+          checksum_sha256: sha256Hex(params.payload),
+        }),
+      }),
+    );
+
+    expect(commitResponse.status).toBe(200);
+
+    return {
+      fileId: presignBody.file_id,
+    };
+  }
+
+  async function createIngestionDraft(params: {
+    app: ReturnType<typeof createTestApp>;
+    body?: Record<string, unknown>;
+  }): Promise<string> {
+    const createResponse = await params.app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody(params.body)),
+      }),
+    );
+
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as {
+      ingestion: { id: string };
+    };
+
+    return createBody.ingestion.id;
   }
 
   beforeAll(async () => {
@@ -251,6 +344,685 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
     expect(detailBody.ingestion.status).toBe("QUEUED");
     expect(detailBody.files.length).toBe(1);
     expect(detailBody.files[0]?.status).toBe("UPLOADED");
+  });
+
+  test("marks unsupported files with preview status unsupported", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-preview-unsupported" })),
+      }),
+    );
+
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as {
+      ingestion: { id: string };
+    };
+
+    const file = await createCommittedFile({
+      app,
+      ingestionId: createBody.ingestion.id,
+      filename: "sample.txt",
+      contentType: "text/plain",
+      payload: "hello world",
+    });
+
+    const detailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+
+    expect(detailResponse.status).toBe(200);
+    const detailBody = (await detailResponse.json()) as {
+      files: Array<{
+        id: string;
+        preview: { status: string; url: string | null };
+      }>;
+    };
+
+    expect(detailBody.files.find((entry) => entry.id === file.fileId)?.preview).toMatchObject({
+      status: "unsupported",
+      url: null,
+    });
+  });
+
+  test("returns pending previews for committed images and serves ready preview bytes", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: "batch-preview-image",
+          classification_type: "image",
+          item_kind: "photo",
+        })),
+      }),
+    );
+
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as {
+      ingestion: { id: string };
+    };
+
+    const file = await createCommittedFile({
+      app,
+      ingestionId: createBody.ingestion.id,
+      filename: "sample.png",
+      contentType: "image/png",
+      payload: "pngbytes",
+    });
+
+    let detailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+
+    expect(detailResponse.status).toBe(200);
+    let detailBody = (await detailResponse.json()) as {
+      files: Array<{
+        id: string;
+        preview: {
+          status: string;
+          content_type: string | null;
+          width: number | null;
+          height: number | null;
+          url: string | null;
+        };
+      }>;
+    };
+
+    expect(detailBody.files.find((entry) => entry.id === file.fileId)?.preview).toMatchObject({
+      status: "pending",
+      content_type: null,
+      width: null,
+      height: null,
+      url: null,
+    });
+
+    const previewStorageKey = `tenants/00000000-0000-0000-0000-000000000001/ingestions/${createBody.ingestion.id}/preview/${file.fileId}.jpg`;
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+    try {
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      await sql`
+        UPDATE ingestion_files
+        SET preview_status = 'ready',
+            preview_storage_key = ${previewStorageKey},
+            preview_content_type = ${"image/jpeg"},
+            preview_size_bytes = ${5},
+            preview_width = ${64},
+            preview_height = ${64},
+            preview_generated_at = now()
+        WHERE id = ${file.fileId}
+      `;
+    } finally {
+      await sql.close();
+    }
+
+    const previewPath = join(stagingRoot, previewStorageKey);
+    await mkdir(dirname(previewPath), { recursive: true });
+    await Bun.write(previewPath, "thumb");
+
+    detailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+
+    expect(detailResponse.status).toBe(200);
+    detailBody = (await detailResponse.json()) as {
+      files: Array<{
+        id: string;
+        preview: {
+          status: string;
+          content_type: string | null;
+          width: number | null;
+          height: number | null;
+          url: string | null;
+        };
+      }>;
+    };
+
+    expect(detailBody.files.find((entry) => entry.id === file.fileId)?.preview).toMatchObject({
+      status: "ready",
+      content_type: "image/jpeg",
+      width: 64,
+      height: 64,
+      url: `/api/ingestions/${createBody.ingestion.id}/files/${file.fileId}/preview`,
+    });
+
+    const previewResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/ingestions/${createBody.ingestion.id}/files/${file.fileId}/preview`,
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${authToken}`,
+          },
+        },
+      ),
+    );
+
+    expect(previewResponse.status).toBe(200);
+    expect(previewResponse.headers.get("content-type")).toBe("image/jpeg");
+    expect(await previewResponse.text()).toBe("thumb");
+  });
+
+  test("worker can claim, upload, and complete an ingestion preview", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: "batch-preview-worker-complete",
+          classification_type: "image",
+          item_kind: "photo",
+        })),
+      }),
+    );
+
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as {
+      ingestion: { id: string };
+    };
+
+    const file = await createCommittedFile({
+      app,
+      ingestionId: createBody.ingestion.id,
+      filename: "sample.png",
+      contentType: "image/png",
+      payload: "pngbytes",
+    });
+
+    const claimResponse = await app.fetch(
+      new Request("http://localhost/api/worker/ingestion-previews/claim", {
+        method: "POST",
+        headers: workerHeaders(),
+      }),
+    );
+
+    expect(claimResponse.status).toBe(200);
+    const claimBody = (await claimResponse.json()) as {
+      preview: { ingestion_id: string; file_id: string; download_url: string } | null;
+    };
+    expect(claimBody.preview?.ingestion_id).toBe(createBody.ingestion.id);
+    expect(claimBody.preview?.file_id).toBe(file.fileId);
+
+    const presignResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/worker/ingestion-previews/${createBody.ingestion.id}/files/${file.fileId}/presign`,
+        {
+          method: "POST",
+          headers: {
+            ...workerHeaders(),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            content_type: "image/jpeg",
+            size_bytes: 5,
+            extension: "jpg",
+          }),
+        },
+      ),
+    );
+
+    expect(presignResponse.status).toBe(200);
+    const presignBody = (await presignResponse.json()) as {
+      upload_token: string;
+      upload_url: string;
+    };
+
+    const uploadResponse = await app.fetch(
+      new Request(`http://localhost${presignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "image/jpeg",
+          "content-length": "5",
+        },
+        body: "thumb",
+      }),
+    );
+
+    expect(uploadResponse.status).toBe(200);
+
+    const completeResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/worker/ingestion-previews/${createBody.ingestion.id}/files/${file.fileId}/complete`,
+        {
+          method: "POST",
+          headers: {
+            ...workerHeaders(),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            upload_token: presignBody.upload_token,
+            width: 64,
+            height: 64,
+          }),
+        },
+      ),
+    );
+
+    expect(completeResponse.status).toBe(200);
+
+    const detailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+
+    expect(detailResponse.status).toBe(200);
+    const detailBody = (await detailResponse.json()) as {
+      files: Array<{
+        id: string;
+        preview: {
+          status: string;
+          content_type: string | null;
+          size_bytes: number | null;
+          width: number | null;
+          height: number | null;
+          url: string | null;
+        };
+      }>;
+    };
+    expect(detailBody.files.find((entry) => entry.id === file.fileId)?.preview).toMatchObject({
+      status: "ready",
+      content_type: "image/jpeg",
+      size_bytes: 5,
+      width: 64,
+      height: 64,
+      url: `/api/ingestions/${createBody.ingestion.id}/files/${file.fileId}/preview`,
+    });
+  });
+
+  test("worker preview presign rejects unsupported thumbnail output types", async () => {
+    const app = createTestApp();
+    const ingestionId = await createIngestionDraft({
+      app,
+      body: {
+        batch_label: "batch-preview-worker-bad-type",
+        classification_type: "image",
+        item_kind: "photo",
+      },
+    });
+    const file = await createCommittedFile({
+      app,
+      ingestionId,
+      filename: "sample.png",
+      contentType: "image/png",
+      payload: "pngbytes",
+    });
+
+    const claimResponse = await app.fetch(
+      new Request("http://localhost/api/worker/ingestion-previews/claim", {
+        method: "POST",
+        headers: workerHeaders("preview-worker-bad-type"),
+      }),
+    );
+
+    expect(claimResponse.status).toBe(200);
+
+    const presignResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/worker/ingestion-previews/${ingestionId}/files/${file.fileId}/presign`,
+        {
+          method: "POST",
+          headers: {
+            ...workerHeaders("preview-worker-bad-type"),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            content_type: "text/html",
+            size_bytes: 5,
+          }),
+        },
+      ),
+    );
+
+    expect(presignResponse.status).toBe(400);
+  });
+
+  test("worker preview presign rejects oversized thumbnails", async () => {
+    const app = createTestApp();
+    const ingestionId = await createIngestionDraft({
+      app,
+      body: {
+        batch_label: "batch-preview-worker-oversized",
+        classification_type: "image",
+        item_kind: "photo",
+      },
+    });
+    const file = await createCommittedFile({
+      app,
+      ingestionId,
+      filename: "sample.png",
+      contentType: "image/png",
+      payload: "pngbytes",
+    });
+
+    const claimResponse = await app.fetch(
+      new Request("http://localhost/api/worker/ingestion-previews/claim", {
+        method: "POST",
+        headers: workerHeaders("preview-worker-oversized"),
+      }),
+    );
+
+    expect(claimResponse.status).toBe(200);
+
+    const presignResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/worker/ingestion-previews/${ingestionId}/files/${file.fileId}/presign`,
+        {
+          method: "POST",
+          headers: {
+            ...workerHeaders("preview-worker-oversized"),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            content_type: "image/webp",
+            size_bytes: 5 * 1024 * 1024 + 1,
+          }),
+        },
+      ),
+    );
+
+    expect(presignResponse.status).toBe(400);
+  });
+
+  test("worker preview completion requires dimensions", async () => {
+    const app = createTestApp();
+    const ingestionId = await createIngestionDraft({
+      app,
+      body: {
+        batch_label: "batch-preview-worker-dimensions",
+        classification_type: "image",
+        item_kind: "photo",
+      },
+    });
+    const file = await createCommittedFile({
+      app,
+      ingestionId,
+      filename: "sample.png",
+      contentType: "image/png",
+      payload: "pngbytes",
+    });
+
+    const claimResponse = await app.fetch(
+      new Request("http://localhost/api/worker/ingestion-previews/claim", {
+        method: "POST",
+        headers: workerHeaders("preview-worker-dimensions"),
+      }),
+    );
+
+    expect(claimResponse.status).toBe(200);
+
+    const presignResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/worker/ingestion-previews/${ingestionId}/files/${file.fileId}/presign`,
+        {
+          method: "POST",
+          headers: {
+            ...workerHeaders("preview-worker-dimensions"),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            content_type: "image/jpeg",
+            size_bytes: 5,
+          }),
+        },
+      ),
+    );
+
+    expect(presignResponse.status).toBe(200);
+    const presignBody = (await presignResponse.json()) as {
+      upload_token: string;
+      upload_url: string;
+    };
+
+    const uploadResponse = await app.fetch(
+      new Request(`http://localhost${presignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "image/jpeg",
+          "content-length": "5",
+        },
+        body: "thumb",
+      }),
+    );
+
+    expect(uploadResponse.status).toBe(200);
+
+    const completeResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/worker/ingestion-previews/${ingestionId}/files/${file.fileId}/complete`,
+        {
+          method: "POST",
+          headers: {
+            ...workerHeaders("preview-worker-dimensions"),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            upload_token: presignBody.upload_token,
+          }),
+        },
+      ),
+    );
+
+    expect(completeResponse.status).toBe(400);
+  });
+
+  test("worker can mark an ingestion preview as failed", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: "batch-preview-worker-fail",
+          classification_type: "image",
+          item_kind: "photo",
+        })),
+      }),
+    );
+
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as {
+      ingestion: { id: string };
+    };
+
+    const file = await createCommittedFile({
+      app,
+      ingestionId: createBody.ingestion.id,
+      filename: "sample.png",
+      contentType: "image/png",
+      payload: "pngbytes",
+    });
+
+    const claimResponse = await app.fetch(
+      new Request("http://localhost/api/worker/ingestion-previews/claim", {
+        method: "POST",
+        headers: workerHeaders("preview-worker-fail"),
+      }),
+    );
+
+    expect(claimResponse.status).toBe(200);
+
+    const presignResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/worker/ingestion-previews/${createBody.ingestion.id}/files/${file.fileId}/presign`,
+        {
+          method: "POST",
+          headers: {
+            ...workerHeaders("preview-worker-fail"),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            content_type: "image/jpeg",
+            size_bytes: 5,
+          }),
+        },
+      ),
+    );
+
+    expect(presignResponse.status).toBe(200);
+
+    const failResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/worker/ingestion-previews/${createBody.ingestion.id}/files/${file.fileId}/fail`,
+        {
+          method: "POST",
+          headers: {
+            ...workerHeaders("preview-worker-fail"),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            error: {
+              message: "ffmpeg failed",
+              code: "PREVIEW_GENERATION_FAILED",
+              retryable: true,
+            },
+          }),
+        },
+      ),
+    );
+
+    expect(failResponse.status).toBe(200);
+
+    const detailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+
+    expect(detailResponse.status).toBe(200);
+    const detailBody = (await detailResponse.json()) as {
+      files: Array<{
+        id: string;
+        preview: {
+          status: string;
+          content_type: string | null;
+          size_bytes: number | null;
+          width: number | null;
+          height: number | null;
+          url: string | null;
+          error: Record<string, unknown> | null;
+        };
+      }>;
+    };
+    expect(detailBody.files.find((entry) => entry.id === file.fileId)?.preview).toMatchObject({
+      status: "failed",
+      content_type: null,
+      size_bytes: null,
+      width: null,
+      height: null,
+      url: null,
+      error: {
+        message: "ffmpeg failed",
+        code: "PREVIEW_GENERATION_FAILED",
+        retryable: true,
+      },
+    });
+  });
+
+  test("only current preview source kinds are marked pending", async () => {
+    const app = createTestApp();
+    const videoIngestionId = await createIngestionDraft({
+      app,
+      body: {
+        batch_label: "batch-preview-video-source",
+        classification_type: "interview",
+        item_kind: "video",
+      },
+    });
+    const videoFile = await createCommittedFile({
+      app,
+      ingestionId: videoIngestionId,
+      filename: "sample.mp4",
+      contentType: "video/mp4",
+      payload: "mp4data",
+    });
+    const audioIngestionId = await createIngestionDraft({
+      app,
+      body: {
+        batch_label: "batch-preview-audio-source",
+        classification_type: "interview",
+        item_kind: "audio",
+      },
+    });
+    const audioFile = await createCommittedFile({
+      app,
+      ingestionId: audioIngestionId,
+      filename: "sample.mp3",
+      contentType: "audio/mpeg",
+      payload: "mp3data",
+    });
+
+    const videoDetailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${videoIngestionId}`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+    const audioDetailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${audioIngestionId}`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+
+    expect(videoDetailResponse.status).toBe(200);
+    expect(audioDetailResponse.status).toBe(200);
+    const videoDetailBody = (await videoDetailResponse.json()) as {
+      files: Array<{ id: string; preview: { status: string } }>;
+    };
+    const audioDetailBody = (await audioDetailResponse.json()) as {
+      files: Array<{ id: string; preview: { status: string } }>;
+    };
+
+    expect(videoDetailBody.files.find((entry) => entry.id === videoFile.fileId)?.preview)
+      .toMatchObject({ status: "pending" });
+    expect(audioDetailBody.files.find((entry) => entry.id === audioFile.fileId)?.preview)
+      .toMatchObject({ status: "unsupported" });
   });
 
   test("updates ingestion metadata while draft", async () => {
@@ -825,7 +1597,11 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
           authorization: `Bearer ${authToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-remove-file-001" })),
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: "batch-remove-file-001",
+          classification_type: "image",
+          item_kind: "photo",
+        })),
       }),
     );
 
@@ -1013,7 +1789,11 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
           authorization: `Bearer ${authToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-jpeg-jpg-001" })),
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: "batch-jpeg-jpg-001",
+          classification_type: "image",
+          item_kind: "photo",
+        })),
       }),
     );
 
@@ -1136,7 +1916,11 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
           authorization: `Bearer ${authToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-mp3-mpeg-001" })),
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: "batch-mp3-mpeg-001",
+          classification_type: "interview",
+          item_kind: "audio",
+        })),
       }),
     );
 
@@ -1382,7 +2166,11 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
           authorization: `Bearer ${authToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-m4v-mp4-001" })),
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: "batch-m4v-mp4-001",
+          classification_type: "interview",
+          item_kind: "video",
+        })),
       }),
     );
 
@@ -1505,7 +2293,11 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
           authorization: `Bearer ${authToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-mixed-types-001" })),
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: "batch-mixed-types-001",
+          classification_type: "document",
+          item_kind: "scanned_document",
+        })),
       }),
     );
 
@@ -2220,7 +3012,11 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
           authorization: `Bearer ${authToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-items-order-001" })),
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: "batch-items-order-001",
+          classification_type: "document",
+          item_kind: "scanned_document",
+        })),
       }),
     );
 
@@ -2498,5 +3294,333 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
     expect(patchBody.item.summary.dates.created.value).toBe("1950");
     expect(patchBody.item.summary.dates.published.value).toBe("1960-05");
     expect(patchBody.item.summary.custom_field.keep).toBe(true);
+  });
+
+  test("rejects incompatible classification type and item kind on ingestion create", async () => {
+    const app = createTestApp();
+
+    const response = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(
+          buildIngestionBody({
+            batch_label: "batch-invalid-kind-001",
+            classification_type: "image",
+            item_kind: "video",
+          }),
+        ),
+      }),
+    );
+
+    expect(response.status).toBe(409);
+  });
+
+  test("rejects incompatible classification type and item kind on ingestion update", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(
+          buildIngestionBody({
+            batch_label: "batch-invalid-update-001",
+            classification_type: "interview",
+            item_kind: "audio",
+          }),
+        ),
+      }),
+    );
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+
+    const patchResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          classification_type: "book",
+        }),
+      }),
+    );
+
+    expect(patchResponse.status).toBe(409);
+  });
+
+  test("rejects document uploads when ingestion item kind is video", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(
+          buildIngestionBody({
+            batch_label: "batch-video-ebook-001",
+            classification_type: "interview",
+            item_kind: "video",
+          }),
+        ),
+      }),
+    );
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+
+    const presignResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}/files/presign`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          filename: "ebook.pdf",
+          content_type: "application/pdf",
+          size_bytes: 7,
+        }),
+      }),
+    );
+    expect(presignResponse.status).toBe(201);
+    const presignBody = (await presignResponse.json()) as { file_id: string; upload_url: string };
+
+    const uploadResponse = await app.fetch(
+      new Request(`http://localhost${presignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/pdf",
+          "content-length": "7",
+        },
+        body: "pdfdata",
+      }),
+    );
+    expect(uploadResponse.status).toBe(200);
+
+    const commitResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}/files/commit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          file_id: presignBody.file_id,
+          checksum_sha256: sha256Hex("pdfdata"),
+        }),
+      }),
+    );
+
+    expect(commitResponse.status).toBe(409);
+  });
+
+  test("allows scanned document ingestions to commit image uploads", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(
+          buildIngestionBody({
+            batch_label: "batch-scanned-image-001",
+            classification_type: "interview",
+            item_kind: "scanned_document",
+          }),
+        ),
+      }),
+    );
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+
+    const file = await createCommittedFile({
+      app,
+      ingestionId: createBody.ingestion.id,
+      filename: "page.jpg",
+      contentType: "image/jpeg",
+      payload: "imgdata",
+    });
+
+    expect(file.fileId).toBeTruthy();
+  });
+
+  test("rejects incompatible classification type and item kind on ingestion item create", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(
+          buildIngestionBody({
+            batch_label: "batch-item-create-invalid-001",
+            classification_type: "interview",
+            item_kind: "audio",
+          }),
+        ),
+      }),
+    );
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+
+    const itemResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}/items`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          item_index: 1,
+          classification_type: "book",
+        }),
+      }),
+    );
+
+    expect(itemResponse.status).toBe(409);
+  });
+
+  test("rejects incompatible classification type and item kind on ingestion item update", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(
+          buildIngestionBody({
+            batch_label: "batch-item-update-invalid-001",
+            classification_type: "interview",
+            item_kind: "audio",
+          }),
+        ),
+      }),
+    );
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+
+    const itemCreateResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}/items`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          item_index: 1,
+          title: "Interview item",
+        }),
+      }),
+    );
+    expect(itemCreateResponse.status).toBe(201);
+    const itemCreateBody = (await itemCreateResponse.json()) as { item: { id: string } };
+
+    const patchResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}/items/${itemCreateBody.item.id}`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          classification_type: "book",
+        }),
+      }),
+    );
+
+    expect(patchResponse.status).toBe(409);
+  });
+
+  test("rejects linking document files to video ingestion items", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(
+          buildIngestionBody({
+            batch_label: "batch-item-link-invalid-001",
+            classification_type: "interview",
+            item_kind: "video",
+          }),
+        ),
+      }),
+    );
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+    const ingestionId = createBody.ingestion.id;
+
+    const itemResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          item_index: 1,
+          title: "Video item",
+        }),
+      }),
+    );
+    expect(itemResponse.status).toBe(201);
+    const itemBody = (await itemResponse.json()) as { item: { id: string } };
+
+    const presignResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/files/presign`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          filename: "ebook.pdf",
+          content_type: "application/pdf",
+          size_bytes: 7,
+        }),
+      }),
+    );
+    expect(presignResponse.status).toBe(201);
+    const presignBody = (await presignResponse.json()) as { file_id: string };
+
+    const linkResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items/${itemBody.item.id}/files`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          ingestion_file_id: presignBody.file_id,
+          sort_order: 1,
+        }),
+      }),
+    );
+
+    expect(linkResponse.status).toBe(409);
   });
 });

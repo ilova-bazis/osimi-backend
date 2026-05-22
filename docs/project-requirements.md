@@ -170,6 +170,7 @@ Compatibility expectations:
 - `COMPLETED`: retain staging files for 7 days, then purge
 - `FAILED` and `CANCELED`: retain staging files for 14 days, then purge
 - `DRAFT`, `UPLOADING`, `QUEUED`, `PROCESSING`: retain indefinitely
+- Temporary ingestion previews stored on VPS staging follow the same retention and purge rules as their source staged uploads.
 
 #### Stuck Attention
 
@@ -249,6 +250,13 @@ Backend must provide:
 | content_type | string |
 | size_bytes | int |
 | storage_key | string |
+| preview_status | enum (`pending`, `ready`, `failed`, `unsupported`, nullable until classified) |
+| preview_storage_key | string (nullable) |
+| preview_content_type | string (nullable) |
+| preview_size_bytes | int (nullable) |
+| preview_width | int (nullable) |
+| preview_height | int (nullable) |
+| preview_error | JSON (nullable) |
 | source_order | int (nullable, planned) |
 | status | enum |
 | error | JSON |
@@ -501,6 +509,28 @@ Files may be deleted while an ingestion is in `DRAFT` or `UPLOADING`.
 Ingestions may be deleted while in `DRAFT`, `UPLOADING`, or `CANCELED` as long as processing has not started.
 Queued ingestions may be canceled back to `UPLOADING` if processing has not started.
 Canceled ingestions may be restored to `DRAFT` or `UPLOADING` depending on file presence.
+
+`classification_type`, `item_kind`, and uploaded file media kind must remain compatible.
+
+- `newspaper_article|magazine_article|book_chapter|book|letter|report|manuscript|document` -> `scanned_document|document`
+- `image` -> `photo`
+- `speech|interview` -> `audio|video|scanned_document`
+- `other` -> any `item_kind`
+- `photo` -> `image`
+- `audio` -> `audio`
+- `video` -> `video`
+- `scanned_document` -> `image|document`
+- `document` -> `document`
+- `other` -> any file media kind
+
+Committed ingestion files may expose temporary upload previews from VPS staging for resume-later UX.
+
+- v1 preview support is limited to image and video uploads.
+- Previews are temporary derivatives tied to `ingestion_files`, not permanent `object_artifacts`.
+- After commit, preview-capable files transition to preview-pending until a worker-generated thumbnail preview is uploaded back to VPS staging.
+- Generated thumbnail preview uploads must use a validated browser-viewable image output type, stay within the configured preview byte limit, and report bounded width/height dimensions on completion.
+- Unsupported media return an explicit unsupported preview state.
+- Preview generation uses a preview-specific worker claim/report flow and does not require the normal ingestion processing lease.
 
 ---
 

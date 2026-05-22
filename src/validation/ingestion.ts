@@ -90,6 +90,21 @@ export const ingestionFileStatusSchema = z.enum([
     "FAILED",
 ]);
 
+export const ingestionPreviewStatusSchema = z.enum([
+    "pending",
+    "processing",
+    "ready",
+    "failed",
+    "unsupported",
+]);
+
+const workerPreviewErrorSchema = z.strictObject({
+    message: z.string().trim().min(1),
+    code: z.string().trim().min(1).optional(),
+    retryable: z.boolean().optional(),
+    details: jsonObjectSchema.optional(),
+});
+
 export const ingestionItemStatusSchema = z.enum([
     "PENDING",
     "READY",
@@ -186,6 +201,60 @@ export const commitUploadedFileBodySchema = z.strictObject({
         .trim()
         .min(1)
         .regex(/^[a-f0-9]{64}$/i),
+});
+
+export const workerClaimIngestionPreviewResponseSchema = z.object({
+    preview: z.object({
+        ingestion_id: z.string(),
+        file_id: z.string(),
+        tenant_id: z.string(),
+        batch_label: z.string(),
+        filename: z.string(),
+        content_type: z.string(),
+        size_bytes: z.number(),
+        download_url: z.string(),
+        claimed_by: z.string().nullable(),
+        claimed_at: z.string().nullable(),
+    }).nullable(),
+});
+
+export const workerPresignIngestionPreviewUploadBodySchema = z.strictObject({
+    content_type: z.string().trim().min(1),
+    size_bytes: z.number().int().min(1),
+    extension: z.string().trim().min(1).optional(),
+});
+
+export const workerPresignIngestionPreviewUploadResponseSchema = z.object({
+    upload_token: z.string(),
+    upload_url: z.string(),
+    storage_key: z.string(),
+    expires_at: z.string(),
+    headers: z.object({
+        "content-type": z.string(),
+        "content-length": z.number(),
+    }),
+});
+
+export const workerCompleteIngestionPreviewBodySchema = z.strictObject({
+    upload_token: z.string().trim().min(1),
+    width: z.number().int().min(1),
+    height: z.number().int().min(1),
+});
+
+export const workerCompleteIngestionPreviewResponseSchema = z.object({
+    status: z.literal("ready"),
+    ingestion_id: z.string(),
+    file_id: z.string(),
+});
+
+export const workerFailIngestionPreviewBodySchema = z.strictObject({
+    error: workerPreviewErrorSchema,
+});
+
+export const workerFailIngestionPreviewResponseSchema = z.object({
+    status: z.literal("failed"),
+    ingestion_id: z.string(),
+    file_id: z.string(),
 });
 
 export const updateIngestionFileOverridesBodySchema = z.strictObject({
@@ -297,6 +366,15 @@ export const ingestionFileDtoSchema = z.object({
     storage_key: z.string(),
     status: ingestionFileStatusSchema,
     checksum_sha256: z.string().nullable(),
+    preview: z.object({
+        status: ingestionPreviewStatusSchema,
+        content_type: z.string().nullable(),
+        size_bytes: z.number().nullable(),
+        width: z.number().int().nullable(),
+        height: z.number().int().nullable(),
+        url: z.string().nullable(),
+        error: jsonObjectSchema.nullable(),
+    }),
     processing_overrides: ingestionFileProcessingOverridesSchema,
     error: jsonObjectSchema,
     created_at: z.string(),
@@ -459,6 +537,15 @@ export type CreatePresignedUploadBody = z.infer<
 export type CommitUploadedFileBody = z.infer<
     typeof commitUploadedFileBodySchema
 >;
+export type WorkerPresignIngestionPreviewUploadBody = z.infer<
+    typeof workerPresignIngestionPreviewUploadBodySchema
+>;
+export type WorkerCompleteIngestionPreviewBody = z.infer<
+    typeof workerCompleteIngestionPreviewBodySchema
+>;
+export type WorkerFailIngestionPreviewBody = z.infer<
+    typeof workerFailIngestionPreviewBodySchema
+>;
 export type UpdateIngestionFileOverridesBody = z.infer<
     typeof updateIngestionFileOverridesBodySchema
 >;
@@ -493,6 +580,18 @@ export type CreatePresignedUploadResponse = z.infer<
 >;
 export type CommitUploadedFileResponse = z.infer<
     typeof commitUploadedFileResponseSchema
+>;
+export type WorkerClaimIngestionPreviewResponse = z.infer<
+    typeof workerClaimIngestionPreviewResponseSchema
+>;
+export type WorkerPresignIngestionPreviewUploadResponse = z.infer<
+    typeof workerPresignIngestionPreviewUploadResponseSchema
+>;
+export type WorkerCompleteIngestionPreviewResponse = z.infer<
+    typeof workerCompleteIngestionPreviewResponseSchema
+>;
+export type WorkerFailIngestionPreviewResponse = z.infer<
+    typeof workerFailIngestionPreviewResponseSchema
 >;
 export type UpdateIngestionFileOverridesResponse = z.infer<
     typeof updateIngestionFileOverridesResponseSchema
@@ -642,6 +741,39 @@ export function parseCommitUploadedFileBody(
     value: unknown,
 ): CommitUploadedFileBody {
     const parsed = commitUploadedFileBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseWorkerPresignIngestionPreviewUploadBody(
+    value: unknown,
+): WorkerPresignIngestionPreviewUploadBody {
+    const parsed = workerPresignIngestionPreviewUploadBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseWorkerCompleteIngestionPreviewBody(
+    value: unknown,
+): WorkerCompleteIngestionPreviewBody {
+    const parsed = workerCompleteIngestionPreviewBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseWorkerFailIngestionPreviewBody(
+    value: unknown,
+): WorkerFailIngestionPreviewBody {
+    const parsed = workerFailIngestionPreviewBodySchema.safeParse(value);
     if (!parsed.success) {
         throw mapZodErrorToValidation(parsed.error);
     }

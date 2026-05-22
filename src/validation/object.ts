@@ -145,11 +145,13 @@ const objectEditRightsSchema = z.strictObject({
 });
 
 export const patchObjectMetadataBodySchema = z.strictObject({
+    revision: z.number().int().min(0),
     metadata: objectEditMetadataSchema,
     rights: objectEditRightsSchema,
 });
 
 export const submitObjectCurationBodySchema = z.strictObject({
+    revision: z.number().int().min(0),
     review_note: nullableTrimmedStringSchema,
 });
 
@@ -163,6 +165,7 @@ const documentCurationPageSchema = z.strictObject({
 
 export const putDocumentCurationBodySchema = z
     .strictObject({
+        revision: z.number().int().min(0),
         pages: z.array(
             z.strictObject({
                 page_number: z.number().int().positive(),
@@ -236,6 +239,7 @@ const objectEditLockSchema = z.object({
 const objectEditResponseSchema = z.object({
     object_id: objectIdParamSchema,
     media_type: objectEditMediaTypeSchema,
+    revision: z.number().int().min(0),
     curation_state: objectEditCurationStateSchema,
     lock: objectEditLockSchema,
     draft: objectEditDraftSchema.nullable(),
@@ -249,18 +253,21 @@ const objectEditResponseSchema = z.object({
 
 const patchObjectMetadataResponseSchema = z.object({
     object_id: objectIdParamSchema,
+    revision: z.number().int().min(0),
     curation_state: objectEditCurationStateSchema,
     updated_at: z.string(),
 });
 
 const putDocumentCurationResponseSchema = z.object({
     object_id: objectIdParamSchema,
+    revision: z.number().int().min(0),
     updated_count: z.number().int().min(1),
     updated_at: z.string(),
 });
 
 const submitObjectCurationResponseSchema = z.object({
     object_id: objectIdParamSchema,
+    revision: z.number().int().min(0),
     curation_state: objectEditCurationStateSchema,
     request: z.object({
         id: z.uuid(),
