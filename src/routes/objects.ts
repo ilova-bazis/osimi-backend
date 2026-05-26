@@ -50,9 +50,7 @@ import {
     releaseObjectEditLockForTenant,
     submitObjectCurationForTenant,
 } from "../services/object-edit-service.ts";
-import {
-    replaceObjectTextManifest,
-} from "../services/object-text-manifest-service.ts";
+import { replaceObjectTextManifest } from "../services/object-text-manifest-service.ts";
 import {
     completeObjectDownloadRequestByWorker,
     createObjectDownloadRequestForTenant,
@@ -193,10 +191,7 @@ const getObjectEditRoute: RouteDefinition = {
     method: "GET",
     path: "/api/objects/:object_id/edit",
     handler: async (request, context) => {
-        const authenticated = requireRole(context, [
-            "archiver",
-            "admin",
-        ]);
+        const authenticated = requireRole(context, ["archiver", "admin"]);
         const pathname = new URL(request.url).pathname;
         const objectId = parseObjectIdParam(
             extractPathParam(
@@ -303,7 +298,9 @@ const submitObjectCurationRoute: RouteDefinition = {
                 "object_id",
             ),
         );
-        const body = parseSubmitObjectCurationBody(await parseJsonBody(request));
+        const body = parseSubmitObjectCurationBody(
+            await parseJsonBody(request),
+        );
         return jsonResponse(
             await submitObjectCurationForTenant({
                 auth: authenticated,
@@ -489,22 +486,12 @@ const listObjectDownloadRequestsRoute: RouteDefinition = {
                 "object_id",
             ),
         );
-        try {
-            return jsonResponse(
-                await listObjectDownloadRequestsForTenant({
-                    auth: authenticated,
-                    objectId,
-                }),
-            );
-        } catch (err) {
-            throw err;
-        }
-        // return jsonResponse(
-        //     await listObjectDownloadRequestsForTenant({
-        //         auth: authenticated,
-        //         objectId,
-        //     }),
-        // );
+        return jsonResponse(
+            await listObjectDownloadRequestsForTenant({
+                auth: authenticated,
+                objectId,
+            }),
+        );
     },
 };
 
@@ -515,7 +502,11 @@ const requestObjectResyncRoute: RouteDefinition = {
         const authenticated = requireRole(context, ["archiver", "admin"]);
         const pathname = new URL(request.url).pathname;
         const objectId = parseObjectIdParam(
-            extractPathParam(pathname, /^\/api\/objects\/([^/]+)\/resync$/, "object_id"),
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/resync$/,
+                "object_id",
+            ),
         );
         const body = parseCreateObjectResyncBody(
             await parseOptionalJsonBody(request),
@@ -685,7 +676,9 @@ const failArchiveRequestRoute: RouteDefinition = {
                 "id",
             ),
         );
-        const body = parseWorkerFailArchiveRequestBody(await parseJsonBody(request));
+        const body = parseWorkerFailArchiveRequestBody(
+            await parseJsonBody(request),
+        );
 
         return jsonResponse(
             await failArchiveRequestByWorker({
