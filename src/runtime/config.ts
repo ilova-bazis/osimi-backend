@@ -1,5 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
+import { ConfigurationError } from "../http/errors.ts";
+
+const MINIMUM_SIGNING_SECRET_LENGTH = 32;
+
 export interface RuntimeConfig {
   databaseUrl?: string;
   dbSchema?: string;
@@ -13,6 +17,43 @@ const runtimeConfigStore = new AsyncLocalStorage<RuntimeConfig>();
 
 export function getRuntimeConfig(): RuntimeConfig {
   return runtimeConfigStore.getStore() ?? {};
+}
+
+function resolveSigningSecret(params: {
+  variableName: "UPLOAD_SIGNING_SECRET" | "LEASE_SIGNING_SECRET";
+  runtimeValue: string | undefined;
+  environmentValue: string | undefined;
+}): string {
+  const value = params.runtimeValue ?? params.environmentValue;
+
+  if (!value || value.trim().length < MINIMUM_SIGNING_SECRET_LENGTH) {
+    throw new ConfigurationError(
+      `Environment variable '${params.variableName}' must be at least ${MINIMUM_SIGNING_SECRET_LENGTH} non-whitespace characters.`,
+    );
+  }
+
+  return value.trim();
+}
+
+export function resolveUploadSigningSecret(config: RuntimeConfig = getRuntimeConfig()): string {
+  return resolveSigningSecret({
+    variableName: "UPLOAD_SIGNING_SECRET",
+    runtimeValue: config.uploadSigningSecret,
+    environmentValue: process.env.UPLOAD_SIGNING_SECRET,
+  });
+}
+
+export function resolveLeaseSigningSecret(config: RuntimeConfig = getRuntimeConfig()): string {
+  return resolveSigningSecret({
+    variableName: "LEASE_SIGNING_SECRET",
+    runtimeValue: config.leaseSigningSecret,
+    environmentValue: process.env.LEASE_SIGNING_SECRET,
+  });
+}
+
+export function validateSigningConfiguration(config: RuntimeConfig = getRuntimeConfig()): void {
+  resolveUploadSigningSecret(config);
+  resolveLeaseSigningSecret(config);
 }
 
 export function runWithRuntimeConfig<T>(

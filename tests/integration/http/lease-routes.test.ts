@@ -8,6 +8,7 @@ import { sql as sqlIdentifier } from "bun";
 import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
+import { runWithRuntimeConfig } from "../../../src/runtime/config.ts";
 import { createDownloadToken } from "../../../src/storage/staging.ts";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
@@ -276,6 +277,8 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
         dbSchema: schema,
         stagingRoot,
         workerAuthToken: "worker-secret",
+        uploadSigningSecret: "lease-routes-upload-signing-secret-000",
+        leaseSigningSecret: "lease-routes-lease-signing-secret-0000",
       },
     });
   }
@@ -803,7 +806,9 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
     const file = leaseBody.lease.items[0]?.files[0];
     expect(file).toBeDefined();
 
-    const expiredToken = createDownloadToken({
+    const expiredToken = runWithRuntimeConfig({
+      uploadSigningSecret: "lease-routes-upload-signing-secret-000",
+    }, () => createDownloadToken({
       ingestion_id: ingestionId,
       file_id: file!.file_id,
       tenant_id: "00000000-0000-4000-8000-000000000001",
@@ -811,7 +816,7 @@ describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
       content_type: file!.content_type,
       size_bytes: file!.size_bytes,
       expires_at: new Date(Date.now() - 1000).toISOString(),
-    });
+    }));
 
     const downloadResponse = await app.fetch(
       new Request(`http://localhost/api/worker/downloads/${expiredToken}`),

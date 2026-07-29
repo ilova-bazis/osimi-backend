@@ -1,6 +1,7 @@
-import { createApp } from "./app.ts";
+import { createAppWithOptions } from "./app.ts";
 import { ConfigurationError, createErrorResponse } from "./http/errors.ts";
 import { startBackgroundJobs } from "./jobs/index.ts";
+import type { RuntimeConfig } from "./runtime/config.ts";
 
 const DEFAULT_PORT = 3000;
 const DEFAULT_HOSTNAME = "0.0.0.0";
@@ -8,6 +9,7 @@ const DEFAULT_HOSTNAME = "0.0.0.0";
 export interface ServerOptions {
   port?: number;
   hostname?: string;
+  runtimeConfig?: RuntimeConfig;
 }
 
 function resolvePort(rawValue: string | undefined): number {
@@ -27,7 +29,7 @@ function resolvePort(rawValue: string | undefined): number {
 }
 
 export function startServer(options: ServerOptions = {}): Bun.Server<unknown> {
-  const app = createApp();
+  const app = createAppWithOptions({ runtimeConfig: options.runtimeConfig });
   const port = options.port ?? resolvePort(process.env.PORT);
   const hostname = options.hostname ?? process.env.HOST ?? DEFAULT_HOSTNAME;
 

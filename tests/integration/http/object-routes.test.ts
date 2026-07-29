@@ -37,6 +37,8 @@ describe.skipIf(!TEST_DATABASE_URL)("object routes", () => {
                 dbSchema: schema,
                 stagingRoot,
                 workerAuthToken: "worker-secret",
+                uploadSigningSecret: "object-routes-upload-signing-secret-000",
+                leaseSigningSecret: "object-routes-lease-signing-secret-0000",
             },
         });
     }

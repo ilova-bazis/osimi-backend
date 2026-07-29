@@ -2,9 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { ConflictError, UnauthorizedError } from "../http/errors.ts";
 import { findActiveLeaseByToken } from "../repos/lease-repo.ts";
-import { getRuntimeConfig } from "../runtime/config.ts";
-
-const DEFAULT_LEASE_SIGNING_SECRET = "dev-local-lease-secret";
+import { resolveLeaseSigningSecret } from "../runtime/config.ts";
 
 export interface LeaseTokenPayload {
   lease_id: string;
@@ -24,12 +22,7 @@ export interface AuthorizedWorkerLease {
 }
 
 function leaseSigningSecret(): string {
-  const runtimeLeaseSigningSecret = getRuntimeConfig().leaseSigningSecret;
-  return (
-    runtimeLeaseSigningSecret?.trim() ||
-    process.env.LEASE_SIGNING_SECRET?.trim() ||
-    DEFAULT_LEASE_SIGNING_SECRET
-  );
+  return resolveLeaseSigningSecret();
 }
 
 function encodePayload(value: LeaseTokenPayload): string {

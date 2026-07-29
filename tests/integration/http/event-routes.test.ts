@@ -245,6 +245,8 @@ describe.skipIf(!TEST_DATABASE_URL)("event routes", () => {
         dbSchema: schema,
         stagingRoot,
         workerAuthToken: "worker-secret",
+        uploadSigningSecret: "event-routes-upload-signing-secret-000",
+        leaseSigningSecret: "event-routes-lease-signing-secret-0000",
       },
     });
   }

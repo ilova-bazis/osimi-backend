@@ -19,6 +19,8 @@ describe.skipIf(!TEST_DATABASE_URL)("auth routes", () => {
       runtimeConfig: {
         databaseUrl: TEST_DATABASE_URL,
         dbSchema: schema,
+        uploadSigningSecret: "auth-routes-upload-signing-secret-0001",
+        leaseSigningSecret: "auth-routes-lease-signing-secret-00001",
       },
     });
   }

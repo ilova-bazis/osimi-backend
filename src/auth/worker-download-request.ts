@@ -2,10 +2,8 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { ConflictError, UnauthorizedError } from "../http/errors.ts";
 import { findActiveArchiveRequestLeaseByToken } from "../repos/archive-request-repo.ts";
-import { getRuntimeConfig } from "../runtime/config.ts";
+import { resolveLeaseSigningSecret } from "../runtime/config.ts";
 import type { ArtifactKind } from "../repos/object-repo.ts";
-
-const DEFAULT_LEASE_SIGNING_SECRET = "dev-local-lease-secret";
 
 export interface DownloadRequestLeaseTokenPayload {
   request_id: string;
@@ -31,12 +29,7 @@ export interface AuthorizedWorkerDownloadRequestLease {
 }
 
 function leaseSigningSecret(): string {
-  const runtimeLeaseSigningSecret = getRuntimeConfig().leaseSigningSecret;
-  return (
-    runtimeLeaseSigningSecret?.trim() ||
-    process.env.LEASE_SIGNING_SECRET?.trim() ||
-    DEFAULT_LEASE_SIGNING_SECRET
-  );
+  return resolveLeaseSigningSecret();
 }
 
 function encodePayload(value: DownloadRequestLeaseTokenPayload): string {

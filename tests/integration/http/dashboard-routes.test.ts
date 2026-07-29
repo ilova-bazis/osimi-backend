@@ -17,6 +17,8 @@ describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
       runtimeConfig: {
         databaseUrl: TEST_DATABASE_URL,
         dbSchema: schema,
+        uploadSigningSecret: "dashboard-upload-signing-secret-00001",
+        leaseSigningSecret: "dashboard-lease-signing-secret-000001",
       },
     });
   }

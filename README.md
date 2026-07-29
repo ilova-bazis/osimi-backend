@@ -20,6 +20,19 @@ bun run --watch index.ts
 bun run index.ts
 ```
 
+## Required Security Configuration
+
+The server refuses to start unless both signing secrets are set to at least 32
+non-whitespace characters:
+
+- `UPLOAD_SIGNING_SECRET`: signs staged-file and artifact upload/download URLs.
+- `LEASE_SIGNING_SECRET`: signs ingestion and archive-request worker lease tokens.
+
+Generate distinct, deployment-specific values and store them in your secret
+manager. Rotating either value invalidates outstanding tokens signed with the
+previous value, so rotate only after their maximum expiry window has passed or
+coordinate the worker/client rollout.
+
 ## Tests
 
 ```bash

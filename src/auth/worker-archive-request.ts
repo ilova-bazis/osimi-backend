@@ -6,9 +6,7 @@ import {
   type ArchiveRequestActionType,
   type ArchiveRequestTargetType,
 } from "../repos/archive-request-repo.ts";
-import { getRuntimeConfig } from "../runtime/config.ts";
-
-const DEFAULT_LEASE_SIGNING_SECRET = "dev-local-lease-secret";
+import { resolveLeaseSigningSecret } from "../runtime/config.ts";
 
 export interface ArchiveRequestLeaseTokenPayload {
   request_id: string;
@@ -34,12 +32,7 @@ export interface AuthorizedWorkerArchiveRequestLease {
 }
 
 function leaseSigningSecret(): string {
-  const runtimeLeaseSigningSecret = getRuntimeConfig().leaseSigningSecret;
-  return (
-    runtimeLeaseSigningSecret?.trim() ||
-    process.env.LEASE_SIGNING_SECRET?.trim() ||
-    DEFAULT_LEASE_SIGNING_SECRET
-  );
+  return resolveLeaseSigningSecret();
 }
 
 function encodePayload(value: ArchiveRequestLeaseTokenPayload): string {

@@ -6,7 +6,11 @@ import {
 } from "./http/errors.ts";
 import { routes as defaultRoutes } from "./routes/index.ts";
 import type { RouteDefinition } from "./routes/types.ts";
-import { runWithRuntimeConfig, type RuntimeConfig } from "./runtime/config.ts";
+import {
+  runWithRuntimeConfig,
+  validateSigningConfiguration,
+  type RuntimeConfig,
+} from "./runtime/config.ts";
 
 interface App {
   fetch: (request: Request) => Promise<Response>;
@@ -97,6 +101,7 @@ interface CreateAppOptions {
 export function createAppWithOptions(options: CreateAppOptions = {}): App {
   const routeDefinitions = options.routeDefinitions ?? defaultRoutes;
   const runtimeConfig = options.runtimeConfig ?? {};
+  validateSigningConfiguration(runtimeConfig);
   const handlers = new Map<string, RouteDefinition["handler"]>();
   const methodsByPath = new Map<string, Set<string>>();
   const dynamicRoutes: DynamicRoute[] = [];

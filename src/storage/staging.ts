@@ -1,11 +1,10 @@
-import { createHmac } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { join, normalize } from "node:path";
 
 import { UnauthorizedError, ValidationError } from "../http/errors.ts";
-import { getRuntimeConfig } from "../runtime/config.ts";
+import { getRuntimeConfig, resolveUploadSigningSecret } from "../runtime/config.ts";
 
 const DEFAULT_STAGING_ROOT = ".staging";
-const DEFAULT_SIGNING_SECRET = "dev-local-signing-secret";
 
 interface UploadTokenPayload {
   ingestion_id: string;
@@ -40,8 +39,14 @@ interface ObjectArtifactUploadTokenPayload {
 }
 
 function getSigningSecret(): string {
-  const runtimeSigningSecret = getRuntimeConfig().uploadSigningSecret;
-  return runtimeSigningSecret?.trim() || process.env.UPLOAD_SIGNING_SECRET?.trim() || DEFAULT_SIGNING_SECRET;
+  return resolveUploadSigningSecret();
+}
+
+function secureEquals(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left, "utf8");
+  const rightBuffer = Buffer.from(right, "utf8");
+
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function toBase64Url(value: string): string {
@@ -112,7 +117,7 @@ export function parseUploadToken(token: string): UploadTokenPayload {
 
   const expectedSignature = sign(encodedPayload);
 
-  if (providedSignature !== expectedSignature) {
+  if (!secureEquals(providedSignature, expectedSignature)) {
     throw new UnauthorizedError("Upload token signature is invalid.");
   }
 
@@ -174,7 +179,7 @@ export function parseDownloadToken(token: string): DownloadTokenPayload {
 
   const expectedSignature = sign(encodedPayload);
 
-  if (providedSignature !== expectedSignature) {
+  if (!secureEquals(providedSignature, expectedSignature)) {
     throw new UnauthorizedError("Download token signature is invalid.");
   }
 
@@ -240,7 +245,7 @@ export function parseObjectArtifactUploadToken(
 
   const expectedSignature = sign(encodedPayload);
 
-  if (providedSignature !== expectedSignature) {
+  if (!secureEquals(providedSignature, expectedSignature)) {
     throw new UnauthorizedError("Upload token signature is invalid.");
   }
 

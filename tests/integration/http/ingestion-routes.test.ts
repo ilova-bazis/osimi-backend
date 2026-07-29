@@ -70,6 +70,8 @@ describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
         dbSchema: schema,
         stagingRoot,
         workerAuthToken: "worker-secret",
+        uploadSigningSecret: "ingestion-routes-upload-secret-00001",
+        leaseSigningSecret: "ingestion-routes-lease-secret-000001",
       },
     });
   }
