@@ -1,7 +1,7 @@
 import { createSqlClient, resolveDatabaseUrl } from "./client.ts";
 import { getRuntimeConfig } from "../runtime/config.ts";
 
-const SCHEMA_PATTERN = /^[a-z_][a-z0-9_]*$/;
+export const DB_SCHEMA_PATTERN = /^[a-z_][a-z0-9_]*$/;
 const IDENTIFIER_PATTERN = /^[a-z_][a-z0-9_]*$/;
 
 const cachedClientsByKey = new Map<
@@ -19,19 +19,28 @@ function validateIdentifier(value: string, kind: string): string {
     return value;
 }
 
-export function resolveDbSchema(): string {
-    const runtimeSchema = getRuntimeConfig().dbSchema;
-    const schema = (runtimeSchema ?? process.env.DB_SCHEMA ?? "public")
+export function normalizeDbSchema(value: string, source: string): string {
+    const schema = value
         .trim()
         .toLowerCase();
 
-    if (!SCHEMA_PATTERN.test(schema)) {
+    if (!DB_SCHEMA_PATTERN.test(schema)) {
         throw new Error(
-            `Invalid DB_SCHEMA '${schema}'. Must match ${SCHEMA_PATTERN.source}.`,
+            `Invalid ${source} '${schema}'. Must match ${DB_SCHEMA_PATTERN.source}.`,
         );
     }
 
     return schema;
+}
+
+export function resolveDbSchema(): string {
+    const runtimeSchema = getRuntimeConfig().dbSchema;
+    const source = runtimeSchema !== undefined
+        ? "runtime database schema"
+        : process.env.DB_SCHEMA !== undefined
+        ? "DB_SCHEMA"
+        : "default database schema";
+    return normalizeDbSchema(runtimeSchema ?? process.env.DB_SCHEMA ?? "public", source);
 }
 
 export function db(): ReturnType<typeof createSqlClient> {

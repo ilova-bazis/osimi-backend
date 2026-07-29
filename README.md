@@ -63,7 +63,7 @@ tests at a production database.
 ## Database Migrations
 
 ```bash
-bun run src/db/migrate.ts
+bun run migrate
 ```
 
 Optional flags:
@@ -72,6 +72,12 @@ Optional flags:
 - `--schema=public`
 - `--migrations-dir=src/db/migrations`
 - `--dry-run`
+
+Migration schema selection is, in order: explicit `--schema`, `DB_SCHEMA`,
+then `public`. An explicit schema that differs from `DB_SCHEMA` wins and emits
+a warning. `--dry-run` is read-only: it does not create the target schema,
+tracking table, or migration objects. Migration runners take a database-scoped
+advisory lock so concurrent deployments cannot apply the same migration twice.
 
 ## Health Endpoint
 
