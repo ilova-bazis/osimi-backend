@@ -3,12 +3,10 @@ import { sql as sqlIdentifier } from "bun";
 
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
-
-const TEST_DATABASE_URL =
-  process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
+import { TEST_DATABASE_URL } from "../test-database.ts";
 
 describe("database migrations", () => {
-  test.skipIf(!TEST_DATABASE_URL)(
+  test(
     "applies migrations and tracks state",
     async () => {
       const schema = `phase1_${Date.now()}_${Math.floor(Math.random() * 100000)}`;

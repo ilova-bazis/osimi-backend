@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "bun run --watch index.ts",
     "start": "bun run index.ts",
-    "test": "bun test",
+    "test": "bun run test:release",
+    "typecheck": "bunx tsc --noEmit",
+    "test:unit": "bun test tests/unit",
+    "test:integration": "bun run tests/scripts/run-integration.ts",
+    "test:release": "bun run typecheck && bun run test:unit && bun run test:integration",
     "migrate": "bun run src/db/migrate.ts",
     "create-user": "bun run src/cli/create-user.ts",
     "create-tenant": "bun run src/cli/create-tenant.ts"

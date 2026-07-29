@@ -8,8 +8,7 @@ import { sql as sqlIdentifier } from "bun";
 import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
-
-const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
+import { TEST_DATABASE_URL } from "../test-database.ts";
 
 function sha256Hex(value: string): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
@@ -58,7 +57,7 @@ function buildIngestionBody(overrides?: Record<string, unknown>): Record<string,
   };
 }
 
-describe.skipIf(!TEST_DATABASE_URL)("ingestion routes", () => {
+describe("ingestion routes", () => {
   let schema = "";
   let stagingRoot = "";
   let authToken = "";

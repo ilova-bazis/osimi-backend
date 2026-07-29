@@ -10,10 +10,9 @@ import { runMigrations } from "../../../src/db/migrate.ts";
 import { runStagingRetentionSweep, runStuckAttentionCheck } from "../../../src/jobs/operations.ts";
 import { runWithRuntimeConfig } from "../../../src/runtime/config.ts";
 import { resolveStagingPath } from "../../../src/storage/staging.ts";
+import { TEST_DATABASE_URL } from "../test-database.ts";
 
-const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
-
-describe.skipIf(!TEST_DATABASE_URL)("jobs operations", () => {
+describe("jobs operations", () => {
   let schema = "";
   let stagingRoot = "";
 

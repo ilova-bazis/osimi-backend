@@ -67,6 +67,10 @@ Planned future scenarios (file ordering contract):
 
 ## Test Environment
 
-- Use `bun test`
-- Use PostgreSQL test database
+- Use `bun run test:unit` for database-free unit tests.
+- Use `bun run test:integration` for PostgreSQL-backed integration tests.
+- Use `bun run test:release` for the required type-check, unit, and integration release gate.
+- Integration tests require `TEST_DATABASE_URL` and never use `DATABASE_URL`.
+- The test database name must contain `test`; use `ALLOW_UNSAFE_TEST_DATABASE_NAME=true` only for a known disposable database.
+- Integration tests must not be conditionally skipped because the database is unavailable.
 - Use local filesystem staging directory

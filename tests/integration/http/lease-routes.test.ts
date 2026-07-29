@@ -10,8 +10,7 @@ import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
 import { runWithRuntimeConfig } from "../../../src/runtime/config.ts";
 import { createDownloadToken } from "../../../src/storage/staging.ts";
-
-const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
+import { TEST_DATABASE_URL } from "../test-database.ts";
 
 function sha256Hex(value: string): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
@@ -265,7 +264,7 @@ async function createQueuedIngestion(
   return ingestionId;
 }
 
-describe.skipIf(!TEST_DATABASE_URL)("lease routes", () => {
+describe("lease routes", () => {
   let schema = "";
   let stagingRoot = "";
   let authToken = "";

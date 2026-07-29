@@ -35,11 +35,30 @@ coordinate the worker/client rollout.
 
 ## Tests
 
+Run fast unit tests without PostgreSQL:
+
 ```bash
-bun test
+bun run test:unit
 ```
 
-Integration migration tests require either `TEST_DATABASE_URL` or `DATABASE_URL`.
+Run the database-backed integration suite:
+
+```bash
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/osimi_test bun run test:integration
+```
+
+Run the release gate, including type-checking, unit tests, and integration tests:
+
+```bash
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/osimi_test bun run test:release
+```
+
+`bun run test` runs the release gate. Integration tests require
+`TEST_DATABASE_URL`; they never fall back to `DATABASE_URL`. The database name
+must contain `test` because the suite creates and drops isolated schemas with
+`CASCADE`. For a known disposable database with a different name, set
+`ALLOW_UNSAFE_TEST_DATABASE_NAME=true` explicitly. Never point integration
+tests at a production database.
 
 ## Database Migrations
 

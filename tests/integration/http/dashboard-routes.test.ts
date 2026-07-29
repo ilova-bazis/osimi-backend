@@ -4,11 +4,9 @@ import { sql as sqlIdentifier } from "bun";
 import { createAppWithOptions as createApp } from "../../../src/app.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
+import { TEST_DATABASE_URL } from "../test-database.ts";
 
-const TEST_DATABASE_URL =
-  process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
-
-describe.skipIf(!TEST_DATABASE_URL)("dashboard routes", () => {
+describe("dashboard routes", () => {
   let schema = "";
   let viewerToken = "";
 
