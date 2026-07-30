@@ -2141,6 +2141,7 @@ Integration guides for archive worker teams:
   - returns next queued ingestion lease, or `lease: null` when no work is available
   - lease TTL is 5 minutes
   - `items[].files[]` includes ingestion files in `UPLOADED|VALIDATED` status only
+  - payload validation completes before the lease and `PROCESSING` transition are persisted; an invalid payload leaves the ingestion queued without an active lease
 - 200 response:
   - `lease: null` when no queued ingestion available
   - or
@@ -2165,6 +2166,7 @@ Integration guides for archive worker teams:
 - Behavior:
   - deterministic targeted lease acquire for a specific ingestion id
   - no active-lease takeover is allowed (reacquire/recovery path only)
+  - payload validation completes before the lease and `PROCESSING` transition are persisted
 - 200 response:
   - `lease { lease_id, lease_token, lease_expires_at, ingestion_id, batch_label, tenant_id, items[] }`
 - Error behavior:
@@ -2201,7 +2203,7 @@ Integration guides for archive worker teams:
   - `lease_token` (required non-empty string)
 - Behavior:
   - releases active lease
-  - if ingestion is `PROCESSING`, it is moved back to `QUEUED`
+  - if ingestion is `PROCESSING`, it is moved back to `QUEUED` in the same transaction as lease release
 - 200 response:
   - `status` (`ok`), `ingestion_id`, `lease_id`
 - Error behavior:
@@ -2261,6 +2263,8 @@ Integration guides for archive worker teams:
     - `object_id` (required for `INGESTION_ITEM_COMPLETED|OBJECT_CREATED|ARTIFACT_CREATED`; optional for other event types, including `INGESTION_COMPLETED` and `INGESTION_FAILED`; when present must match object id format)
 - Behavior:
   - idempotent by `event_id`
+  - an exact duplicate performs no additional projection writes; conflicting reuse of an `event_id` returns `409 CONFLICT`
+  - each event and its database projections commit atomically; earlier events in a batch remain committed if a later event fails
   - out-of-order tolerant
   - completion event creates or resolves object by source ingestion
   - state projection rules (current phase):

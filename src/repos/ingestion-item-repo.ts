@@ -1,4 +1,5 @@
-import { withSchemaClient } from "../db/client.ts";
+import { withExecutor, withSchemaClient } from "../db/client.ts";
+import type { SqlExecutor } from "../db/client.ts";
 import { toSafeNumberFromDbInt, type DbInt } from "../db/number.ts";
 import type {
     IngestionClassificationType,
@@ -243,8 +244,9 @@ export async function findIngestionItemById(params: {
     tenantId: string;
     ingestionId: string;
     ingestionItemId: string;
+    executor?: SqlExecutor;
 }): Promise<IngestionItemRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<IngestionItemRow[]>`
       SELECT
         item.id,
@@ -276,8 +278,9 @@ export async function findIngestionItemById(params: {
 export async function listIngestionItems(params: {
     tenantId: string;
     ingestionId: string;
+    executor?: SqlExecutor;
 }): Promise<IngestionItemRecord[]> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<IngestionItemRow[]>`
       SELECT
         item.id,
@@ -439,8 +442,9 @@ export async function setIngestionItemStatus(params: {
     ingestionItemId: string;
     toStatus: IngestionItemStatus;
     objectId?: string;
+    executor?: SqlExecutor;
 }): Promise<IngestionItemRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<IngestionItemRow[]>`
       UPDATE ingestion_items item
       SET status = ${params.toStatus}::ingestion_item_status,
@@ -475,8 +479,9 @@ export async function setIngestionItemStatus(params: {
 export async function summarizeIngestionItems(params: {
     tenantId: string;
     ingestionId: string;
+    executor?: SqlExecutor;
 }): Promise<IngestionItemSummaryRecord> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<IngestionItemSummaryRow[]>`
       SELECT
         COUNT(*)::int AS total_count,
@@ -567,8 +572,9 @@ export async function listIngestionItemFiles(params: {
     tenantId: string;
     ingestionId: string;
     ingestionItemId: string;
+    executor?: SqlExecutor;
 }): Promise<IngestionItemFileRecord[]> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<IngestionItemFileRow[]>`
       SELECT
         link.id,
@@ -677,8 +683,9 @@ export async function reorderIngestionItemFiles(params: {
 export async function listLeasedIngestionFiles(params: {
     tenantId: string;
     ingestionId: string;
+    executor?: SqlExecutor;
 }): Promise<LeasedIngestionFileRecord[]> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<LeasedIngestionFileRow[]>`
       SELECT
         file.id,

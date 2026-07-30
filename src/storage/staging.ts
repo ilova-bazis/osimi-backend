@@ -7,6 +7,8 @@ import { getRuntimeConfig, resolveUploadSigningSecret } from "../runtime/config.
 const DEFAULT_STAGING_ROOT = ".staging";
 
 interface UploadTokenPayload {
+  purpose: "ingestion_original" | "ingestion_preview";
+  upload_token_id: string;
   ingestion_id: string;
   file_id: string;
   tenant_id: string;
@@ -27,6 +29,7 @@ interface DownloadTokenPayload {
 }
 
 interface ObjectArtifactUploadTokenPayload {
+  upload_token_id: string;
   request_id: string;
   object_id: string;
   tenant_id: string;
@@ -79,27 +82,40 @@ export function buildStagingStorageKey(params: {
   return `tenants/${params.tenantId}/ingestions/${params.ingestionId}/original/${params.fileId}-${safeStorageKeySegment(params.filename)}`;
 }
 
+export function buildIngestionUploadStorageKey(params: {
+  tenantId: string;
+  ingestionId: string;
+  fileId: string;
+  uploadTokenId: string;
+  filename: string;
+}): string {
+  return `tenants/${params.tenantId}/ingestions/${params.ingestionId}/original/${params.fileId}/uploads/${params.uploadTokenId}-${safeStorageKeySegment(params.filename)}`;
+}
+
 export function buildIngestionPreviewStorageKey(params: {
   tenantId: string;
   ingestionId: string;
   fileId: string;
+  uploadTokenId: string;
   extension: string;
 }): string {
   const safeExtension = safeStorageKeySegment(params.extension).replace(/^\./, "");
-  return `tenants/${params.tenantId}/ingestions/${params.ingestionId}/preview/${params.fileId}.${safeExtension || "bin"}`;
+  return `tenants/${params.tenantId}/ingestions/${params.ingestionId}/preview/${params.fileId}/uploads/${params.uploadTokenId}.${safeExtension || "bin"}`;
 }
 
 export function buildObjectArtifactStorageKey(params: {
   tenantId: string;
   objectId: string;
   requestId: string;
+  uploadTokenId?: string;
   artifactKind: string;
   variant: string | null;
   extension: string;
 }): string {
   const safeVariant = params.variant ? `-${safeStorageKeySegment(params.variant)}` : "";
   const safeExtension = safeStorageKeySegment(params.extension).replace(/^\./, "");
-  return `tenants/${params.tenantId}/objects/${params.objectId}/artifacts/${params.requestId}-${safeStorageKeySegment(params.artifactKind)}${safeVariant}.${safeExtension || "bin"}`;
+  const uploadSegment = params.uploadTokenId ? `-${params.uploadTokenId}` : "";
+  return `tenants/${params.tenantId}/objects/${params.objectId}/artifacts/${params.requestId}${uploadSegment}-${safeStorageKeySegment(params.artifactKind)}${safeVariant}.${safeExtension || "bin"}`;
 }
 
 export function createUploadToken(payload: UploadTokenPayload): string {
@@ -136,12 +152,16 @@ export function parseUploadToken(token: string): UploadTokenPayload {
   const candidate = payload as Partial<UploadTokenPayload>;
 
   if (
+    (candidate.purpose !== "ingestion_original" && candidate.purpose !== "ingestion_preview") ||
+    typeof candidate.upload_token_id !== "string" ||
     typeof candidate.ingestion_id !== "string" ||
     typeof candidate.file_id !== "string" ||
     typeof candidate.tenant_id !== "string" ||
     typeof candidate.storage_key !== "string" ||
     typeof candidate.content_type !== "string" ||
     typeof candidate.size_bytes !== "number" ||
+    !Number.isSafeInteger(candidate.size_bytes) ||
+    candidate.size_bytes < 0 ||
     typeof candidate.expires_at !== "string"
   ) {
     throw new UnauthorizedError("Upload token payload is invalid.");
@@ -154,6 +174,8 @@ export function parseUploadToken(token: string): UploadTokenPayload {
   }
 
   return {
+    purpose: candidate.purpose,
+    upload_token_id: candidate.upload_token_id,
     ingestion_id: candidate.ingestion_id,
     file_id: candidate.file_id,
     tenant_id: candidate.tenant_id,
@@ -204,6 +226,8 @@ export function parseDownloadToken(token: string): DownloadTokenPayload {
     typeof candidate.storage_key !== "string" ||
     typeof candidate.content_type !== "string" ||
     typeof candidate.size_bytes !== "number" ||
+    !Number.isSafeInteger(candidate.size_bytes) ||
+    candidate.size_bytes < 0 ||
     typeof candidate.expires_at !== "string"
   ) {
     throw new UnauthorizedError("Download token payload is invalid.");
@@ -264,6 +288,7 @@ export function parseObjectArtifactUploadToken(
   const candidate = payload as Partial<ObjectArtifactUploadTokenPayload>;
 
   if (
+    typeof candidate.upload_token_id !== "string" ||
     typeof candidate.request_id !== "string" ||
     typeof candidate.object_id !== "string" ||
     typeof candidate.tenant_id !== "string" ||
@@ -271,6 +296,8 @@ export function parseObjectArtifactUploadToken(
     typeof candidate.storage_key !== "string" ||
     typeof candidate.content_type !== "string" ||
     typeof candidate.size_bytes !== "number" ||
+    !Number.isSafeInteger(candidate.size_bytes) ||
+    candidate.size_bytes < 0 ||
     typeof candidate.expires_at !== "string"
   ) {
     throw new UnauthorizedError("Upload token payload is invalid.");
@@ -287,6 +314,7 @@ export function parseObjectArtifactUploadToken(
   }
 
   return {
+    upload_token_id: candidate.upload_token_id,
     request_id: candidate.request_id,
     object_id: candidate.object_id,
     tenant_id: candidate.tenant_id,

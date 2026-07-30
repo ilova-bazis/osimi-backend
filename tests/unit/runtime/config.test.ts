@@ -4,6 +4,8 @@ import { describe, expect, test } from "bun:test";
 
 import { parseLeaseToken } from "../../../src/auth/worker-lease.ts";
 import {
+  DEFAULT_MAX_UPLOAD_SIZE_BYTES,
+  resolveMaxUploadSizeBytes,
   runWithRuntimeConfig,
   validateSigningConfiguration,
 } from "../../../src/runtime/config.ts";
@@ -90,5 +92,20 @@ describe("signing configuration", () => {
     }, () => {
       parseUploadToken(token);
     })).toThrow("Upload token signature is invalid.");
+  });
+});
+
+describe("upload size configuration", () => {
+  test("uses a 2 GiB default and accepts a runtime override", () => {
+    expect(resolveMaxUploadSizeBytes({})).toBe(DEFAULT_MAX_UPLOAD_SIZE_BYTES);
+    expect(resolveMaxUploadSizeBytes({ maxUploadSizeBytes: 1234 })).toBe(1234);
+  });
+
+  test("rejects invalid runtime upload limits", () => {
+    for (const maxUploadSizeBytes of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(() => resolveMaxUploadSizeBytes({ maxUploadSizeBytes })).toThrow(
+        "Runtime upload size limit",
+      );
+    }
   });
 });

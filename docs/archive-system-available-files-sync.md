@@ -429,7 +429,7 @@ Success:
 {
   "upload_token": "<signed-upload-token>",
   "upload_url": "/api/archive-requests/uploads/<signed-upload-token>",
-  "storage_key": "tenants/.../objects/.../artifacts/<request-id>-pdf.txt",
+  "storage_key": "tenants/.../objects/.../artifacts/<request-id>-<upload-token-id>-pdf.txt",
   "expires_at": "2026-03-05T10:30:30.000Z",
   "headers": {
     "content-type": "text/plain",
@@ -439,6 +439,8 @@ Success:
 ```
 
 Upload token TTL is 15 minutes.
+Each presign creates a unique immutable storage key and invalidates any prior
+artifact upload token for the same request.
 
 ### 4.5 Upload bytes
 
@@ -457,6 +459,9 @@ Required request headers:
 Body rules:
 
 - exact byte length must equal signed token `size_bytes`
+- bytes are streamed to a temporary file and atomically promoted without overwriting an existing storage key
+- the configured `MAX_UPLOAD_SIZE_BYTES` limit is enforced while streaming
+- an active token may be retried only with identical bytes; completed requests reject all upload replays
 
 Success:
 

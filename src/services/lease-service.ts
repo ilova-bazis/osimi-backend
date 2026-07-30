@@ -7,7 +7,6 @@ import {
 } from "../auth/worker-lease.ts";
 import {
   findIngestionWithCreator,
-  updateIngestionStatus,
 } from "../repos/ingestion-repo.ts";
 import {
   listIngestionItems,
@@ -16,12 +15,13 @@ import {
 } from "../repos/ingestion-item-repo.ts";
 import { findObjectBySourceIngestionItem } from "../repos/object-repo.ts";
 import {
+  claimNextQueuedIngestion,
+  claimQueuedIngestionById,
   extendLease,
-  leaseQueuedIngestionById,
-  leaseNextQueuedIngestion,
-  releaseLease,
+  releaseLeaseAndRequeue,
   sweepExpiredLeases,
 } from "../repos/lease-repo.ts";
+import type { SqlExecutor } from "../db/client.ts";
 import {
   createDownloadToken,
   parseDownloadToken,
@@ -262,10 +262,12 @@ async function buildLeasePayload(params: {
   batchLabel: string;
   tenantId: string;
   workerId?: string;
+  executor?: SqlExecutor;
 }): Promise<LeaseDto> {
   const allIngestionFiles = await listLeasedIngestionFiles({
     tenantId: params.tenantId,
     ingestionId: params.ingestionId,
+    executor: params.executor,
   });
   const ingestionFiles = allIngestionFiles.filter(
     (file) => file.status === "UPLOADED" || file.status === "VALIDATED",
@@ -274,6 +276,7 @@ async function buildLeasePayload(params: {
   const ingestion = await findIngestionWithCreator({
     tenantId: params.tenantId,
     ingestionId: params.ingestionId,
+    executor: params.executor,
   });
 
   if (!ingestion) {
@@ -283,6 +286,7 @@ async function buildLeasePayload(params: {
   const ingestionItems = await listIngestionItems({
     tenantId: params.tenantId,
     ingestionId: params.ingestionId,
+    executor: params.executor,
   });
 
   const itemsById = new Map(ingestionItems.map((item) => [item.id, item]));
@@ -343,9 +347,10 @@ async function buildLeasePayload(params: {
       continue;
     }
 
-    const existingObject = await findObjectBySourceIngestionItem({
-      tenantId: params.tenantId,
-      ingestionItemId: item.id,
+      const existingObject = await findObjectBySourceIngestionItem({
+        tenantId: params.tenantId,
+        ingestionItemId: item.id,
+        executor: params.executor,
     });
 
     leasedItems.push({
@@ -381,27 +386,35 @@ export async function leaseNextIngestion(params: {
 }): Promise<Record<string, unknown>> {
   await sweepExpiredLeases();
 
-  const leaseResult = await leaseNextQueuedIngestion({
+  const lease = await claimNextQueuedIngestion({
     workerId: params.workerId,
     leaseDurationSeconds: leaseTtlSeconds(),
+    buildPayload: ({ candidate, grant, executor }) => {
+      return buildLeasePayload({
+        leaseId: grant.id,
+        leaseTokenId: grant.tokenId,
+        leaseExpiresAt: grant.expiresAt,
+        ingestionId: candidate.id,
+        batchLabel: candidate.batchLabel,
+        tenantId: candidate.tenantId,
+        workerId: params.workerId,
+        executor,
+      });
+    },
   });
 
-  if (!leaseResult) {
+  if (!lease) {
     return {
       lease: null,
     };
   }
 
+  if (lease.status === "invalid") {
+    throw lease.error;
+  }
+
   return {
-    lease: await buildLeasePayload({
-      leaseId: leaseResult.lease.id,
-      leaseTokenId: leaseResult.lease.leaseTokenId,
-      leaseExpiresAt: leaseResult.lease.leaseExpiresAt,
-      ingestionId: leaseResult.ingestion.id,
-      batchLabel: leaseResult.ingestion.batchLabel,
-      tenantId: leaseResult.ingestion.tenantId,
-      workerId: params.workerId,
-    }),
+    lease: lease.payload,
   };
 }
 
@@ -411,10 +424,22 @@ export async function leaseIngestionById(params: {
 }): Promise<Record<string, unknown>> {
   await sweepExpiredLeases();
 
-  const leaseResult = await leaseQueuedIngestionById({
+  const leaseResult = await claimQueuedIngestionById({
     ingestionId: params.ingestionId,
     workerId: params.workerId,
     leaseDurationSeconds: leaseTtlSeconds(),
+    buildPayload: ({ candidate, grant, executor }) => {
+      return buildLeasePayload({
+        leaseId: grant.id,
+        leaseTokenId: grant.tokenId,
+        leaseExpiresAt: grant.expiresAt,
+        ingestionId: candidate.id,
+        batchLabel: candidate.batchLabel,
+        tenantId: candidate.tenantId,
+        workerId: params.workerId,
+        executor,
+      });
+    },
   });
 
   if (leaseResult.status === "not_found") {
@@ -427,17 +452,11 @@ export async function leaseIngestionById(params: {
     });
   }
 
-  return {
-    lease: await buildLeasePayload({
-      leaseId: leaseResult.lease.id,
-      leaseTokenId: leaseResult.lease.leaseTokenId,
-      leaseExpiresAt: leaseResult.lease.leaseExpiresAt,
-      ingestionId: leaseResult.ingestion.id,
-      batchLabel: leaseResult.ingestion.batchLabel,
-      tenantId: leaseResult.ingestion.tenantId,
-      workerId: params.workerId,
-    }),
-  };
+  if (leaseResult.status === "invalid") {
+    throw leaseResult.error;
+  }
+
+  return { lease: leaseResult.payload };
 }
 
 export async function heartbeatLease(
@@ -502,34 +521,21 @@ export async function releaseActiveLease(
 ): Promise<ReleaseLeaseResponse> {
   const { authorizedLease } = params;
 
-  const released = await releaseLease({
+  const released = await releaseLeaseAndRequeue({
+    tenantId: authorizedLease.tenantId,
     ingestionId: authorizedLease.ingestionId,
     leaseId: authorizedLease.leaseId,
     leaseTokenId: authorizedLease.leaseTokenId,
   });
 
-  if (!released) {
-    throw new ConflictError("Lease is no longer active.");
-  }
-
-  const ingestion = await findIngestionWithCreator({
-    tenantId: authorizedLease.tenantId,
-    ingestionId: authorizedLease.ingestionId,
-  });
-
-  if (!ingestion) {
+  if (released.status === "not_found") {
     throw new NotFoundError(
       `Ingestion '${authorizedLease.ingestionId}' was not found.`,
     );
   }
 
-  if (ingestion.status === "PROCESSING") {
-    await updateIngestionStatus({
-      ingestionId: ingestion.id,
-      tenantId: ingestion.tenantId,
-      fromStatus: ingestion.status,
-      toStatus: "QUEUED",
-    });
+  if (released.status === "inactive") {
+    throw new ConflictError("Lease is no longer active.");
   }
 
   return {

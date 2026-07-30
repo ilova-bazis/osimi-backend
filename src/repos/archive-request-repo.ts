@@ -42,6 +42,11 @@ interface ArchiveRequestRow {
     created_at: Date;
     updated_at: Date;
     completed_at: Date | null;
+    artifact_upload_token_id?: string | null;
+    artifact_upload_storage_key?: string | null;
+    artifact_upload_content_type?: string | null;
+    artifact_upload_size_bytes?: bigint | null;
+    artifact_upload_checksum_sha256?: string | null;
 }
 
 export interface ArchiveRequestRecord {
@@ -71,6 +76,19 @@ export interface LeasedArchiveRequestRecord {
     leaseId: string;
     leaseTokenId: string;
     leaseExpiresAt: Date;
+}
+
+export interface ArchiveArtifactUploadRecord {
+    requestId: string;
+    tenantId: string;
+    targetId: string;
+    actionType: ArchiveRequestActionType;
+    status: ArchiveRequestStatus;
+    uploadTokenId?: string;
+    storageKey?: string;
+    contentType?: string;
+    sizeBytes?: number;
+    checksumSha256?: string;
 }
 
 interface CountRow {
@@ -460,6 +478,106 @@ export async function completeArchiveRequest(params: {
 
     const row = rows[0];
     return row ? mapArchiveRequest(row) : undefined;
+}
+
+export async function prepareArchiveArtifactUpload(params: {
+    requestId: string;
+    leaseId: string;
+    leaseTokenId: string;
+    uploadTokenId: string;
+    storageKey: string;
+    contentType: string;
+    sizeBytes: number;
+}): Promise<boolean> {
+    const rows = await withSchemaClient(async (sql) => {
+        return await sql<Array<{ id: string }>>`
+      UPDATE archive_requests
+      SET artifact_upload_token_id = ${params.uploadTokenId},
+          artifact_upload_storage_key = ${params.storageKey},
+          artifact_upload_content_type = ${params.contentType},
+          artifact_upload_size_bytes = ${params.sizeBytes},
+          artifact_upload_checksum_sha256 = NULL,
+          updated_at = now()
+      WHERE id = ${params.requestId}
+        AND action_type = 'artifact_fetch'
+        AND status = 'PROCESSING'
+        AND lease_id = ${params.leaseId}
+        AND lease_token_id = ${params.leaseTokenId}
+      RETURNING id
+    `;
+    });
+
+    return rows.length > 0;
+}
+
+export async function findArchiveArtifactUpload(params: {
+    requestId: string;
+}): Promise<ArchiveArtifactUploadRecord | undefined> {
+    const rows = await withSchemaClient(async (sql) => {
+        return await sql<Array<{
+            id: string;
+            tenant_id: string;
+            target_id: string;
+            action_type: ArchiveRequestActionType;
+            status: ArchiveRequestStatus;
+            artifact_upload_token_id: string | null;
+            artifact_upload_storage_key: string | null;
+            artifact_upload_content_type: string | null;
+            artifact_upload_size_bytes: bigint | null;
+            artifact_upload_checksum_sha256: string | null;
+        }>>`
+      SELECT id, tenant_id, target_id, action_type, status,
+             artifact_upload_token_id, artifact_upload_storage_key,
+             artifact_upload_content_type, artifact_upload_size_bytes,
+             artifact_upload_checksum_sha256
+      FROM archive_requests
+      WHERE id = ${params.requestId}
+      LIMIT 1
+    `;
+    });
+    const row = rows[0];
+
+    if (!row) {
+        return undefined;
+    }
+
+    return {
+        requestId: row.id,
+        tenantId: row.tenant_id,
+        targetId: row.target_id,
+        actionType: row.action_type,
+        status: row.status,
+        uploadTokenId: row.artifact_upload_token_id ?? undefined,
+        storageKey: row.artifact_upload_storage_key ?? undefined,
+        contentType: row.artifact_upload_content_type ?? undefined,
+        sizeBytes: row.artifact_upload_size_bytes === null
+            ? undefined
+            : Number(row.artifact_upload_size_bytes),
+        checksumSha256: row.artifact_upload_checksum_sha256 ?? undefined,
+    };
+}
+
+export async function recordArchiveArtifactUpload(params: {
+    requestId: string;
+    uploadTokenId: string;
+    storageKey: string;
+    checksumSha256: string;
+}): Promise<boolean> {
+    const rows = await withSchemaClient(async (sql) => {
+        return await sql<Array<{ id: string }>>`
+      UPDATE archive_requests
+      SET artifact_upload_checksum_sha256 = ${params.checksumSha256},
+          updated_at = now()
+      WHERE id = ${params.requestId}
+        AND action_type = 'artifact_fetch'
+        AND status = 'PROCESSING'
+        AND artifact_upload_token_id = ${params.uploadTokenId}
+        AND artifact_upload_storage_key = ${params.storageKey}
+      RETURNING id
+    `;
+    });
+
+    return rows.length > 0;
 }
 
 export async function failArchiveRequest(params: {

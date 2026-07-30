@@ -5,6 +5,13 @@ import { getRuntimeConfig } from "../runtime/config.ts";
 const DATABASE_URL_ENV = "DATABASE_URL";
 export type DbClient = Awaited<ReturnType<ReturnType<typeof db>["reserve"]>>;
 
+export interface SqlExecutor {
+  <T = unknown>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): Promise<T>;
+}
+
 export function resolveDatabaseUrl(override?: string): string {
   const runtimeOverride = getRuntimeConfig().databaseUrl;
   const candidate = (override ?? runtimeOverride ?? process.env[DATABASE_URL_ENV])?.trim();
@@ -37,4 +44,15 @@ export async function withSchemaClient<T>(
   } finally {
     client.release();
   }
+}
+
+export async function withExecutor<T>(
+  executor: SqlExecutor | undefined,
+  handler: (sql: SqlExecutor) => Promise<T>,
+): Promise<T> {
+  if (executor) {
+    return handler(executor);
+  }
+
+  return withSchemaClient(handler);
 }

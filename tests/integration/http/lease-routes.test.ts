@@ -122,6 +122,40 @@ async function resetActiveIngestions(schema: string): Promise<void> {
   }
 }
 
+async function getLeaseState(
+  schema: string,
+  ingestionId: string,
+): Promise<{ status: string; activeLeaseCount: number }> {
+  const sql = createSqlClient(TEST_DATABASE_URL!);
+
+  try {
+    await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+    const rows = await sql<Array<{ status: string; active_lease_count: number }>>`
+      SELECT
+        ing.status,
+        COUNT(lease.id) FILTER (
+          WHERE lease.released_at IS NULL
+            AND lease.lease_expires_at > now()
+        )::int AS active_lease_count
+      FROM ingestions ing
+      LEFT JOIN ingestion_leases lease ON lease.ingestion_id = ing.id
+      WHERE ing.id = ${ingestionId}
+      GROUP BY ing.id
+    `;
+    const row = rows[0];
+    if (!row) {
+      throw new Error(`Ingestion '${ingestionId}' was not found.`);
+    }
+
+    return {
+      status: row.status,
+      activeLeaseCount: Number(row.active_lease_count),
+    };
+  } finally {
+    await sql.close();
+  }
+}
+
 async function createQueuedIngestion(
   app: ReturnType<typeof createApp>,
   token: string,
@@ -1070,5 +1104,24 @@ describe("lease routes", () => {
       }),
     );
     expect(leaseResponse.status).toBe(409);
+    expect(await getLeaseState(schema, ingestionId)).toEqual({
+      status: "QUEUED",
+      activeLeaseCount: 0,
+    });
+
+    const targetedLeaseResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/lease`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "x-worker-id": "worker-unlinked",
+        },
+      }),
+    );
+    expect(targetedLeaseResponse.status).toBe(409);
+    expect(await getLeaseState(schema, ingestionId)).toEqual({
+      status: "QUEUED",
+      activeLeaseCount: 0,
+    });
   });
 });

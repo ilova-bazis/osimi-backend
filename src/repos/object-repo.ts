@@ -1,5 +1,5 @@
-import { withSchemaClient } from "../db/client.ts";
-import type { DbClient } from "../db/client.ts";
+import { withExecutor, withSchemaClient } from "../db/client.ts";
+import type { SqlExecutor } from "../db/client.ts";
 import { toSafeNumberFromDbInt, type DbInt } from "../db/number.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
 
@@ -173,7 +173,7 @@ function normalizeTags(input: unknown): string[] {
 }
 
 async function replaceObjectTags(
-    sql: DbClient,
+    sql: SqlExecutor,
     objectId: string,
     tags: string[],
 ): Promise<void> {
@@ -271,8 +271,9 @@ function mapArtifact(row: ObjectArtifactRow): ObjectArtifactRecord {
 export async function findObjectBySourceIngestion(params: {
     tenantId: string;
     ingestionId: string;
+    executor?: SqlExecutor;
 }): Promise<ObjectRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ObjectRow[]>`
       SELECT
         obj.object_id,
@@ -318,8 +319,9 @@ export async function findObjectBySourceIngestion(params: {
 export async function findObjectBySourceIngestionItem(params: {
     tenantId: string;
     ingestionItemId: string;
+    executor?: SqlExecutor;
 }): Promise<ObjectRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ObjectRow[]>`
       SELECT
         obj.object_id,
@@ -453,8 +455,9 @@ export async function createOrGetObjectBySourceIngestion(params: {
     sensitivityNote?: string;
     metadata?: JsonObject;
     tags?: string[];
+    executor?: SqlExecutor;
 }): Promise<ObjectRecord> {
-    return await withSchemaClient(async (sql) => {
+    return await withExecutor(params.executor, async (sql) => {
         const insertedRows = await sql<ObjectRow[]>`
       INSERT INTO objects (
         object_id,
@@ -486,7 +489,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
         ${params.sourceIngestionId},
         ${params.sourceIngestionItemId ?? null}
       )
-      ON CONFLICT (object_id)
+      ON CONFLICT
       DO NOTHING
       RETURNING
         object_id,
@@ -1027,8 +1030,9 @@ export async function listObjects(
 export async function findObjectById(params: {
     tenantId: string;
     objectId: string;
+    executor?: SqlExecutor;
 }): Promise<ObjectRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ObjectRow[]>`
       SELECT
         obj.object_id,
@@ -1165,8 +1169,9 @@ export async function updateObjectIngestManifest(params: {
     tenantId: string;
     objectId: string;
     ingestManifest: JsonObject;
+    executor?: SqlExecutor;
 }): Promise<ObjectRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ObjectRow[]>`
       UPDATE objects
       SET ingest_manifest = ${params.ingestManifest},
@@ -1220,8 +1225,9 @@ export async function updateObjectProjectionState(params: {
     embargoCurationState?: ObjectRecord["curationState"] | null;
     rightsNote?: string | null;
     sensitivityNote?: string | null;
+    executor?: SqlExecutor;
 }): Promise<ObjectRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         const embargoKind = params.embargoKind ?? null;
         const embargoUntil =
             embargoKind === "timed" ? (params.embargoUntil ?? null) : null;
@@ -1359,8 +1365,9 @@ export async function updateObjectMetadataPages(params: {
         image_artifact_id?: string | null;
         ocr_text_artifact_id?: string | null;
     }>;
+    executor?: SqlExecutor;
 }): Promise<ObjectRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ObjectRow[]>`
       UPDATE objects
       SET metadata = metadata || ${{

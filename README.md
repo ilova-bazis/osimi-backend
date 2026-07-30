@@ -33,6 +33,15 @@ manager. Rotating either value invalidates outstanding tokens signed with the
 previous value, so rotate only after their maximum expiry window has passed or
 coordinate the worker/client rollout.
 
+## Upload Configuration
+
+- `MAX_UPLOAD_SIZE_BYTES`: maximum signed upload size and streamed request body
+  size. Defaults to `2147483648` (2 GiB) and must be a positive safe integer.
+
+Every presign receives a unique immutable staging key. Re-presigning a pending
+file or artifact invalidates the earlier URL; uploads stream to a temporary
+file and are atomically promoted without replacing an existing object.
+
 ## Tests
 
 Run fast unit tests without PostgreSQL:

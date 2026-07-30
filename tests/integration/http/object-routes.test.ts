@@ -3356,10 +3356,51 @@ describe("object routes", () => {
         const presignBody = (await presignResponse.json()) as {
             upload_token: string;
             upload_url: string;
+            storage_key: string;
         };
 
-        const uploadResponse = await app.fetch(
+        const represignResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/archive-requests/${leasedRequest!.request_id}/artifacts/presign`,
+                {
+                    method: "POST",
+                    headers: {
+                        "x-worker-auth-token": "worker-secret",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        lease_token: leasedRequest!.lease_token,
+                        content_type: "text/plain",
+                        size_bytes: 11,
+                        extension: "txt",
+                    }),
+                },
+            ),
+        );
+
+        expect(represignResponse.status).toBe(200);
+        const represignBody = (await represignResponse.json()) as {
+            upload_token: string;
+            upload_url: string;
+            storage_key: string;
+        };
+        expect(represignBody.storage_key).not.toBe(presignBody.storage_key);
+
+        const staleUploadResponse = await app.fetch(
             new Request(`http://localhost${presignBody.upload_url}`, {
+                method: "PUT",
+                headers: {
+                    "content-type": "text/plain",
+                    "content-length": "11",
+                },
+                body: "hello world",
+            }),
+        );
+
+        expect(staleUploadResponse.status).toBe(409);
+
+        const uploadResponse = await app.fetch(
+            new Request(`http://localhost${represignBody.upload_url}`, {
                 method: "PUT",
                 headers: {
                     "content-type": "text/plain",
@@ -3400,7 +3441,7 @@ describe("object routes", () => {
                     },
                     body: JSON.stringify({
                         lease_token: leasedRequest!.lease_token,
-                        upload_token: presignBody.upload_token,
+                        upload_token: represignBody.upload_token,
                     }),
                 },
             ),
@@ -3414,6 +3455,22 @@ describe("object routes", () => {
         expect(completeBody.status).toBe("completed");
         expect(completeBody.request.status).toBe("COMPLETED");
         expect(completeBody.request.action_type).toBe("artifact_fetch");
+
+        const replayResponse = await app.fetch(
+            new Request(`http://localhost${represignBody.upload_url}`, {
+                method: "PUT",
+                headers: {
+                    "content-type": "text/plain",
+                    "content-length": "11",
+                },
+                body: "goodbye all",
+            }),
+        );
+
+        expect(replayResponse.status).toBe(409);
+        expect(await Bun.file(join(stagingRoot, represignBody.storage_key)).text()).toBe(
+            "hello world",
+        );
 
         const listRequestsResponse = await app.fetch(
             new Request(

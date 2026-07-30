@@ -1,4 +1,5 @@
 import { withSchemaClient } from "../db/client.ts";
+import type { SqlExecutor } from "../db/client.ts";
 
 interface LeaseRow {
   id: string;
@@ -54,6 +55,27 @@ export type LeaseByIdResult =
   | { status: "not_found" }
   | { status: "not_leasable" };
 
+export interface LeaseClaimCandidate {
+  id: string;
+  batchLabel: string;
+  tenantId: string;
+}
+
+export interface PendingLeaseGrant {
+  id: string;
+  tokenId: string;
+  expiresAt: Date;
+}
+
+export type ReleaseLeaseResult =
+  | { status: "released"; lease: LeaseRecord }
+  | { status: "not_found" }
+  | { status: "inactive" };
+
+export type LeaseClaimResult<T> =
+  | { status: "claimed"; payload: T }
+  | { status: "invalid"; error: unknown };
+
 function mapLease(row: LeaseRow): LeaseRecord {
   return {
     id: row.id,
@@ -73,6 +95,168 @@ function mapLeasedIngestion(row: QueuedIngestionRow): LeasedIngestionRecord {
     tenantId: row.tenant_id,
     status: row.status,
   };
+}
+
+function createPendingLeaseGrant(leaseDurationSeconds: number): PendingLeaseGrant {
+  return {
+    id: crypto.randomUUID(),
+    tokenId: crypto.randomUUID(),
+    expiresAt: new Date(Date.now() + leaseDurationSeconds * 1000),
+  };
+}
+
+async function insertLeaseAndMarkProcessing(
+  transaction: SqlExecutor,
+  params: {
+    candidate: LeaseClaimCandidate;
+    workerId?: string;
+    grant: PendingLeaseGrant;
+  },
+): Promise<LeaseRecord> {
+  const updatedRows = await transaction<Array<{ id: string }>>`
+    UPDATE ingestions
+    SET status = 'PROCESSING',
+        updated_at = now()
+    WHERE id = ${params.candidate.id}
+      AND tenant_id = ${params.candidate.tenantId}
+      AND status = 'QUEUED'
+    RETURNING id
+  `;
+
+  if (updatedRows.length === 0) {
+    throw new Error(`Queued ingestion '${params.candidate.id}' could not be claimed.`);
+  }
+
+  const leaseRows = await transaction<LeaseRow[]>`
+    INSERT INTO ingestion_leases (
+      id,
+      ingestion_id,
+      leased_by,
+      lease_token_id,
+      lease_expires_at
+    )
+    VALUES (
+      ${params.grant.id},
+      ${params.candidate.id},
+      ${params.workerId ?? null},
+      ${params.grant.tokenId},
+      ${params.grant.expiresAt.toISOString()}
+    )
+    RETURNING id, ingestion_id, leased_by, lease_token_id, lease_expires_at, created_at, released_at
+  `;
+
+  return mapLease(leaseRows[0]!);
+}
+
+export async function claimNextQueuedIngestion<T>(params: {
+  workerId?: string;
+  leaseDurationSeconds: number;
+  buildPayload: (params: {
+    candidate: LeaseClaimCandidate;
+    grant: PendingLeaseGrant;
+    executor: SqlExecutor;
+  }) => Promise<T>;
+}): Promise<LeaseClaimResult<T> | undefined> {
+  return withSchemaClient(async (sql) => {
+    return sql.begin(async (transaction) => {
+      const candidates = await transaction<QueuedIngestionRow[]>`
+        SELECT ing.id, ing.batch_label, ing.tenant_id, ing.status
+        FROM ingestions ing
+        WHERE ing.status = 'QUEUED'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM ingestion_leases lease
+            WHERE lease.ingestion_id = ing.id
+              AND lease.released_at IS NULL
+              AND lease.lease_expires_at > now()
+          )
+        ORDER BY ing.created_at ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+      `;
+      const candidateRow = candidates[0];
+      if (!candidateRow) {
+        return undefined;
+      }
+
+      const candidate: LeaseClaimCandidate = {
+        id: candidateRow.id,
+        batchLabel: candidateRow.batch_label,
+        tenantId: candidateRow.tenant_id,
+      };
+      const grant = createPendingLeaseGrant(params.leaseDurationSeconds);
+      let payload: T;
+      try {
+        payload = await params.buildPayload({ candidate, grant, executor: transaction });
+      } catch (error) {
+        return { status: "invalid", error };
+      }
+      await insertLeaseAndMarkProcessing(transaction, {
+        candidate,
+        workerId: params.workerId,
+        grant,
+      });
+      return { status: "claimed", payload };
+    });
+  });
+}
+
+export async function claimQueuedIngestionById<T>(params: {
+  ingestionId: string;
+  workerId?: string;
+  leaseDurationSeconds: number;
+  buildPayload: (params: {
+    candidate: LeaseClaimCandidate;
+    grant: PendingLeaseGrant;
+    executor: SqlExecutor;
+  }) => Promise<T>;
+}): Promise<LeaseClaimResult<T> | { status: "not_found" } | { status: "not_leasable" }> {
+  return withSchemaClient(async (sql) => {
+    return sql.begin(async (transaction) => {
+      const candidates = await transaction<IngestionLeaseCandidateRow[]>`
+        SELECT ing.id, ing.batch_label, ing.tenant_id, ing.status
+        FROM ingestions ing
+        WHERE ing.id = ${params.ingestionId}
+        FOR UPDATE
+      `;
+      const candidateRow = candidates[0];
+      if (!candidateRow) {
+        return { status: "not_found" as const };
+      }
+
+      const activeLeaseRows = await transaction<Array<{ exists: boolean }>>`
+        SELECT EXISTS(
+          SELECT 1
+          FROM ingestion_leases lease
+          WHERE lease.ingestion_id = ${candidateRow.id}
+            AND lease.released_at IS NULL
+            AND lease.lease_expires_at > now()
+        ) AS exists
+      `;
+      if (candidateRow.status !== "QUEUED" || activeLeaseRows[0]?.exists) {
+        return { status: "not_leasable" as const };
+      }
+
+      const candidate: LeaseClaimCandidate = {
+        id: candidateRow.id,
+        batchLabel: candidateRow.batch_label,
+        tenantId: candidateRow.tenant_id,
+      };
+      const grant = createPendingLeaseGrant(params.leaseDurationSeconds);
+      let payload: T;
+      try {
+        payload = await params.buildPayload({ candidate, grant, executor: transaction });
+      } catch (error) {
+        return { status: "invalid", error };
+      }
+      await insertLeaseAndMarkProcessing(transaction, {
+        candidate,
+        workerId: params.workerId,
+        grant,
+      });
+      return { status: "claimed" as const, payload };
+    });
+  });
 }
 
 export async function sweepExpiredLeases(): Promise<number> {
@@ -295,6 +479,60 @@ export async function releaseLease(params: {
 
   const row = rows[0];
   return row ? mapLease(row) : undefined;
+}
+
+export async function releaseLeaseAndRequeue(params: {
+  tenantId: string;
+  ingestionId: string;
+  leaseId: string;
+  leaseTokenId: string;
+}): Promise<ReleaseLeaseResult> {
+  return withSchemaClient(async (sql) => {
+    return sql.begin(async (transaction) => {
+      const ingestions = await transaction<Array<{ id: string; status: string }>>`
+        SELECT id, status
+        FROM ingestions
+        WHERE id = ${params.ingestionId}
+          AND tenant_id = ${params.tenantId}
+        FOR UPDATE
+      `;
+      const ingestion = ingestions[0];
+      if (!ingestion) {
+        return { status: "not_found" };
+      }
+
+      const leaseRows = await transaction<LeaseRow[]>`
+        UPDATE ingestion_leases
+        SET released_at = now()
+        WHERE id = ${params.leaseId}
+          AND ingestion_id = ${params.ingestionId}
+          AND lease_token_id = ${params.leaseTokenId}
+          AND released_at IS NULL
+        RETURNING id, ingestion_id, leased_by, lease_token_id, lease_expires_at, created_at, released_at
+      `;
+      const lease = leaseRows[0];
+      if (!lease) {
+        return { status: "inactive" };
+      }
+
+      if (ingestion.status === "PROCESSING") {
+        const requeuedRows = await transaction<Array<{ id: string }>>`
+          UPDATE ingestions
+          SET status = 'QUEUED',
+              updated_at = now()
+          WHERE id = ${params.ingestionId}
+            AND tenant_id = ${params.tenantId}
+            AND status = 'PROCESSING'
+          RETURNING id
+        `;
+        if (requeuedRows.length === 0) {
+          throw new Error(`Processing ingestion '${params.ingestionId}' could not be requeued.`);
+        }
+      }
+
+      return { status: "released", lease: mapLease(lease) };
+    });
+  });
 }
 
 export async function findActiveLeaseByToken(params: {

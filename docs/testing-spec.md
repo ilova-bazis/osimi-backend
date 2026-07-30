@@ -27,6 +27,8 @@ This document defines the required tests for the Osimi backend control plane (VP
 - Auth token storage validation (hash-only, no raw token persistence)
 - Auth audit events for login/logout/session rejection
 - Lease exclusivity: only one worker can lease a batch at a time
+- Lease payload validation failure: both next and targeted claims leave the ingestion `QUEUED` with no active lease
+- Lease release/requeue is atomic: a successful release has no observable state with a released lease and `PROCESSING` ingestion
 - Lease expiry: expired leases re-queue and can be leased again
 - Redundancy sweep: expired leases are re-queued even if automatic requeue fails
 - Targeted lease reacquire: `POST /api/ingestions/:id/lease` leases only the requested queued ingestion
@@ -44,6 +46,9 @@ This document defines the required tests for the Osimi backend control plane (VP
 - Worker preview claim/report flow is duplicate-safe enough for a single claimed job at a time and can recover claimed preview jobs after timeout
 - Worker download checksum mismatch emits `FILE_FAILED`
 - Event ingestion idempotency by `event_id`
+- Event projection transactions roll back the event reservation and all derived writes on failure
+- Conflicting reuse of an `event_id` is rejected without applying another projection
+- Batched event delivery commits successfully projected earlier events while allowing a failed later event to be retried
 - Event ordering tolerance (out-of-order delivery)
 - Staging retention rules by ingestion state
 - Staging retention removes temporary preview derivatives alongside original staged files

@@ -597,10 +597,49 @@ describe("ingestion routes", () => {
     const presignBody = (await presignResponse.json()) as {
       upload_token: string;
       upload_url: string;
+      storage_key: string;
     };
 
-    const uploadResponse = await app.fetch(
+    const represignResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/worker/ingestion-previews/${createBody.ingestion.id}/files/${file.fileId}/presign`,
+        {
+          method: "POST",
+          headers: {
+            ...workerHeaders(),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            content_type: "image/jpeg",
+            size_bytes: 5,
+          }),
+        },
+      ),
+    );
+
+    expect(represignResponse.status).toBe(200);
+    const represignBody = (await represignResponse.json()) as {
+      upload_token: string;
+      upload_url: string;
+      storage_key: string;
+    };
+    expect(represignBody.storage_key).not.toBe(presignBody.storage_key);
+
+    const staleUploadResponse = await app.fetch(
       new Request(`http://localhost${presignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "image/jpeg",
+          "content-length": "5",
+        },
+        body: "stale",
+      }),
+    );
+
+    expect(staleUploadResponse.status).toBe(409);
+
+    const uploadResponse = await app.fetch(
+      new Request(`http://localhost${represignBody.upload_url}`, {
         method: "PUT",
         headers: {
           "content-type": "image/jpeg",
@@ -622,7 +661,7 @@ describe("ingestion routes", () => {
             "content-type": "application/json",
           },
           body: JSON.stringify({
-            upload_token: presignBody.upload_token,
+            upload_token: represignBody.upload_token,
             width: 64,
             height: 64,
           }),
@@ -2581,7 +2620,7 @@ describe("ingestion routes", () => {
     };
 
     expect(secondPresignBody.file_id).toBe(firstPresignBody.file_id);
-    expect(secondPresignBody.storage_key).toBe(firstPresignBody.storage_key);
+    expect(secondPresignBody.storage_key).not.toBe(firstPresignBody.storage_key);
     expect(secondPresignBody.upload_url).not.toBe(firstPresignBody.upload_url);
 
     const payload = "hello repres!";
@@ -2613,6 +2652,19 @@ describe("ingestion routes", () => {
     );
 
     expect(commitResponse.status).toBe(200);
+
+    const replayResponse = await app.fetch(
+      new Request(`http://localhost${secondPresignBody.upload_url}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "text/plain",
+          "content-length": String(payload.length),
+        },
+        body: "changed-text!",
+      }),
+    );
+
+    expect(replayResponse.status).toBe(409);
 
     const detailResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}`, {

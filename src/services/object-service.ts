@@ -1,6 +1,3 @@
-import { mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
-
 import {
     ConflictError,
     NotFoundError,
@@ -37,10 +34,13 @@ import {
     failArchiveRequest,
     findActiveArchiveRequestByDedupeKey,
     findArchiveRequestById,
+    findArchiveArtifactUpload,
     leaseNextPendingArchiveRequest,
     listArchiveRequests,
     listArchiveRequestsByTarget,
     releaseArchiveRequestLease,
+    prepareArchiveArtifactUpload,
+    recordArchiveArtifactUpload,
     sweepExpiredArchiveRequestLeases,
     type ArchiveRequestRecord,
     type ArchiveRequestTargetType,
@@ -70,6 +70,8 @@ import {
     createObjectArtifactUploadToken,
     parseObjectArtifactUploadToken,
 } from "../storage/staging.ts";
+import { parseContentLength, streamUploadToImmutablePath } from "../storage/upload.ts";
+import { resolveMaxUploadSizeBytes } from "../runtime/config.ts";
 import {
     authorizeWorkerLeaseForArchiveRequest,
     type AuthorizedWorkerArchiveRequestLease,
@@ -1993,31 +1995,55 @@ export async function presignObjectArtifactUpload(params: {
         leaseToken: params.body.lease_token,
     });
 
-    return buildArtifactUploadPresignResponse({
+    return await buildArtifactUploadPresignResponse({
         lease: authorizedLease,
         body: params.body,
     });
 }
 
-function buildArtifactUploadPresignResponse(params: {
+async function buildArtifactUploadPresignResponse(params: {
     lease: AuthorizedWorkerDownloadRequestLease;
     body: WorkerPresignObjectArtifactUploadBody;
-}): WorkerPresignObjectArtifactUploadResponse {
+}): Promise<WorkerPresignObjectArtifactUploadResponse> {
+    const maxUploadSizeBytes = resolveMaxUploadSizeBytes();
+
+    if (params.body.size_bytes > maxUploadSizeBytes) {
+        throw new ValidationError("Artifact size exceeds the configured upload limit.", {
+            max_upload_size_bytes: maxUploadSizeBytes,
+        });
+    }
+
     const expiresAt = new Date(
         Date.now() + workerUploadTtlSeconds() * 1000,
     ).toISOString();
+    const uploadTokenId = crypto.randomUUID();
     const storageKey = buildObjectArtifactStorageKey({
         tenantId: params.lease.tenantId,
         objectId: params.lease.objectId,
         requestId: params.lease.requestId,
+        uploadTokenId,
         artifactKind: params.lease.artifactKind,
         variant: params.lease.variant,
         extension:
             params.body.extension ||
             extensionFromContentType(params.body.content_type),
     });
+    const prepared = await prepareArchiveArtifactUpload({
+        requestId: params.lease.requestId,
+        leaseId: params.lease.leaseId,
+        leaseTokenId: params.lease.leaseTokenId,
+        uploadTokenId,
+        storageKey,
+        contentType: params.body.content_type,
+        sizeBytes: params.body.size_bytes,
+    });
+
+    if (!prepared) {
+        throw new ConflictError("Lease is no longer active.");
+    }
 
     const uploadToken = createObjectArtifactUploadToken({
+        upload_token_id: uploadTokenId,
         request_id: params.lease.requestId,
         object_id: params.lease.objectId,
         tenant_id: params.lease.tenantId,
@@ -2064,7 +2090,7 @@ export async function presignArchiveRequestArtifactUpload(params: {
         leaseToken: params.body.lease_token,
     });
 
-    return buildArtifactUploadPresignResponse({
+    return await buildArtifactUploadPresignResponse({
         lease: authorizedLease,
         body: params.body,
     });
@@ -2114,6 +2140,13 @@ export async function uploadObjectArtifactBySignedToken(params: {
     request: Request;
 }): Promise<WorkerUploadObjectArtifactByTokenResponse> {
     const token = parseObjectArtifactUploadToken(params.uploadToken);
+    const maxUploadSizeBytes = resolveMaxUploadSizeBytes();
+
+    if (token.size_bytes > maxUploadSizeBytes) {
+        throw new ValidationError("Upload size exceeds the configured upload limit.", {
+            max_upload_size_bytes: maxUploadSizeBytes,
+        });
+    }
     const requestContentType = params.request.headers
         .get("content-type")
         ?.split(";")[0]
@@ -2132,23 +2165,46 @@ export async function uploadObjectArtifactBySignedToken(params: {
         );
     }
 
-    const contentLength = Number.parseInt(rawContentLength, 10);
+    const contentLength = parseContentLength(rawContentLength);
     if (!Number.isFinite(contentLength) || contentLength !== token.size_bytes) {
         throw new ValidationError(
             "Upload content length does not match signed URL constraints.",
         );
     }
 
-    const bodyBytes = new Uint8Array(await params.request.arrayBuffer());
-    if (bodyBytes.byteLength !== token.size_bytes) {
-        throw new ValidationError(
-            "Upload body size does not match signed URL constraints.",
-        );
+    const stagedUpload = await findArchiveArtifactUpload({ requestId: token.request_id });
+
+    if (
+        !stagedUpload ||
+        stagedUpload.status !== "PROCESSING" ||
+        stagedUpload.actionType !== "artifact_fetch" ||
+        stagedUpload.tenantId !== token.tenant_id ||
+        stagedUpload.targetId !== token.object_id ||
+        stagedUpload.uploadTokenId !== token.upload_token_id ||
+        stagedUpload.storageKey !== token.storage_key ||
+        stagedUpload.contentType !== token.content_type ||
+        stagedUpload.sizeBytes !== token.size_bytes
+    ) {
+        throw new ConflictError("Upload token is no longer active.");
     }
 
     const destinationPath = resolveStagingPath(token.storage_key);
-    await mkdir(dirname(destinationPath), { recursive: true });
-    await Bun.write(destinationPath, bodyBytes);
+    const inspection = await streamUploadToImmutablePath({
+        body: params.request.body,
+        destinationPath,
+        expectedSizeBytes: token.size_bytes,
+        maxSizeBytes: maxUploadSizeBytes,
+    });
+    const recorded = await recordArchiveArtifactUpload({
+        requestId: token.request_id,
+        uploadTokenId: token.upload_token_id,
+        storageKey: token.storage_key,
+        checksumSha256: inspection.checksumSha256,
+    });
+
+    if (!recorded) {
+        throw new ConflictError("Upload token is no longer active.");
+    }
 
     return {
         status: "ok",
@@ -2173,6 +2229,22 @@ async function resolveArtifactForCompletion(params: {
         throw new ValidationError(
             "Upload token does not match artifact fetch lease context.",
         );
+    }
+
+    const stagedUpload = await findArchiveArtifactUpload({
+        requestId: params.lease.requestId,
+    });
+
+    if (
+        !stagedUpload ||
+        stagedUpload.status !== "PROCESSING" ||
+        stagedUpload.uploadTokenId !== upload.upload_token_id ||
+        stagedUpload.storageKey !== upload.storage_key ||
+        stagedUpload.contentType !== upload.content_type ||
+        stagedUpload.sizeBytes !== upload.size_bytes ||
+        !stagedUpload.checksumSha256
+    ) {
+        throw new ConflictError("Upload token is no longer active.");
     }
 
     const existing = await findLatestArtifactByKind({

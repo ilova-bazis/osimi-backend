@@ -120,6 +120,8 @@ To support outbound-only workers and avoid race conditions, ingestion processing
 - `worker_id` is optional metadata provided by the worker; it may be dynamic per process run
 - VPS may issue a targeted lease for a specific ingestion via `POST /api/ingestions/:id/lease` for deterministic recovery
 - Targeted lease requests must not steal active leases; active lease conflicts return non-success
+- Lease payload validation, the `PROCESSING` transition, and lease creation are atomic. If a queued ingestion cannot produce a valid worker payload, it remains `QUEUED` with no active lease.
+- Releasing a lease and returning its `PROCESSING` ingestion to `QUEUED` are atomic.
 
 ### Lease Model
 
@@ -446,6 +448,10 @@ Purpose: allow the private worker to report ingestion progress and outcomes to t
 - Ordering is best-effort and not guaranteed
 - VPS must reject events without a valid lease
 - VPS must reject conflicting object identity for the same ingestion
+- Each event reservation and every database projection derived from it commit atomically.
+- Deduplication happens before event-derived writes; exact duplicates perform no projection writes.
+- Reusing an `event_id` with a different event type, scope, object identity, or payload is rejected.
+- A batched request commits each event independently; a later failed event does not roll back earlier events.
 
 #### Storage
 
@@ -599,11 +605,13 @@ Backend must expose a storage interface supporting:
 ### Signed URL Policy
 
 - Upload URLs are issued per file and are valid for 60 minutes
-- Upload URLs are `PUT` only and scoped to a specific staging key
+- Upload URLs are `PUT` only and scoped to a unique, immutable staging key
 - Upload requests must include `Content-Type` and `Content-Length`
-- Upload commit requires a SHA-256 checksum; backend verifies integrity
-- Upload URLs are reusable for the same file/key until expiry
-- Re-presign is allowed for the same file if a URL expires mid-upload
+- Uploads are streamed to a temporary file, bounded by the signed byte count and configured maximum, then atomically promoted without overwriting an existing object
+- Upload commit requires a SHA-256 checksum; backend persists and verifies integrity
+- A retry using the active URL may repeat only identical bytes; a conflicting body is rejected
+- Re-presign is allowed before commit, creates a new key and token, and invalidates the prior URL
+- Upload URLs cannot be used after the file or artifact is committed
 - Worker download URLs are issued only with a valid lease
 - Worker download URLs are `GET` only, valid for 5 minutes, and refreshable on heartbeat
 - URL issuance must be audited (who, what, when, TTL)
@@ -630,8 +638,8 @@ tenants/{tenant}/objects/{object_id}/artifacts/
 
 - Lease exclusivity: only one worker can lease a batch at a time (race-safe)
 - Lease expiry: expired leases re-queue correctly and are picked up by another worker
-- Signed URL constraints: method, TTL, content-type, and content-length are enforced
-- Integrity checks: SHA-256 validation on upload commit and worker re-download
+- Signed URL constraints: method, TTL, content-type, content-length, active token, and maximum size are enforced
+- Integrity checks: SHA-256 is streamed and persisted before upload commit and worker re-download
 - Event ingestion: idempotent `event_id` handling and tolerance to out-of-order delivery
 - Staging retention: purge rules per state and stuck-attention alerts are triggered
 - Auth/tenant scoping: all endpoints enforce tenant isolation and role permissions

@@ -1,5 +1,4 @@
-import { mkdir, rm } from "node:fs/promises";
-import { dirname } from "node:path";
+import { rm } from "node:fs/promises";
 
 import {
   ConflictError,
@@ -23,6 +22,8 @@ import {
   markIngestionFilePreviewReady,
   markIngestionFilePreviewUnsupported,
   markIngestionFileUploaded,
+  prepareIngestionFileUpload,
+  recordIngestionFileUpload,
   updateIngestionDetails,
   updateIngestionFileProcessingOverrides,
   updateIngestionPreviewUpload,
@@ -39,12 +40,14 @@ import {
 import type { AuthenticatedContext } from "../auth/guards.ts";
 import {
   buildIngestionPreviewStorageKey,
-  buildStagingStorageKey,
+  buildIngestionUploadStorageKey,
   createDownloadToken,
   createUploadToken,
   parseUploadToken,
   resolveStagingPath,
 } from "../storage/staging.ts";
+import { parseContentLength, streamUploadToImmutablePath } from "../storage/upload.ts";
+import { resolveMaxUploadSizeBytes } from "../runtime/config.ts";
 import { parseIngestionSummary } from "../validation/catalog.ts";
 import {
   EXTENSION_ALLOWLIST,
@@ -646,6 +649,14 @@ export async function createPresignedUpload(params: {
   body: CreatePresignedUploadBody;
 }): Promise<CreatePresignedUploadResponse> {
   const payload = params.body;
+  const maxUploadSizeBytes = resolveMaxUploadSizeBytes();
+
+  if ("size_bytes" in payload && payload.size_bytes > maxUploadSizeBytes) {
+    throw new ValidationError("File size exceeds the configured upload limit.", {
+      max_upload_size_bytes: maxUploadSizeBytes,
+    });
+  }
+
   let ingestion = requireIngestion(
     await findIngestionById(params.auth.tenantId, params.ingestionId),
     params.ingestionId,
@@ -670,6 +681,7 @@ export async function createPresignedUpload(params: {
   let contentType: string;
   let sizeBytes: number;
   let storageKey: string;
+  const uploadTokenId = crypto.randomUUID();
 
   if ("file_id" in payload) {
     const existingFile = await findIngestionFileById({
@@ -701,16 +713,44 @@ export async function createPresignedUpload(params: {
     filename = existingFile.filename;
     contentType = existingFile.contentType;
     sizeBytes = existingFile.sizeBytes;
-    storageKey = existingFile.storageKey;
+
+    if (sizeBytes > maxUploadSizeBytes) {
+      throw new ValidationError("File size exceeds the configured upload limit.", {
+        max_upload_size_bytes: maxUploadSizeBytes,
+      });
+    }
+
+    storageKey = buildIngestionUploadStorageKey({
+      tenantId: params.auth.tenantId,
+      ingestionId: params.ingestionId,
+      fileId,
+      uploadTokenId,
+      filename,
+    });
+
+    const prepared = await prepareIngestionFileUpload({
+      tenantId: params.auth.tenantId,
+      ingestionId: params.ingestionId,
+      fileId,
+      storageKey,
+      uploadTokenId,
+    });
+
+    if (!prepared) {
+      throw new ConflictError("Cannot re-presign a file that is no longer pending.", {
+        file_id: fileId,
+      });
+    }
   } else {
     filename = payload.filename;
     contentType = payload.content_type;
     sizeBytes = payload.size_bytes;
     fileId = crypto.randomUUID();
-    storageKey = buildStagingStorageKey({
+    storageKey = buildIngestionUploadStorageKey({
       tenantId: params.auth.tenantId,
       ingestionId: params.ingestionId,
       fileId,
+      uploadTokenId,
       filename,
     });
 
@@ -721,6 +761,13 @@ export async function createPresignedUpload(params: {
       contentType,
       sizeBytes,
       storageKey,
+      uploadTokenId,
+    });
+  }
+
+  if (sizeBytes > maxUploadSizeBytes) {
+    throw new ValidationError("File size exceeds the configured upload limit.", {
+      max_upload_size_bytes: maxUploadSizeBytes,
     });
   }
 
@@ -735,6 +782,8 @@ export async function createPresignedUpload(params: {
 
   const expiresAt = new Date(Date.now() + ONE_HOUR_MS);
   const token = createUploadToken({
+    purpose: "ingestion_original",
+    upload_token_id: uploadTokenId,
     ingestion_id: params.ingestionId,
     file_id: fileId,
     tenant_id: params.auth.tenantId,
@@ -825,35 +874,27 @@ export async function commitUploadedFile(params: {
     }
   }
 
-  const stagingPath = resolveStagingPath(file.storageKey);
-  const uploadedFile = Bun.file(stagingPath);
-
-  if (!(await uploadedFile.exists())) {
+  if (!file.uploadChecksumSha256) {
     throw new ConflictError("Staged file was not uploaded yet.", {
       file_id: fileId,
     });
   }
 
-  const bytes = await uploadedFile.bytes();
+  const uploadedFile = Bun.file(resolveStagingPath(file.storageKey));
 
-  if (bytes.byteLength !== file.sizeBytes) {
+  if (!(await uploadedFile.exists())) {
     throw new ConflictError(
-      "Uploaded file size does not match presigned metadata.",
+      "Staged file was not uploaded yet.",
       {
-        expected_size_bytes: file.sizeBytes,
-        actual_size_bytes: bytes.byteLength,
+        file_id: fileId,
       },
     );
   }
 
-  const actualChecksum = new Bun.CryptoHasher("sha256")
-    .update(bytes)
-    .digest("hex");
-
-  if (actualChecksum !== checksumSha256) {
+  if (file.uploadChecksumSha256 !== checksumSha256) {
     throw new ConflictError("Uploaded file checksum mismatch.", {
       expected_checksum_sha256: checksumSha256,
-      actual_checksum_sha256: actualChecksum,
+      actual_checksum_sha256: file.uploadChecksumSha256,
     });
   }
 
@@ -1127,13 +1168,17 @@ export async function presignIngestionPreviewUpload(params: {
   const contentType = normalizePreviewOutputContentType(params.body.content_type);
   assertPreviewSizeAllowed(params.body.size_bytes);
   const expiresAt = new Date(Date.now() + ONE_HOUR_MS).toISOString();
+  const uploadTokenId = crypto.randomUUID();
   const storageKey = buildIngestionPreviewStorageKey({
     tenantId: preview.tenantId,
     ingestionId: preview.ingestionId,
     fileId: preview.fileId,
+    uploadTokenId,
     extension: previewExtensionFromContentType(contentType),
   });
   const uploadToken = createUploadToken({
+    purpose: "ingestion_preview",
+    upload_token_id: uploadTokenId,
     ingestion_id: preview.ingestionId,
     file_id: preview.fileId,
     tenant_id: preview.tenantId,
@@ -1149,6 +1194,7 @@ export async function presignIngestionPreviewUpload(params: {
     workerId: params.workerId,
     storageKey,
     contentType,
+    uploadTokenId,
   });
 
   if (!updated) {
@@ -1190,7 +1236,8 @@ export async function completeIngestionPreview(params: {
   if (
     upload.ingestion_id !== preview.ingestionId ||
     upload.file_id !== preview.fileId ||
-    upload.tenant_id !== preview.tenantId
+    upload.tenant_id !== preview.tenantId ||
+    upload.upload_token_id !== preview.previewUploadTokenId
   ) {
     throw new ValidationError("Upload token does not match claimed preview context.");
   }
@@ -1207,6 +1254,7 @@ export async function completeIngestionPreview(params: {
     storageKey: upload.storage_key,
     contentType: upload.content_type,
     sizeBytes: upload.size_bytes,
+    uploadTokenId: upload.upload_token_id,
     width: params.body.width,
     height: params.body.height,
   });
@@ -1496,6 +1544,13 @@ export async function uploadFileBySignedToken(params: {
   request: Request;
 }): Promise<UploadFileBySignedTokenResponse> {
   const token = parseUploadToken(params.uploadToken);
+  const maxUploadSizeBytes = resolveMaxUploadSizeBytes();
+
+  if (token.size_bytes > maxUploadSizeBytes) {
+    throw new ValidationError("Upload size exceeds the configured upload limit.", {
+      max_upload_size_bytes: maxUploadSizeBytes,
+    });
+  }
   const requestContentType = params.request.headers
     .get("content-type")
     ?.split(";")[0]
@@ -1515,7 +1570,7 @@ export async function uploadFileBySignedToken(params: {
     );
   }
 
-  const contentLength = Number.parseInt(rawContentLength, 10);
+  const contentLength = parseContentLength(rawContentLength);
 
   if (!Number.isFinite(contentLength) || contentLength !== token.size_bytes) {
     throw new ValidationError(
@@ -1523,17 +1578,68 @@ export async function uploadFileBySignedToken(params: {
     );
   }
 
-  const bodyBytes = new Uint8Array(await params.request.arrayBuffer());
-
-  if (bodyBytes.byteLength !== token.size_bytes) {
-    throw new ValidationError(
-      "Upload body size does not match signed URL constraints.",
-    );
-  }
-
   const destinationPath = resolveStagingPath(token.storage_key);
-  await mkdir(dirname(destinationPath), { recursive: true });
-  await Bun.write(destinationPath, bodyBytes);
+
+  if (token.purpose === "ingestion_preview") {
+    const file = await findIngestionFileById({
+      tenantId: token.tenant_id,
+      ingestionId: token.ingestion_id,
+      fileId: token.file_id,
+    });
+
+    if (
+      !file ||
+      file.previewStatus !== "processing" ||
+      file.previewStorageKey !== token.storage_key ||
+      file.previewContentType !== token.content_type ||
+      file.previewUploadTokenId !== token.upload_token_id
+    ) {
+      throw new ConflictError("Upload token is no longer active.");
+    }
+
+    await streamUploadToImmutablePath({
+      body: params.request.body,
+      destinationPath,
+      expectedSizeBytes: token.size_bytes,
+      maxSizeBytes: Math.min(maxUploadSizeBytes, MAX_INGESTION_PREVIEW_SIZE_BYTES),
+    });
+  } else {
+    const file = await findIngestionFileById({
+      tenantId: token.tenant_id,
+      ingestionId: token.ingestion_id,
+      fileId: token.file_id,
+    });
+
+    if (
+      !file ||
+      file.status !== "PENDING" ||
+      file.storageKey !== token.storage_key ||
+      file.contentType !== token.content_type ||
+      file.sizeBytes !== token.size_bytes ||
+      file.uploadTokenId !== token.upload_token_id
+    ) {
+      throw new ConflictError("Upload token is no longer active.");
+    }
+
+    const inspection = await streamUploadToImmutablePath({
+      body: params.request.body,
+      destinationPath,
+      expectedSizeBytes: token.size_bytes,
+      maxSizeBytes: maxUploadSizeBytes,
+    });
+    const recorded = await recordIngestionFileUpload({
+      tenantId: token.tenant_id,
+      ingestionId: token.ingestion_id,
+      fileId: token.file_id,
+      storageKey: token.storage_key,
+      uploadTokenId: token.upload_token_id,
+      checksumSha256: inspection.checksumSha256,
+    });
+
+    if (!recorded) {
+      throw new ConflictError("Upload token is no longer active.");
+    }
+  }
 
   return {
     status: "ok",
