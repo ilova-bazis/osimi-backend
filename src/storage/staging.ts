@@ -103,6 +103,13 @@ export function buildIngestionPreviewStorageKey(params: {
   return `tenants/${params.tenantId}/ingestions/${params.ingestionId}/preview/${params.fileId}/uploads/${params.uploadTokenId}.${safeExtension || "bin"}`;
 }
 
+export function buildIngestionStagingDirectory(params: {
+  tenantId: string;
+  ingestionId: string;
+}): string {
+  return `tenants/${params.tenantId}/ingestions/${params.ingestionId}`;
+}
+
 export function buildObjectArtifactStorageKey(params: {
   tenantId: string;
   objectId: string;

@@ -9,6 +9,7 @@ import {
     type AccessReasonCode,
 } from "../domain/objects/access-policy.ts";
 import type { AuthenticatedContext } from "../auth/guards.ts";
+import { requireObjectEditAccess } from "./object-edit-authorization.ts";
 import {
     createObjectAccessRequest,
     findPendingObjectAccessRequestForUser,
@@ -127,6 +128,7 @@ import {
     type UpsertAccessAssignmentBody,
     type UpsertAccessAssignmentResponse,
 } from "../validation/object.ts";
+import { ifRangeMatches, parseSingleByteRange } from "../http/range.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
 
 const DEFAULT_DOWNLOAD_REQUEST_LEASE_TTL_SECONDS = 60 * 5;
@@ -2583,6 +2585,11 @@ export async function patchObjectTitleForTenant(params: {
     objectId: string;
     body: PatchObjectTitleBody;
 }): Promise<PatchObjectTitleResponse> {
+    await requireObjectEditAccess({
+        auth: params.auth,
+        objectId: params.objectId,
+    });
+
     const updated = await updateObjectTitle({
         tenantId: params.auth.tenantId,
         objectId: params.objectId,
@@ -2634,6 +2641,8 @@ export async function viewObjectArtifactForTenant(params: {
     auth: AuthenticatedContext;
     objectId: string;
     artifactId: string;
+    rangeHeader: string | null;
+    ifRangeHeader: string | null;
 }): Promise<Response> {
     const objectRecord = await findObjectById({
         tenantId: params.auth.tenantId,
@@ -2708,12 +2717,43 @@ export async function viewObjectArtifactForTenant(params: {
         );
     }
 
+    const etag = `"artifact-${artifact.id}"`;
+    const headers = {
+        "content-type": artifact.contentType,
+        "content-disposition": `inline; filename=artifact-${artifact.id}`,
+        "accept-ranges": "bytes",
+        etag,
+        "last-modified": artifact.createdAt.toUTCString(),
+    };
+    const range = parseSingleByteRange(params.rangeHeader, artifact.sizeBytes);
+
+    if (range.kind === "unsatisfiable") {
+        return new Response(null, {
+            status: 416,
+            headers: {
+                ...headers,
+                "content-range": `bytes */${artifact.sizeBytes}`,
+            },
+        });
+    }
+
+    if (range.kind === "range" && ifRangeMatches(params.ifRangeHeader, etag, artifact.createdAt)) {
+        const length = range.range.end - range.range.start + 1;
+        return new Response(file.slice(range.range.start, range.range.end + 1, artifact.contentType), {
+            status: 206,
+            headers: {
+                ...headers,
+                "content-length": String(length),
+                "content-range": `bytes ${range.range.start}-${range.range.end}/${artifact.sizeBytes}`,
+            },
+        });
+    }
+
     return new Response(file, {
         status: 200,
         headers: {
-            "content-type": artifact.contentType,
+            ...headers,
             "content-length": String(artifact.sizeBytes),
-            "content-disposition": `inline; filename=artifact-${artifact.id}`,
         },
     });
 }

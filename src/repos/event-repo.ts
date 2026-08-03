@@ -36,6 +36,7 @@ interface ObjectEventRow {
     ingestion_id: string | null;
     ingestion_item_id: string | null;
     object_id: string | null;
+    event_object_id: string | null;
     payload: Record<string, unknown>;
     actor_user_id: string | null;
     created_at: Date;
@@ -43,7 +44,7 @@ interface ObjectEventRow {
 
 export type ReserveObjectEventResult =
     | { status: "inserted"; id: string }
-    | { status: "duplicate" }
+    | { status: "duplicate"; objectId?: string }
     | { status: "conflict" };
 
 function stableStringify(value: unknown): string {
@@ -84,6 +85,7 @@ export async function reserveObjectEventWithExecutor(
         ingestion_id,
         ingestion_item_id,
         object_id,
+        event_object_id,
         payload,
         actor_user_id,
         created_at
@@ -96,6 +98,7 @@ export async function reserveObjectEventWithExecutor(
         ${params.ingestionId ?? null},
         ${params.ingestionItemId ?? null},
         ${null},
+        ${params.objectId ?? null},
         ${params.payload},
         ${params.actorUserId ?? null},
         ${params.createdAt.toISOString()}
@@ -110,7 +113,7 @@ export async function reserveObjectEventWithExecutor(
     }
 
     const existingRows = await executor<ObjectEventRow[]>`
-      SELECT id, tenant_id, type, ingestion_id, ingestion_item_id, object_id,
+       SELECT id, tenant_id, type, ingestion_id, ingestion_item_id, object_id, event_object_id,
              payload, actor_user_id, created_at
       FROM object_events
       WHERE event_id = ${params.eventId}
@@ -126,10 +129,13 @@ export async function reserveObjectEventWithExecutor(
         existing.type === params.type &&
         existing.ingestion_id === (params.ingestionId ?? null) &&
         existing.ingestion_item_id === (params.ingestionItemId ?? null) &&
-        existing.object_id === (params.objectId ?? null) &&
-        stableStringify(existing.payload) === stableStringify(params.payload);
+        existing.event_object_id === (params.objectId ?? null) &&
+        stableStringify(existing.payload) === stableStringify(params.payload) &&
+        new Date(existing.created_at).getTime() === params.createdAt.getTime();
 
-    return hasMatchingEnvelope ? { status: "duplicate" } : { status: "conflict" };
+    return hasMatchingEnvelope
+        ? { status: "duplicate", objectId: existing.object_id ?? undefined }
+        : { status: "conflict" };
 }
 
 export async function finalizeObjectEventWithExecutor(

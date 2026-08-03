@@ -64,16 +64,26 @@ function parseTenantId(rawValue: string | undefined): string | undefined {
   return rawValue;
 }
 
-async function buildRequestContext(request: Request, requestId: string): Promise<RequestContext> {
-  const tenantHeader = parseTenantId(normalizeHeaderValue(request.headers.get(TENANT_ID_HEADER)));
-  const principal = await resolvePrincipalFromRequest(request, createAuthAuditContext(request, requestId));
+async function buildRequestContext(
+  request: Request,
+  requestId: string,
+  skipAuth: boolean,
+): Promise<RequestContext> {
+  const tenantHeader = skipAuth
+    ? undefined
+    : parseTenantId(normalizeHeaderValue(request.headers.get(TENANT_ID_HEADER)));
+  const principal = skipAuth
+    ? undefined
+    : await resolvePrincipalFromRequest(request, createAuthAuditContext(request, requestId));
 
   if (principal && tenantHeader && tenantHeader !== principal.tenantId) {
     throw new ForbiddenError("Header 'x-tenant-id' does not match the authenticated session tenant.");
   }
 
   const tenantId = principal?.tenantId ?? tenantHeader;
-  const idempotencyKey = parseIdempotencyKey(request.headers.get(IDEMPOTENCY_KEY_HEADER));
+  const idempotencyKey = skipAuth
+    ? undefined
+    : parseIdempotencyKey(request.headers.get(IDEMPOTENCY_KEY_HEADER));
   const url = new URL(request.url);
 
   return {
@@ -90,7 +100,11 @@ async function buildRequestContext(request: Request, requestId: string): Promise
   };
 }
 
-export async function withRequestContext(request: Request, handler: ContextHandler): Promise<Response> {
+export async function withRequestContext(
+  request: Request,
+  handler: ContextHandler,
+  options: { skipAuth?: boolean } = {},
+): Promise<Response> {
   const fallbackRequestId: string = crypto.randomUUID();
   let requestId: string = fallbackRequestId;
   const startedAt = performance.now();
@@ -122,7 +136,7 @@ export async function withRequestContext(request: Request, handler: ContextHandl
   }
 
   try {
-    const context = await buildRequestContext(request, requestId);
+    const context = await buildRequestContext(request, requestId, options.skipAuth ?? false);
     const response = await handler(context);
 
     if (!(response instanceof Response)) {

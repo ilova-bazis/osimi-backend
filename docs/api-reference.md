@@ -48,7 +48,7 @@ On non-2xx responses, JSON errors follow this shape:
 
 `error.details` is optional and included only when provided by the server.
 
-Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NOT_ALLOWED`, `CONFLICT`, `REVISION_CONFLICT`, `LOCKED`, `VALIDATION_FAILED`, `CONFIGURATION_ERROR`, `INTERNAL_SERVER_ERROR`.
+Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NOT_ALLOWED`, `CONFLICT`, `REVISION_CONFLICT`, `LOCKED`, `VALIDATION_FAILED`, `SERVICE_UNAVAILABLE`, `CONFIGURATION_ERROR`, `INTERNAL_SERVER_ERROR`.
 
 ---
 
@@ -57,9 +57,26 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 ### GET `/healthz`
 
 - Auth: none
-- Returns service health.
+- Process liveness only; it does not check configuration, database connectivity,
+  migrations, or shutdown state.
 - 200 response:
   - `status`, `service`, `request_id`, `timestamp`
+
+### GET `/readyz`
+
+- Auth: none. Probe requests ignore bearer, tenant, and idempotency headers.
+- Returns deployment readiness for lifecycle state, required configuration,
+  PostgreSQL connectivity, and exact migration history.
+- 200 response: `status = "ready"`, `service`, `request_id`, `timestamp`, and
+  `checks[]` with `name` and `ready`.
+- 503 response: `status = "not_ready"` and `checks[]`; failed checks include a
+  non-sensitive `reason` such as `draining`, `configuration_invalid`,
+  `database_unavailable`, `check_timed_out`, `migrations_pending`,
+  `migration_checksum_mismatch`, or `unknown_migration`.
+- Readiness is false during shutdown draining. It performs no migration DDL or
+  writes.
+- Once draining begins, newly dispatched non-probe requests return
+  `503 SERVICE_UNAVAILABLE` without invoking application handlers.
 
 ### PUT `/api/uploads/:token`
 
@@ -243,6 +260,12 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - `logical_label` (string, nullable)
 - `created_at` (ISO timestamp string)
 
+### Ingestion Request Idempotency
+
+- `POST /api/ingestions`, `POST /api/ingestions/:id/files/presign`, `POST /api/ingestions/:id/files/commit`, `POST /api/ingestions/:id/submit`, and `POST /api/ingestions/:id/retry` accept an optional `x-idempotency-key` header.
+- A key is scoped to the authenticated tenant, actor, and endpoint. The same key with the same canonical request replays the original successful status and response body for seven days.
+- Reusing a key with a different request returns `409 CONFLICT`. Failed requests are not retained as successful replays.
+
 ### POST `/api/ingestions`
 
 - Auth: Bearer token
@@ -323,6 +346,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - preview behavior:
     - image and video uploads return `preview.status = pending` after commit until a worker-generated thumbnail preview is uploaded back to VPS staging
     - unsupported media return `preview.status = unsupported`
+    - retention-purged staged previews return `preview.status = purged`
     - `preview.url` is populated only when `preview.status = ready`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:id` format
@@ -338,6 +362,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - Preconditions:
   - ingestion file exists in tenant scope
   - `preview.status = ready`
+  - retention-purged previews are unavailable
 - 200 response:
   - raw preview bytes with preview `Content-Type`
 - Notes:
@@ -501,6 +526,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `title` (optional string or `null`)
   - `description` (optional string or `null`; stored in `summary.classification.summary`)
   - `tags` (optional string[]; normalized and de-duplicated)
+  - `people` (optional string[]; stored as `summary.people.mentioned`)
   - `dates` (optional object):
     - `published` and/or `created` (partial patch allowed)
       - `value` (YYYY, YYYY-MM, YYYY-MM-DD, or `null`)
@@ -509,6 +535,8 @@ Ingestion response shapes in this section are authoritative with `src/validation
       - `note` (string or `null`)
 - Semantics:
   - merges into existing item `summary`; unspecified fields are preserved
+  - `people` entries are trimmed, blank entries are rejected, and duplicates are removed in first-seen order
+  - a supplied `people` array replaces only `summary.people.mentioned`; empty arrays clear it while preserving `authors`, `contributors`, `subjects`, and unrelated summary fields
 - Preconditions:
   - ingestion status is `DRAFT`, `UPLOADING`, or `CANCELED`
   - ingestion has no active lease
@@ -740,8 +768,10 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - Auth: Bearer token
 - Roles: `archiver`, `admin`
 - Preconditions:
-  - at least one file exists
-  - at least one file is committed (`UPLOADED` or `VALIDATED`)
+  - at least one item and one file exist
+  - every file is committed (`UPLOADED` or `VALIDATED`)
+  - every item has at least one linked file
+  - every committed file is linked to an item
   - status transition to `QUEUED` must be allowed by ingestion state machine
 - 200 response:
   - `ingestion` (status transitions to queued flow)
@@ -1321,6 +1351,10 @@ Example response:
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
 
+### Object Editing Authorization
+
+The object editing endpoints below apply both their listed role requirement and object access policy. For non-admin users, `public` objects require no assignment, `family` objects require a `family` or `private` assignment, and `private` objects require a `private` assignment. Embargo and artifact availability do not limit editing. In-tenant policy denial returns `403 FORBIDDEN`; missing or cross-tenant objects return `404 NOT_FOUND`.
+
 ### PATCH `/api/objects/:object_id`
 
 - Auth: Bearer token
@@ -1449,7 +1483,7 @@ Example response:
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when object does not exist in tenant scope
-  - `423 LOCKED` when another user holds the edit lock (returned with current lock info in response body)
+  - when another user holds the edit lock, returns `200` with current lock information and all edit capabilities set to `false`
 
 ### PATCH `/api/objects/:object_id/metadata`
 
@@ -1458,6 +1492,7 @@ Example response:
 - Purpose:
   - updates backend-managed first-class object editing metadata and rights notes
 - Body:
+  - `revision` (required non-negative integer from `GET /edit`)
   - `metadata`:
     - `title` (required non-empty string)
     - `publication_date` (required string; normalized to `""` when `date_precision = none`)
@@ -1474,6 +1509,7 @@ Example response:
 
 ```json
 {
+  "revision": 1,
   "metadata": {
     "title": "Edited Metadata Title",
     "publication_date": "1987-06-14",
@@ -1587,6 +1623,7 @@ Example response:
 - Purpose:
   - saves curated OCR text page-by-page for one document object
 - Body:
+  - `revision` (required non-negative integer from `GET /edit`)
   - `pages[]` (required, non-empty):
     - `page_number` (required positive integer)
     - `curated_text` (required string; may be empty)
@@ -1599,6 +1636,7 @@ Example response:
 
 ```json
 {
+  "revision": 1,
   "pages": [
     {
       "page_number": 1,
@@ -1659,6 +1697,7 @@ Example response:
   - submits current OCR curation state for archive-side apply
   - creates a `curation_apply` archive request with archive-compatible payload
 - Body:
+  - `revision` (required non-negative integer from `GET /edit`)
   - `review_note` (nullable string)
 - Rules:
   - currently supported for document OCR curation only
@@ -1670,6 +1709,7 @@ Example response:
 
 ```json
 {
+  "revision": 2,
   "review_note": "Ready for archive apply."
 }
 ```
@@ -1966,8 +2006,12 @@ Worker-only object endpoints are documented in `## Worker APIs`:
   - frontend should use this endpoint for inline viewing/playback, not the download endpoint
 - 200 response:
   - Binary file response
-  - headers include `content-type`, `content-length`, `content-disposition: inline`
-  - current implementation returns full-file `200 OK` responses (no `Range`/`206 Partial Content` support yet)
+  - headers include `content-type`, `content-length`, `content-disposition: inline`, `accept-ranges: bytes`, `etag`, and `last-modified`
+  - accepts a single `Range` header in `bytes=start-end`, `bytes=start-`, or `bytes=-suffixLength` form
+  - valid ranges return `206 Partial Content` with `content-range`
+  - multiple or malformed ranges are ignored and return the normal full-file `200 OK` response
+  - `If-Range` permits a range only when its strong ETag or HTTP date matches the current artifact; otherwise the response is a full-file `200 OK`
+  - unsatisfiable ranges return `416 Range Not Satisfiable` with `content-range: bytes */total`
 - Browser-viewable MIME families:
   - `application/pdf`, `text/html`, `text/plain`, `image/*`, `audio/*`, `video/*`
 - Error behavior:
@@ -2259,21 +2303,23 @@ Integration guides for archive worker teams:
       - `ARTIFACT_CREATED`
     - `timestamp` (ISO datetime string with offset)
     - `payload` (JSON object)
-    - `ingestion_item_id` (required for `INGESTION_ITEM_*` events)
-    - `object_id` (required for `INGESTION_ITEM_COMPLETED|OBJECT_CREATED|ARTIFACT_CREATED`; optional for other event types, including `INGESTION_COMPLETED` and `INGESTION_FAILED`; when present must match object id format)
+    - `ingestion_item_id` (required for `INGESTION_ITEM_*` events; not allowed for aggregate `INGESTION_COMPLETED`)
+    - `object_id` (required for `INGESTION_ITEM_COMPLETED|OBJECT_CREATED|ARTIFACT_CREATED`; not allowed for aggregate `INGESTION_COMPLETED`; when present must match object id format)
 - Behavior:
   - idempotent by `event_id`
   - an exact duplicate performs no additional projection writes; conflicting reuse of an `event_id` returns `409 CONFLICT`
   - each event and its database projections commit atomically; earlier events in a batch remain committed if a later event fails
   - out-of-order tolerant
-  - completion event creates or resolves object by source ingestion
+  - `INGESTION_ITEM_COMPLETED` creates or resolves the object for its `ingestion_item_id`, updates its readiness state, and stores a valid `payload.ingest_json` manifest.
+  - `INGESTION_COMPLETED` is an aggregate signal only. It creates no object and does not update an individual object projection.
   - state projection rules (current phase):
-    - `INGESTION_COMPLETED` updates object projection to `processing_state = index_done` and `availability_state = AVAILABLE`
+    - aggregate ingestion status becomes terminal only when all items are terminal
+    - completed/skipped-only items yield `COMPLETED`; completed plus failed yields `COMPLETED_WITH_ERRORS`; failed-only or failed-plus-skipped yields `FAILED`
     - `curation_state` is not currently projected from worker event stream in this phase
     - other event types are stored for audit/activity and do not currently mutate object projection fields directly
-  - `payload.ingest_json` (when provided and valid object) updates `objects.ingest_manifest` (last-write-wins)
+  - item completion `payload.ingest_json` (when valid) updates that item's `objects.ingest_manifest` (last-write-wins)
 - 200 response:
-  - `status`, `ingestion_id`, `inserted_events`, `duplicate_events`, `object_id` (`string|null`)
+  - `status`, `ingestion_id`, `inserted_events`, `duplicate_events`, `object_ids` (`string[]`, item-scoped IDs represented by this request)
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:id` format or invalid body/event schema
   - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token

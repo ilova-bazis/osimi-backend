@@ -192,8 +192,9 @@ export async function createIngestionItem(params: {
     languageCode?: string;
     title?: string;
     summary?: JsonObject;
-}): Promise<IngestionItemRecord> {
-    const rows = await withSchemaClient(async (sql) => {
+    executor?: SqlExecutor;
+}): Promise<IngestionItemRecord | undefined> {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<IngestionItemRow[]>`
       INSERT INTO ingestion_items (
         id,
@@ -237,7 +238,8 @@ export async function createIngestionItem(params: {
     `;
     });
 
-    return mapIngestionItem(rows[0]!);
+    const row = rows[0];
+    return row ? mapIngestionItem(row) : undefined;
 }
 
 export async function findIngestionItemById(params: {
@@ -316,8 +318,9 @@ export async function updateIngestionItem(params: {
     languageCode?: string;
     title?: string | null;
     summary?: JsonObject;
+    executor?: SqlExecutor;
 }): Promise<IngestionItemRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<IngestionItemRow[]>`
       UPDATE ingestion_items item
       SET classification_type = COALESCE(
@@ -368,9 +371,11 @@ export async function reorderIngestionItems(params: {
         ingestionItemId: string;
         itemIndex: number;
     }>;
+    executor?: SqlExecutor;
 }): Promise<IngestionItemRecord[]> {
-    return withSchemaClient(async (sql) => {
-        return sql.begin(async (transaction) => {
+    const reorder = async (
+        transaction: SqlExecutor,
+    ): Promise<IngestionItemRecord[]> => {
             const existingRows = await transaction<Array<{ id: string }>>`
         SELECT item.id
         FROM ingestion_items item
@@ -432,8 +437,13 @@ export async function reorderIngestionItems(params: {
       `;
 
             return rows.map(mapIngestionItem);
-        });
-    });
+    };
+
+    if (params.executor) {
+        return reorder(params.executor);
+    }
+
+    return withSchemaClient((sql) => sql.begin(reorder));
 }
 
 export async function setIngestionItemStatus(params: {
@@ -521,8 +531,9 @@ export async function createIngestionItemFile(params: {
     pageNumber?: number;
     isPrimary?: boolean;
     logicalLabel?: string;
-}): Promise<IngestionItemFileRecord> {
-    const rows = await withSchemaClient(async (sql) => {
+    executor?: SqlExecutor;
+}): Promise<IngestionItemFileRecord | undefined> {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<IngestionItemFileRow[]>`
       INSERT INTO ingestion_item_files (
         id,
@@ -565,7 +576,8 @@ export async function createIngestionItemFile(params: {
     `;
     });
 
-    return mapIngestionItemFile(rows[0]!);
+    const row = rows[0];
+    return row ? mapIngestionItemFile(row) : undefined;
 }
 
 export async function listIngestionItemFiles(params: {
@@ -607,9 +619,11 @@ export async function reorderIngestionItemFiles(params: {
         ingestionFileId: string;
         sortOrder: number;
     }>;
+    executor?: SqlExecutor;
 }): Promise<IngestionItemFileRecord[]> {
-    return withSchemaClient(async (sql) => {
-        return sql.begin(async (transaction) => {
+    const reorder = async (
+        transaction: SqlExecutor,
+    ): Promise<IngestionItemFileRecord[]> => {
             const existingRows = await transaction<
                 Array<{ ingestion_file_id: string }>
             >`
@@ -676,8 +690,13 @@ export async function reorderIngestionItemFiles(params: {
       `;
 
             return rows.map(mapIngestionItemFile);
-        });
-    });
+    };
+
+    if (params.executor) {
+        return reorder(params.executor);
+    }
+
+    return withSchemaClient((sql) => sql.begin(reorder));
 }
 
 export async function listLeasedIngestionFiles(params: {

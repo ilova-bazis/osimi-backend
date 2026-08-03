@@ -33,6 +33,7 @@ interface IngestionRow {
   error_summary: JsonObject;
   created_at: Date;
   updated_at: Date;
+  staging_purge_started_at?: Date | null;
 }
 
 interface IngestionFileRow {
@@ -53,6 +54,7 @@ interface IngestionFileRow {
     | "ready"
     | "failed"
     | "unsupported"
+    | "purged"
     | null;
   preview_claimed_by: string | null;
   preview_claimed_at: Date | null;
@@ -88,6 +90,7 @@ export interface IngestionRecord {
   errorSummary: JsonObject;
   createdAt: Date;
   updatedAt: Date;
+  stagingPurgeStartedAt?: Date;
 }
 
 export interface IngestionWithCreatorRecord extends IngestionRecord {
@@ -106,7 +109,7 @@ export interface IngestionFileRecord {
   uploadTokenId?: string;
   uploadChecksumSha256?: string;
   previewUploadTokenId?: string;
-  previewStatus?: "pending" | "processing" | "ready" | "failed" | "unsupported";
+  previewStatus?: "pending" | "processing" | "ready" | "failed" | "unsupported" | "purged";
   previewClaimedBy?: string;
   previewClaimedAt?: Date;
   previewStorageKey?: string;
@@ -129,6 +132,12 @@ export interface StagingCleanupCandidate {
   updatedAt: Date;
   storageKey: string;
   previewStorageKey?: string;
+}
+
+export interface StagingPurgeClaim {
+  ingestionId: string;
+  tenantId: string;
+  claimToken: string;
 }
 
 export interface ClaimedIngestionPreviewRecord {
@@ -201,6 +210,9 @@ function mapIngestion(row: IngestionRow): IngestionRecord {
     errorSummary: row.error_summary,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
+    stagingPurgeStartedAt: row.staging_purge_started_at
+      ? new Date(row.staging_purge_started_at)
+      : undefined,
   };
 }
 
@@ -293,8 +305,9 @@ export async function createIngestion(params: {
   rightsNote?: string;
   sensitivityNote?: string;
   summary?: IngestionSummary;
+  executor?: SqlExecutor;
 }): Promise<IngestionRecord> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionRow[]>`
       INSERT INTO ingestions (
         id,
@@ -332,7 +345,7 @@ export async function createIngestion(params: {
       )
       RETURNING id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
         pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
-        created_at, updated_at
+        created_at, updated_at, staging_purge_started_at
     `;
   });
 
@@ -368,7 +381,7 @@ export async function findIngestionByIdForUpdate(
   const rows = await executor<IngestionRow[]>`
     SELECT id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
       pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
-      created_at, updated_at
+      created_at, updated_at, staging_purge_started_at
     FROM ingestions
     WHERE id = ${ingestionId}
       AND tenant_id = ${tenantId}
@@ -390,7 +403,7 @@ export async function listIngestions(params: {
       return await sql<IngestionRow[]>`
         SELECT id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
           pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
-          created_at, updated_at
+          created_at, updated_at, staging_purge_started_at
         FROM ingestions
         WHERE tenant_id = ${params.tenantId}
           AND (created_at, id) < (${params.cursorCreatedAt}::timestamptz, ${params.cursorId}::uuid)
@@ -461,8 +474,9 @@ export async function updateIngestionDetails(params: {
   hasEmbargoUntil: boolean;
   hasRightsNote: boolean;
   hasSensitivityNote: boolean;
+  executor?: SqlExecutor;
 }): Promise<IngestionRecord | undefined> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionRow[]>`
       UPDATE ingestions
       SET
@@ -525,14 +539,16 @@ export async function updateIngestionDetails(params: {
 
 export async function createIngestionFile(params: {
   id: string;
+  tenantId: string;
   ingestionId: string;
   filename: string;
   contentType: string;
   sizeBytes: number;
   storageKey: string;
   uploadTokenId: string;
-}): Promise<IngestionFileRecord> {
-  const rows = await withSchemaClient(async (sql) => {
+  executor?: SqlExecutor;
+}): Promise<IngestionFileRecord | undefined> {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionFileRow[]>`
       INSERT INTO ingestion_files (
         id,
@@ -544,22 +560,34 @@ export async function createIngestionFile(params: {
         upload_token_id,
         status
       )
-      VALUES (${params.id}, ${params.ingestionId}, ${params.filename}, ${params.contentType}, ${params.sizeBytes}, ${params.storageKey}, ${params.uploadTokenId}, 'PENDING')
-      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256, upload_token_id, upload_checksum_sha256,
-        preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
-        preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
+      SELECT ${params.id}, ${params.ingestionId}, ${params.filename}, ${params.contentType}, ${params.sizeBytes}, ${params.storageKey}, ${params.uploadTokenId}, 'PENDING'
+      WHERE EXISTS (
+        SELECT 1
+        FROM ingestions
+        WHERE id = ${params.ingestionId}
+          AND tenant_id = ${params.tenantId}
+      )
+      RETURNING ingestion_files.id, ingestion_files.ingestion_id, ingestion_files.filename, ingestion_files.content_type,
+        ingestion_files.size_bytes, ingestion_files.storage_key, ingestion_files.status, ingestion_files.checksum_sha256,
+        ingestion_files.upload_token_id, ingestion_files.upload_checksum_sha256, ingestion_files.preview_status,
+        ingestion_files.preview_claimed_by, ingestion_files.preview_claimed_at, ingestion_files.preview_storage_key,
+        ingestion_files.preview_content_type, ingestion_files.preview_size_bytes, ingestion_files.preview_width,
+        ingestion_files.preview_height, ingestion_files.preview_error, ingestion_files.preview_generated_at,
+        ingestion_files.processing_overrides, ingestion_files.error, ingestion_files.created_at, ingestion_files.updated_at
     `;
   });
 
-  return mapIngestionFile(rows[0]!);
+  const row = rows[0];
+  return row ? mapIngestionFile(row) : undefined;
 }
 
 export async function findIngestionFileById(params: {
   tenantId: string;
   ingestionId: string;
   fileId: string;
+  executor?: SqlExecutor;
 }): Promise<IngestionFileRecord | undefined> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionFileRow[]>`
       SELECT
         file.id,
@@ -603,8 +631,9 @@ export async function findIngestionFileById(params: {
 export async function listIngestionFiles(params: {
   tenantId: string;
   ingestionId: string;
+  executor?: SqlExecutor;
 }): Promise<IngestionFileRecord[]> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionFileRow[]>`
       SELECT
         file.id,
@@ -643,23 +672,32 @@ export async function listIngestionFiles(params: {
 }
 
 export async function markIngestionFileUploaded(params: {
+  tenantId: string;
   fileId: string;
   ingestionId: string;
   checksumSha256: string;
+  executor?: SqlExecutor;
 }): Promise<IngestionFileRecord | undefined> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionFileRow[]>`
       UPDATE ingestion_files
       SET status = 'UPLOADED',
           checksum_sha256 = ${params.checksumSha256},
           updated_at = now()
-      WHERE id = ${params.fileId}
-        AND ingestion_id = ${params.ingestionId}
-        AND status = 'PENDING'
-        AND upload_checksum_sha256 = ${params.checksumSha256}
-      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256, upload_token_id, upload_checksum_sha256,
-        preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
-        preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
+      FROM ingestions ing
+      WHERE ingestion_files.id = ${params.fileId}
+        AND ingestion_files.ingestion_id = ${params.ingestionId}
+        AND ing.id = ingestion_files.ingestion_id
+        AND ing.tenant_id = ${params.tenantId}
+        AND ingestion_files.status = 'PENDING'
+        AND ingestion_files.upload_checksum_sha256 = ${params.checksumSha256}
+      RETURNING ingestion_files.id, ingestion_files.ingestion_id, ingestion_files.filename, ingestion_files.content_type,
+        ingestion_files.size_bytes, ingestion_files.storage_key, ingestion_files.status, ingestion_files.checksum_sha256,
+        ingestion_files.upload_token_id, ingestion_files.upload_checksum_sha256, ingestion_files.preview_status,
+        ingestion_files.preview_claimed_by, ingestion_files.preview_claimed_at, ingestion_files.preview_storage_key,
+        ingestion_files.preview_content_type, ingestion_files.preview_size_bytes, ingestion_files.preview_width,
+        ingestion_files.preview_height, ingestion_files.preview_error, ingestion_files.preview_generated_at,
+        ingestion_files.processing_overrides, ingestion_files.error, ingestion_files.created_at, ingestion_files.updated_at
     `;
   });
 
@@ -673,8 +711,9 @@ export async function prepareIngestionFileUpload(params: {
   fileId: string;
   storageKey: string;
   uploadTokenId: string;
+  executor?: SqlExecutor;
 }): Promise<IngestionFileRecord | undefined> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionFileRow[]>`
       UPDATE ingestion_files file
       SET storage_key = ${params.storageKey},
@@ -706,8 +745,9 @@ export async function recordIngestionFileUpload(params: {
   storageKey: string;
   uploadTokenId: string;
   checksumSha256: string;
+  executor?: SqlExecutor;
 }): Promise<IngestionFileRecord | undefined> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionFileRow[]>`
       UPDATE ingestion_files file
       SET upload_checksum_sha256 = ${params.checksumSha256},
@@ -736,8 +776,9 @@ export async function deleteIngestionFile(params: {
   tenantId: string;
   ingestionId: string;
   fileId: string;
+  executor?: SqlExecutor;
 }): Promise<boolean> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<Array<{ id: string }>>`
       DELETE FROM ingestion_files file
       USING ingestions ing
@@ -755,8 +796,9 @@ export async function deleteIngestionFile(params: {
 export async function markIngestionFilePreviewPending(params: {
   ingestionId: string;
   fileId: string;
+  executor?: SqlExecutor;
 }): Promise<IngestionFileRecord | undefined> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionFileRow[]>`
       UPDATE ingestion_files
       SET preview_status = 'pending',
@@ -785,8 +827,9 @@ export async function markIngestionFilePreviewPending(params: {
 export async function markIngestionFilePreviewUnsupported(params: {
   ingestionId: string;
   fileId: string;
+  executor?: SqlExecutor;
 }): Promise<IngestionFileRecord | undefined> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionFileRow[]>`
       UPDATE ingestion_files
       SET preview_status = 'unsupported',
@@ -817,8 +860,9 @@ export async function updateIngestionFileProcessingOverrides(params: {
   ingestionId: string;
   fileId: string;
   processingOverrides: IngestionFileProcessingOverrides;
+  executor?: SqlExecutor;
 }): Promise<IngestionFileRecord | undefined> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<IngestionFileRow[]>`
       UPDATE ingestion_files file
       SET processing_overrides = ${params.processingOverrides},
@@ -843,8 +887,9 @@ export async function updateIngestionFileProcessingOverrides(params: {
 export async function deleteIngestion(params: {
   tenantId: string;
   ingestionId: string;
+  executor?: SqlExecutor;
 }): Promise<boolean> {
-  const rows = await withSchemaClient(async (sql) => {
+  const rows = await withExecutor(params.executor, async (sql) => {
     return await sql<Array<{ id: string }>>`
       DELETE FROM ingestions
       WHERE id = ${params.ingestionId}
@@ -892,6 +937,103 @@ export async function listStagingCleanupCandidates(params: {
   });
 
   return rows.map(mapStagingCleanupCandidate);
+}
+
+export async function claimStagingPurgeBatch(params: {
+  completedRetentionDays: number;
+  failedCanceledRetentionDays: number;
+  batchSize: number;
+  claimTimeoutSeconds: number;
+}): Promise<StagingPurgeClaim[]> {
+  const claimToken = crypto.randomUUID();
+  const rows = await withSchemaClient(async (sql) => sql.begin(async (executor) => {
+    return executor<Array<{ id: string; tenant_id: string }>>`
+      WITH eligible AS (
+        SELECT id
+        FROM ingestions
+        WHERE staging_purged_at IS NULL
+          AND (staging_purge_next_attempt_at IS NULL OR staging_purge_next_attempt_at <= now())
+          AND (staging_purge_claimed_at IS NULL OR staging_purge_claimed_at <= now() - (${params.claimTimeoutSeconds} * interval '1 second'))
+          AND (
+            (status IN ('COMPLETED', 'COMPLETED_WITH_ERRORS') AND updated_at <= now() - (${params.completedRetentionDays} * interval '1 day'))
+            OR (status IN ('FAILED', 'CANCELED') AND updated_at <= now() - (${params.failedCanceledRetentionDays} * interval '1 day'))
+          )
+        ORDER BY updated_at ASC, id ASC
+        LIMIT ${params.batchSize}
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE ingestions ing
+      SET staging_purge_started_at = COALESCE(ing.staging_purge_started_at, now()),
+          staging_purge_claim_token = ${claimToken},
+          staging_purge_claimed_at = now(),
+          staging_purge_attempt_count = ing.staging_purge_attempt_count + 1,
+          staging_purge_next_attempt_at = NULL,
+          updated_at = ing.updated_at
+      FROM eligible
+      WHERE ing.id = eligible.id
+      RETURNING ing.id, ing.tenant_id
+    `;
+  }));
+  return rows.map((row) => ({
+    ingestionId: row.id,
+    tenantId: row.tenant_id,
+    claimToken,
+  }));
+}
+
+export async function completeStagingPurge(params: {
+  ingestionId: string;
+  claimToken: string;
+}): Promise<boolean> {
+  return withSchemaClient(async (sql) => sql.begin(async (executor) => {
+    const rows = await executor<Array<{ id: string }>>`
+      UPDATE ingestions
+      SET staging_purged_at = now(),
+          staging_purge_claim_token = NULL,
+          staging_purge_claimed_at = NULL,
+          staging_purge_next_attempt_at = NULL,
+          staging_purge_last_error = NULL
+      WHERE id = ${params.ingestionId}
+        AND staging_purge_claim_token = ${params.claimToken}
+      RETURNING id
+    `;
+    if (rows.length === 0) {
+      return false;
+    }
+    await executor`
+      UPDATE ingestion_files
+      SET preview_status = 'purged',
+          preview_claimed_by = NULL,
+          preview_claimed_at = NULL,
+          preview_storage_key = NULL,
+          preview_content_type = NULL,
+          preview_size_bytes = NULL,
+          preview_width = NULL,
+          preview_height = NULL,
+          preview_error = NULL,
+          preview_generated_at = NULL
+      WHERE ingestion_id = ${params.ingestionId}
+    `;
+    return true;
+  }));
+}
+
+export async function failStagingPurge(params: {
+  ingestionId: string;
+  claimToken: string;
+  message: string;
+}): Promise<void> {
+  await withSchemaClient(async (sql) => {
+    await sql`
+      UPDATE ingestions
+      SET staging_purge_claim_token = NULL,
+          staging_purge_claimed_at = NULL,
+          staging_purge_next_attempt_at = now() + interval '5 minutes',
+          staging_purge_last_error = ${ { code: "STAGING_PURGE_FAILED", message: params.message } }
+      WHERE id = ${params.ingestionId}
+        AND staging_purge_claim_token = ${params.claimToken}
+    `;
+  });
 }
 
 export async function listStuckIngestions(params: {
@@ -986,6 +1128,7 @@ export async function claimNextPendingIngestionPreview(params: {
         WHERE file.status = 'UPLOADED'
           AND file.preview_status IN ('pending', 'processing')
           AND ing.status IN ('DRAFT', 'UPLOADING', 'CANCELED')
+          AND ing.staging_purge_started_at IS NULL
           AND (
             file.preview_status = 'pending'
             OR file.preview_claimed_at IS NULL
@@ -1044,6 +1187,7 @@ export async function findClaimedIngestionPreview(params: {
         AND file.id = ${params.fileId}
         AND file.preview_status = 'processing'
         AND file.preview_claimed_by = ${claimedBy}
+        AND ing.staging_purge_started_at IS NULL
       LIMIT 1
     `;
   });
@@ -1072,6 +1216,12 @@ export async function updateIngestionPreviewUpload(params: {
         AND ingestion_id = ${params.ingestionId}
         AND preview_status = 'processing'
         AND preview_claimed_by = ${claimedBy}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM ingestions
+          WHERE id = ingestion_files.ingestion_id
+            AND staging_purge_started_at IS NOT NULL
+        )
       RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
         preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
         preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
@@ -1113,6 +1263,12 @@ export async function markIngestionFilePreviewReady(params: {
         AND preview_status = 'processing'
         AND preview_claimed_by = ${claimedBy}
         AND preview_upload_token_id = ${params.uploadTokenId}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM ingestions
+          WHERE id = ingestion_files.ingestion_id
+            AND staging_purge_started_at IS NOT NULL
+        )
       RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
         preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
         preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
@@ -1149,6 +1305,12 @@ export async function markIngestionFilePreviewFailed(params: {
         AND ingestion_id = ${params.ingestionId}
         AND preview_status = 'processing'
         AND preview_claimed_by = ${claimedBy}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM ingestions
+          WHERE id = ingestion_files.ingestion_id
+            AND staging_purge_started_at IS NOT NULL
+        )
       RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
         preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
         preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at

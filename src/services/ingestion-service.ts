@@ -1,5 +1,6 @@
 import { rm } from "node:fs/promises";
 
+import type { SqlExecutor } from "../db/client.ts";
 import {
   ConflictError,
   NotFoundError,
@@ -65,6 +66,11 @@ import {
   isItemKindCompatibleWithMediaKind,
 } from "../domain/ingestions/compatibility.ts";
 import { hasActiveLease } from "../repos/lease-repo.ts";
+import { withMutableIngestion } from "./ingestion-manifest.ts";
+import {
+  listIngestionItemFiles,
+  listIngestionItems,
+} from "../repos/ingestion-item-repo.ts";
 import {
   type CancelIngestionResponse,
   type CommitUploadedFileResponse,
@@ -122,6 +128,11 @@ const INGESTION_PREVIEW_OUTPUT_CONTENT_TYPES = new Set([
 interface CursorPayload {
   created_at: string;
   id: string;
+}
+
+interface SubmissionValidationFailure {
+  message: string;
+  details?: object;
 }
 
 function normalizeSha256(value: string): string {
@@ -362,6 +373,7 @@ function assertPreviewDimensionAllowed(field: "width" | "height", value: number)
 export async function createIngestionDraft(params: {
   auth: AuthenticatedContext;
   body: CreateIngestionBody;
+  executor?: SqlExecutor;
 }): Promise<CreateIngestionDraftResponse> {
   assertClassificationTypeCompatibleWithItemKind({
     classificationType: params.body.classification_type,
@@ -385,6 +397,7 @@ export async function createIngestionDraft(params: {
     rightsNote: params.body.rights_note ?? undefined,
     sensitivityNote: params.body.sensitivity_note ?? undefined,
     summary: params.body.summary,
+    executor: params.executor,
   });
 
   return {
@@ -508,29 +521,34 @@ export async function updateIngestion(params: {
     itemKind: nextItemKind,
   });
 
-  const updated = await updateIngestionDetails({
-    ingestionId: ingestion.id,
+  const updated = await withMutableIngestion({
     tenantId: params.auth.tenantId,
-    batchLabel: params.body.batch_label,
-    classificationType: params.body.classification_type,
-    itemKind: params.body.item_kind,
-    languageCode: params.body.language_code,
-    pipelinePreset: params.body.pipeline_preset,
-    accessLevel: params.body.access_level,
-    summary: params.body.summary,
-    embargoUntil: params.body.embargo_until,
-    rightsNote: params.body.rights_note,
-    sensitivityNote: params.body.sensitivity_note,
-    hasBatchLabel,
-    hasClassificationType,
-    hasItemKind,
-    hasLanguageCode,
-    hasPipelinePreset,
-    hasAccessLevel,
-    hasSummary,
-    hasEmbargoUntil,
-    hasRightsNote,
-    hasSensitivityNote,
+    ingestionId: ingestion.id,
+    handler: (_, executor) => updateIngestionDetails({
+      ingestionId: ingestion.id,
+      tenantId: params.auth.tenantId,
+      batchLabel: params.body.batch_label,
+      classificationType: params.body.classification_type,
+      itemKind: params.body.item_kind,
+      languageCode: params.body.language_code,
+      pipelinePreset: params.body.pipeline_preset,
+      accessLevel: params.body.access_level,
+      summary: params.body.summary,
+      embargoUntil: params.body.embargo_until,
+      rightsNote: params.body.rights_note,
+      sensitivityNote: params.body.sensitivity_note,
+      hasBatchLabel,
+      hasClassificationType,
+      hasItemKind,
+      hasLanguageCode,
+      hasPipelinePreset,
+      hasAccessLevel,
+      hasSummary,
+      hasEmbargoUntil,
+      hasRightsNote,
+      hasSensitivityNote,
+      executor,
+    }),
   });
 
   return {
@@ -601,6 +619,12 @@ function canMutateIngestionFiles(status: IngestionStatus): boolean {
 async function ensureIngestionNotProcessing(
   ingestion: IngestionRecord,
 ): Promise<void> {
+  if (ingestion.stagingPurgeStartedAt) {
+    throw new ConflictError("Ingestion staging has been scheduled for purge.", {
+      ingestion_id: ingestion.id,
+    });
+  }
+
   if (
     ingestion.status === "PROCESSING" ||
     ingestion.status === "COMPLETED" ||
@@ -628,10 +652,12 @@ async function ensureIngestionNotProcessing(
 async function reopenCanceledIngestion(params: {
   tenantId: string;
   ingestionId: string;
+  executor?: SqlExecutor;
 }): Promise<IngestionRecord> {
   const files = await listIngestionFiles({
     tenantId: params.tenantId,
     ingestionId: params.ingestionId,
+    executor: params.executor,
   });
   const nextStatus: IngestionStatus =
     files.length === 0 ? "DRAFT" : "UPLOADING";
@@ -640,6 +666,7 @@ async function reopenCanceledIngestion(params: {
     tenantId: params.tenantId,
     ingestionId: params.ingestionId,
     to: nextStatus,
+    executor: params.executor,
   });
 }
 
@@ -647,6 +674,7 @@ export async function createPresignedUpload(params: {
   auth: AuthenticatedContext;
   ingestionId: string;
   body: CreatePresignedUploadBody;
+  executor?: SqlExecutor;
 }): Promise<CreatePresignedUploadResponse> {
   const payload = params.body;
   const maxUploadSizeBytes = resolveMaxUploadSizeBytes();
@@ -658,7 +686,7 @@ export async function createPresignedUpload(params: {
   }
 
   let ingestion = requireIngestion(
-    await findIngestionById(params.auth.tenantId, params.ingestionId),
+    await findIngestionById(params.auth.tenantId, params.ingestionId, params.executor),
     params.ingestionId,
   );
 
@@ -666,6 +694,7 @@ export async function createPresignedUpload(params: {
     ingestion = await reopenCanceledIngestion({
       tenantId: params.auth.tenantId,
       ingestionId: params.ingestionId,
+      executor: params.executor,
     });
   }
 
@@ -688,6 +717,7 @@ export async function createPresignedUpload(params: {
       tenantId: params.auth.tenantId,
       ingestionId: params.ingestionId,
       fileId: payload.file_id,
+      executor: params.executor,
     });
 
     if (!existingFile) {
@@ -728,12 +758,18 @@ export async function createPresignedUpload(params: {
       filename,
     });
 
-    const prepared = await prepareIngestionFileUpload({
+    const prepared = await withMutableIngestion({
       tenantId: params.auth.tenantId,
       ingestionId: params.ingestionId,
-      fileId,
-      storageKey,
-      uploadTokenId,
+      executor: params.executor,
+      handler: (_, executor) => prepareIngestionFileUpload({
+        tenantId: params.auth.tenantId,
+        ingestionId: params.ingestionId,
+        fileId,
+        storageKey,
+        uploadTokenId,
+        executor,
+      }),
     });
 
     if (!prepared) {
@@ -754,29 +790,45 @@ export async function createPresignedUpload(params: {
       filename,
     });
 
-    await createIngestionFile({
-      id: fileId,
+    const created = await withMutableIngestion({
+      tenantId: params.auth.tenantId,
       ingestionId: params.ingestionId,
-      filename,
-      contentType,
-      sizeBytes,
-      storageKey,
-      uploadTokenId,
+      executor: params.executor,
+      handler: async (lockedIngestion, executor) => {
+        const file = await createIngestionFile({
+          id: fileId,
+          tenantId: params.auth.tenantId,
+          ingestionId: params.ingestionId,
+          filename,
+          contentType,
+          sizeBytes,
+          storageKey,
+          uploadTokenId,
+          executor,
+        });
+        if (!file) {
+          throw new ConflictError("Ingestion file could not be created.");
+        }
+        if (lockedIngestion.status === "DRAFT") {
+          await updateIngestionStatus({
+            ingestionId: params.ingestionId,
+            tenantId: params.auth.tenantId,
+            fromStatus: "DRAFT",
+            toStatus: "UPLOADING",
+            executor,
+          });
+        }
+        return file;
+      },
     });
+    if (!created) {
+      throw new ConflictError("Ingestion file could not be created.");
+    }
   }
 
   if (sizeBytes > maxUploadSizeBytes) {
     throw new ValidationError("File size exceeds the configured upload limit.", {
       max_upload_size_bytes: maxUploadSizeBytes,
-    });
-  }
-
-  if (ingestion.status === "DRAFT") {
-    await updateIngestionStatus({
-      ingestionId: params.ingestionId,
-      tenantId: params.auth.tenantId,
-      fromStatus: ingestion.status,
-      toStatus: "UPLOADING",
     });
   }
 
@@ -809,13 +861,14 @@ export async function commitUploadedFile(params: {
   auth: AuthenticatedContext;
   ingestionId: string;
   body: CommitUploadedFileBody;
+  executor?: SqlExecutor;
 }): Promise<CommitUploadedFileResponse> {
   const payload = params.body;
   const fileId = payload.file_id;
   const checksumSha256 = normalizeSha256(payload.checksum_sha256);
 
   const ingestion = requireIngestion(
-    await findIngestionById(params.auth.tenantId, params.ingestionId),
+    await findIngestionById(params.auth.tenantId, params.ingestionId, params.executor),
     params.ingestionId,
   );
 
@@ -833,6 +886,7 @@ export async function commitUploadedFile(params: {
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
     fileId,
+    executor: params.executor,
   });
 
   if (!file) {
@@ -842,6 +896,7 @@ export async function commitUploadedFile(params: {
   const files = await listIngestionFiles({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
+    executor: params.executor,
   });
 
   const fileKind = requireMediaKind(file.contentType);
@@ -898,10 +953,17 @@ export async function commitUploadedFile(params: {
     });
   }
 
-  const updated = await markIngestionFileUploaded({
-    fileId,
+  const updated = await withMutableIngestion({
+    tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
-    checksumSha256,
+    executor: params.executor,
+    handler: (_, executor) => markIngestionFileUploaded({
+      tenantId: params.auth.tenantId,
+      fileId,
+      ingestionId: params.ingestionId,
+      checksumSha256,
+      executor,
+    }),
   });
 
   if (!updated) {
@@ -917,10 +979,12 @@ export async function commitUploadedFile(params: {
     ? await markIngestionFilePreviewPending({
         fileId,
         ingestionId: params.ingestionId,
+        executor: params.executor,
       })
     : await markIngestionFilePreviewUnsupported({
         fileId,
         ingestionId: params.ingestionId,
+        executor: params.executor,
       });
 
   return {
@@ -968,11 +1032,16 @@ export async function updateIngestionFileOverrides(params: {
     throw new NotFoundError(`Ingestion file '${params.fileId}' was not found.`);
   }
 
-  const updated = await updateIngestionFileProcessingOverrides({
+  const updated = await withMutableIngestion({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
-    fileId: params.fileId,
-    processingOverrides,
+    handler: (_, executor) => updateIngestionFileProcessingOverrides({
+      tenantId: params.auth.tenantId,
+      ingestionId: params.ingestionId,
+      fileId: params.fileId,
+      processingOverrides,
+      executor,
+    }),
   });
 
   if (!updated) {
@@ -991,62 +1060,51 @@ export async function removeIngestionFile(params: {
   ingestionId: string;
   fileId: string;
 }): Promise<DeleteIngestionFileResponse> {
-  let ingestion = requireIngestion(
-    await findIngestionById(params.auth.tenantId, params.ingestionId),
-    params.ingestionId,
-  );
-
-  const file = await findIngestionFileById({
+  const file = await withMutableIngestion({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
-    fileId: params.fileId,
+    handler: async (ingestion, executor) => {
+      const currentFile = await findIngestionFileById({
+        tenantId: params.auth.tenantId,
+        ingestionId: params.ingestionId,
+        fileId: params.fileId,
+        executor,
+      });
+      if (!currentFile) {
+        throw new NotFoundError(`Ingestion file '${params.fileId}' was not found.`);
+      }
+      const deleted = await deleteIngestionFile({
+        tenantId: params.auth.tenantId,
+        ingestionId: params.ingestionId,
+        fileId: params.fileId,
+        executor,
+      });
+      if (!deleted) {
+        throw new ConflictError("Ingestion file could not be deleted.", {
+          file_id: currentFile.id,
+        });
+      }
+      if (ingestion.status === "CANCELED") {
+        const remainingFiles = await listIngestionFiles({
+          tenantId: params.auth.tenantId,
+          ingestionId: params.ingestionId,
+          executor,
+        });
+        await updateIngestionStatus({
+          ingestionId: ingestion.id,
+          tenantId: ingestion.tenantId,
+          fromStatus: "CANCELED",
+          toStatus: remainingFiles.length === 0 ? "DRAFT" : "UPLOADING",
+          executor,
+        });
+      }
+      return currentFile;
+    },
   });
 
-  if (!file) {
-    throw new NotFoundError(`Ingestion file '${params.fileId}' was not found.`);
-  }
-
-  if (ingestion.status === "CANCELED") {
-    const files = await listIngestionFiles({
-      tenantId: params.auth.tenantId,
-      ingestionId: params.ingestionId,
-    });
-    const remainingCount = files.filter((entry) => entry.id !== file.id).length;
-    const nextStatus: IngestionStatus =
-      remainingCount === 0 ? "DRAFT" : "UPLOADING";
-    ingestion = await transitionIngestionStatus({
-      tenantId: params.auth.tenantId,
-      ingestionId: params.ingestionId,
-      to: nextStatus,
-    });
-  }
-
-  if (!canMutateIngestionFiles(ingestion.status)) {
-    throw new ConflictError(
-      "Cannot remove files after ingestion is submitted.",
-      {
-        ingestion_id: params.ingestionId,
-        status: ingestion.status,
-      },
-    );
-  }
-
-  const stagingPath = resolveStagingPath(file.storageKey);
-  await rm(stagingPath, { force: true });
+  await rm(resolveStagingPath(file.storageKey), { force: true });
   if (file.previewStorageKey) {
     await rm(resolveStagingPath(file.previewStorageKey), { force: true });
-  }
-
-  const deleted = await deleteIngestionFile({
-    tenantId: params.auth.tenantId,
-    ingestionId: params.ingestionId,
-    fileId: params.fileId,
-  });
-
-  if (!deleted) {
-    throw new ConflictError("Ingestion file could not be deleted.", {
-      file_id: file.id,
-    });
   }
 
   return {
@@ -1316,63 +1374,34 @@ export async function deleteIngestionRecord(params: {
   auth: AuthenticatedContext;
   ingestionId: string;
 }): Promise<DeleteIngestionResponse> {
-  const ingestion = requireIngestion(
-    await findIngestionById(params.auth.tenantId, params.ingestionId),
-    params.ingestionId,
-  );
-
-  await ensureIngestionNotProcessing(ingestion);
-
-  if (
-    ingestion.status === "QUEUED" ||
-    ingestion.status === "COMPLETED" ||
-    ingestion.status === "COMPLETED_WITH_ERRORS"
-  ) {
-    throw new ConflictError(
-      "Ingestion cannot be deleted in its current state.",
-      {
-        ingestion_id: ingestion.id,
-        status: ingestion.status,
-      },
-    );
-  }
-
-  if (
-    ingestion.status !== "DRAFT" &&
-    ingestion.status !== "UPLOADING" &&
-    ingestion.status !== "CANCELED"
-  ) {
-    throw new ConflictError(
-      "Ingestion cannot be deleted in its current state.",
-      {
-        ingestion_id: ingestion.id,
-        status: ingestion.status,
-      },
-    );
-  }
-
-  const files = await listIngestionFiles({
+  const { ingestion, files } = await withMutableIngestion({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
+    handler: async (lockedIngestion, executor) => {
+      const files = await listIngestionFiles({
+        tenantId: params.auth.tenantId,
+        ingestionId: params.ingestionId,
+        executor,
+      });
+      const deleted = await deleteIngestion({
+        tenantId: params.auth.tenantId,
+        ingestionId: params.ingestionId,
+        executor,
+      });
+      if (!deleted) {
+        throw new ConflictError("Ingestion could not be deleted.", {
+          ingestion_id: lockedIngestion.id,
+        });
+      }
+      return { ingestion: lockedIngestion, files };
+    },
   });
 
   for (const file of files) {
-    const stagingPath = resolveStagingPath(file.storageKey);
-    await rm(stagingPath, { force: true });
+    await rm(resolveStagingPath(file.storageKey), { force: true });
     if (file.previewStorageKey) {
       await rm(resolveStagingPath(file.previewStorageKey), { force: true });
     }
-  }
-
-  const deleted = await deleteIngestion({
-    tenantId: params.auth.tenantId,
-    ingestionId: params.ingestionId,
-  });
-
-  if (!deleted) {
-    throw new ConflictError("Ingestion could not be deleted.", {
-      ingestion_id: ingestion.id,
-    });
   }
 
   return {
@@ -1385,11 +1414,18 @@ async function transitionIngestionStatus(params: {
   tenantId: string;
   ingestionId: string;
   to: IngestionStatus;
+  executor?: SqlExecutor;
 }): Promise<IngestionRecord> {
   const ingestion = requireIngestion(
-    await findIngestionById(params.tenantId, params.ingestionId),
+    await findIngestionById(params.tenantId, params.ingestionId, params.executor),
     params.ingestionId,
   );
+
+  if (ingestion.stagingPurgeStartedAt) {
+    throw new ConflictError("Ingestion staging has been scheduled for purge.", {
+      ingestion_id: ingestion.id,
+    });
+  }
 
   try {
     assertIngestionStatusTransition(ingestion.status, params.to);
@@ -1402,6 +1438,7 @@ async function transitionIngestionStatus(params: {
     tenantId: params.tenantId,
     fromStatus: ingestion.status,
     toStatus: params.to,
+    executor: params.executor,
   });
 
   return requireIngestion(updated, params.ingestionId);
@@ -1410,34 +1447,94 @@ async function transitionIngestionStatus(params: {
 export async function submitIngestion(params: {
   auth: AuthenticatedContext;
   ingestionId: string;
+  executor?: SqlExecutor;
 }): Promise<SubmitIngestionResponse> {
-  const files = await listIngestionFiles({
+  const result = await withMutableIngestion<IngestionRecord | SubmissionValidationFailure>({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
+    executor: params.executor,
+    handler: async (ingestion, executor) => {
+      if (ingestion.status !== "UPLOADING") {
+        return {
+          message: "Ingestion must be uploading before submission.",
+          details: {
+            ingestion_id: ingestion.id,
+            status: ingestion.status,
+          },
+        };
+      }
+
+      const [files, items] = await Promise.all([
+        listIngestionFiles({
+          tenantId: params.auth.tenantId,
+          ingestionId: params.ingestionId,
+          executor,
+        }),
+        listIngestionItems({
+          tenantId: params.auth.tenantId,
+          ingestionId: params.ingestionId,
+          executor,
+        }),
+      ]);
+      if (files.length === 0) {
+        return { message: "Cannot submit ingestion without files." };
+      }
+      if (files.some((file) => file.status !== "UPLOADED" && file.status !== "VALIDATED")) {
+        return { message: "All ingestion files must be committed before submission." };
+      }
+      if (items.length === 0) {
+        return { message: "Cannot submit ingestion without items." };
+      }
+
+      const fileIds = new Set(files.map((file) => file.id));
+      const linkedFileIds = new Set<string>();
+      for (const item of items) {
+        const links = await listIngestionItemFiles({
+          tenantId: params.auth.tenantId,
+          ingestionId: params.ingestionId,
+          ingestionItemId: item.id,
+          executor,
+        });
+        if (links.length === 0) {
+          return {
+            message: "Every ingestion item must contain a committed file.",
+            details: { ingestion_item_id: item.id },
+          };
+        }
+        for (const link of links) {
+          if (!fileIds.has(link.ingestionFileId)) {
+            return {
+              message: "Item link references an uncommitted ingestion file.",
+              details: {
+                ingestion_item_id: item.id,
+                ingestion_file_id: link.ingestionFileId,
+              },
+            };
+          }
+          linkedFileIds.add(link.ingestionFileId);
+        }
+      }
+      if (linkedFileIds.size !== fileIds.size) {
+        return { message: "All committed ingestion files must be linked to an item." };
+      }
+
+      const queued = await updateIngestionStatus({
+        ingestionId: ingestion.id,
+        tenantId: ingestion.tenantId,
+        fromStatus: "UPLOADING",
+        toStatus: "QUEUED",
+        executor,
+      });
+      return requireIngestion(queued, ingestion.id);
+    },
   });
 
-  if (files.length === 0) {
-    throw new ConflictError("Cannot submit ingestion without uploaded files.");
+  if ("message" in result) {
+    throw new ConflictError(result.message, result.details);
   }
-
-  if (
-    !files.some(
-      (file) => file.status === "UPLOADED" || file.status === "VALIDATED",
-    )
-  ) {
-    throw new ConflictError(
-      "Cannot submit ingestion before at least one file is committed.",
-    );
-  }
-
-  const updated = await transitionIngestionStatus({
-    tenantId: params.auth.tenantId,
-    ingestionId: params.ingestionId,
-    to: "QUEUED",
-  });
 
   return {
-    ingestion: serializeIngestion(updated),
+    ingestion: serializeIngestion(result),
   };
 }
 
@@ -1527,11 +1624,13 @@ export async function restoreIngestion(params: {
 export async function retryIngestion(params: {
   auth: AuthenticatedContext;
   ingestionId: string;
+  executor?: SqlExecutor;
 }): Promise<RetryIngestionResponse> {
   const updated = await transitionIngestionStatus({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
     to: "QUEUED",
+    executor: params.executor,
   });
 
   return {
@@ -1545,6 +1644,14 @@ export async function uploadFileBySignedToken(params: {
 }): Promise<UploadFileBySignedTokenResponse> {
   const token = parseUploadToken(params.uploadToken);
   const maxUploadSizeBytes = resolveMaxUploadSizeBytes();
+  const ingestion = requireIngestion(
+    await findIngestionById(token.tenant_id, token.ingestion_id),
+    token.ingestion_id,
+  );
+
+  if (ingestion.stagingPurgeStartedAt) {
+    throw new ConflictError("Upload token is no longer active.");
+  }
 
   if (token.size_bytes > maxUploadSizeBytes) {
     throw new ValidationError("Upload size exceeds the configured upload limit.", {
@@ -1627,13 +1734,18 @@ export async function uploadFileBySignedToken(params: {
       expectedSizeBytes: token.size_bytes,
       maxSizeBytes: maxUploadSizeBytes,
     });
-    const recorded = await recordIngestionFileUpload({
+    const recorded = await withMutableIngestion({
       tenantId: token.tenant_id,
       ingestionId: token.ingestion_id,
-      fileId: token.file_id,
-      storageKey: token.storage_key,
-      uploadTokenId: token.upload_token_id,
-      checksumSha256: inspection.checksumSha256,
+      handler: (_, executor) => recordIngestionFileUpload({
+        tenantId: token.tenant_id,
+        ingestionId: token.ingestion_id,
+        fileId: token.file_id,
+        storageKey: token.storage_key,
+        uploadTokenId: token.upload_token_id,
+        checksumSha256: inspection.checksumSha256,
+        executor,
+      }),
     });
 
     if (!recorded) {

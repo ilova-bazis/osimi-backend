@@ -1,6 +1,6 @@
 # Access Level Model
 
-This document defines object access policy and download authorization behavior.
+This document defines object access policy, editing authorization, and download authorization behavior.
 
 ## Scope
 
@@ -78,6 +78,17 @@ Reason codes:
 - `RESTORE_REQUIRED`
 - `RESTORE_IN_PROGRESS`
 - `TEMP_UNAVAILABLE`
+
+## Editing Authorization
+
+Object editing uses the authorization portion of the access decision, without embargo or artifact-availability gates.
+
+- `public`: any authenticated user who satisfies the endpoint role requirement may access editing operations.
+- `family`: requires a `family` or `private` assignment in addition to the endpoint role requirement.
+- `private`: requires a `private` assignment in addition to the endpoint role requirement.
+- `admin`: bypasses assignment checks.
+
+This policy applies to title updates, edit detail and lock acquisition, metadata, curation, curation submission, edit history, and edit-lock release. A policy denial for an object in the current tenant returns `403`; a missing or cross-tenant object returns `404`.
 
 ## API Direction
 

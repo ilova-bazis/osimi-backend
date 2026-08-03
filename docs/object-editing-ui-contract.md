@@ -25,6 +25,13 @@ This document does not define transcript or caption editing payloads yet.
 - `POST /api/objects/:object_id/curation/submit`
 - `GET /api/objects/:object_id/curation/history`
 
+## Authorization
+
+- Edit mutations and `GET /edit` require `archiver` or `admin`; edit history also permits `viewer`.
+- The object policy applies after the role gate: `public` requires no assignment, `family` requires a `family` or `private` assignment, and `private` requires a `private` assignment.
+- `admin` bypasses assignment checks. Embargo and artifact availability do not block editing.
+- The UI must treat `403 FORBIDDEN` as a policy denial and `404 NOT_FOUND` as a missing or cross-tenant object.
+
 ## Source of Truth
 
 - UI reads editing state from backend only.
@@ -40,7 +47,6 @@ Load the current editing state for one object.
 
 ### Roles
 
-- `viewer`
 - `archiver`
 - `admin`
 
@@ -113,14 +119,13 @@ Load the current editing state for one object.
   - read-only in this contract
   - provided so the editor can display current access context alongside editable notes
 - `capabilities.can_edit_metadata`
-  - `true` for archiver and admin roles
-  - `false` for viewer role
+  - `true` for authorized archiver and admin users when the object is not locked by another editor
 - `capabilities.can_curate_text`
-  - `true` for document objects when role is archiver or admin
-  - `false` for non-document objects or viewer role
+  - `true` for authorized archiver and admin users on document objects when the object is not locked by another editor
+  - `false` for non-document objects
 - `capabilities.can_submit_review`
-  - `true` for document objects when role is archiver or admin
-  - `false` for non-document objects or viewer role
+  - `true` for authorized archiver and admin users on document objects when the object is not locked by another editor
+  - `false` for non-document objects
 - `curation_payload.kind`
   - currently mirrors `media_type`
   - for `document`, `curation_payload.pages[]` contains OCR editing data

@@ -5,9 +5,14 @@ import { describe, expect, test } from "bun:test";
 import { parseLeaseToken } from "../../../src/auth/worker-lease.ts";
 import {
   DEFAULT_MAX_UPLOAD_SIZE_BYTES,
+  DEFAULT_READINESS_TIMEOUT_MS,
+  DEFAULT_SHUTDOWN_GRACE_PERIOD_MS,
   resolveMaxUploadSizeBytes,
+  resolveReadinessTimeoutMs,
+  resolveShutdownGracePeriodMs,
   runWithRuntimeConfig,
   validateSigningConfiguration,
+  validateWorkerConfiguration,
 } from "../../../src/runtime/config.ts";
 import { startServer } from "../../../src/server.ts";
 import { parseUploadToken } from "../../../src/storage/staging.ts";
@@ -107,5 +112,34 @@ describe("upload size configuration", () => {
         "Runtime upload size limit",
       );
     }
+  });
+});
+
+describe("readiness configuration", () => {
+  test("uses the default readiness timeout and accepts a runtime override", () => {
+    expect(resolveReadinessTimeoutMs({})).toBe(DEFAULT_READINESS_TIMEOUT_MS);
+    expect(resolveReadinessTimeoutMs({ readinessTimeoutMs: 250 })).toBe(250);
+  });
+
+  test("rejects invalid readiness timeout and missing worker authentication", () => {
+    expect(() => resolveReadinessTimeoutMs({ readinessTimeoutMs: 0 })).toThrow(
+      "READINESS_TIMEOUT_MS",
+    );
+    expect(() => validateWorkerConfiguration({ workerAuthToken: "" })).toThrow(
+      "WORKER_AUTH_TOKEN",
+    );
+  });
+});
+
+describe("shutdown configuration", () => {
+  test("uses a 60 second default and accepts a runtime override", () => {
+    expect(resolveShutdownGracePeriodMs({})).toBe(DEFAULT_SHUTDOWN_GRACE_PERIOD_MS);
+    expect(resolveShutdownGracePeriodMs({ shutdownGracePeriodMs: 250 })).toBe(250);
+  });
+
+  test("rejects invalid shutdown grace periods", () => {
+    expect(() => resolveShutdownGracePeriodMs({ shutdownGracePeriodMs: 0 })).toThrow(
+      "SHUTDOWN_GRACE_PERIOD_MS",
+    );
   });
 });

@@ -89,6 +89,22 @@ const incomingEventSchema = z
         path: ["ingestion_item_id"],
       });
     }
+
+    if (event.event_type === "INGESTION_COMPLETED" && event.object_id) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "object_id is not allowed for aggregate ingestion completion events.",
+        path: ["object_id"],
+      });
+    }
+
+    if (event.event_type === "INGESTION_COMPLETED" && event.ingestion_item_id) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "ingestion_item_id is not allowed for aggregate ingestion completion events.",
+        path: ["ingestion_item_id"],
+      });
+    }
   });
 
 const ingestWorkerEventsSchema = z.object({

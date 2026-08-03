@@ -11,5 +11,5 @@ export interface IngestWorkerEventsResponse {
   ingestion_id: string;
   inserted_events: number;
   duplicate_events: number;
-  object_id: string | null;
+  object_ids: string[];
 }

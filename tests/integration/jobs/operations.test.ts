@@ -7,6 +7,7 @@ import { sql as sqlIdentifier } from "bun";
 
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
+import { claimStagingPurgeBatch, completeStagingPurge } from "../../../src/repos/ingestion-repo.ts";
 import { runStagingRetentionSweep, runStuckAttentionCheck } from "../../../src/jobs/operations.ts";
 import { runWithRuntimeConfig } from "../../../src/runtime/config.ts";
 import { resolveStagingPath } from "../../../src/storage/staging.ts";
@@ -43,11 +44,11 @@ describe("jobs operations", () => {
 
   test("applies staging retention windows by ingestion status", async () => {
     const sql = createSqlClient(TEST_DATABASE_URL!);
-    const keepStorageKey = "tenants/t1/ingestions/i-keep/original/f-keep.txt";
-    const cleanupCompletedStorageKey = "tenants/t1/ingestions/i-completed/original/f-completed.txt";
-    const cleanupCompletedPreviewKey = "tenants/t1/ingestions/i-completed/preview/f-completed.jpg";
-    const cleanupFailedStorageKey = "tenants/t1/ingestions/i-failed/original/f-failed.txt";
-    const cleanupFailedPreviewKey = "tenants/t1/ingestions/i-failed/preview/f-failed.jpg";
+    const keepStorageKey = "tenants/00000000-0000-0000-0000-000000000001/ingestions/30000000-0000-0000-0000-000000000101/original/f-keep.txt";
+    const cleanupCompletedStorageKey = "tenants/00000000-0000-0000-0000-000000000001/ingestions/30000000-0000-0000-0000-000000000102/original/f-completed.txt";
+    const cleanupCompletedPreviewKey = "tenants/00000000-0000-0000-0000-000000000001/ingestions/30000000-0000-0000-0000-000000000102/preview/f-completed.jpg";
+    const cleanupFailedStorageKey = "tenants/00000000-0000-0000-0000-000000000001/ingestions/30000000-0000-0000-0000-000000000103/original/f-failed.txt";
+    const cleanupFailedPreviewKey = "tenants/00000000-0000-0000-0000-000000000001/ingestions/30000000-0000-0000-0000-000000000103/preview/f-failed.jpg";
 
     try {
       await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
@@ -216,8 +217,8 @@ describe("jobs operations", () => {
           }),
       );
 
-      expect(result.scanned).toBe(2);
-      expect(result.deleted).toBe(2);
+      expect(result.claimed).toBe(2);
+      expect(result.purged).toBe(2);
       expect(result.missing).toBe(0);
       expect(await Bun.file(keepPath).exists()).toBe(true);
       expect(await Bun.file(completedPath).exists()).toBe(false);
@@ -308,6 +309,79 @@ describe("jobs operations", () => {
         ]),
       );
       expect(stuckIds.includes("30000000-0000-0000-0000-000000000203")).toBe(false);
+    } finally {
+      await sql.close();
+    }
+  });
+
+  test("claims bounded purge batches exclusively and converges after completion or lease expiry", async () => {
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+    const config = {
+      completedRetentionDays: 7,
+      failedCanceledRetentionDays: 14,
+      batchSize: 2,
+      claimTimeoutSeconds: 900,
+    };
+    const runtimeConfig = { databaseUrl: TEST_DATABASE_URL, dbSchema: schema, stagingRoot };
+
+    try {
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      await sql`
+        INSERT INTO ingestions (
+          id, batch_label, tenant_id, status, created_by, schema_version,
+          classification_type, item_kind, language_code, pipeline_preset,
+          access_level, updated_at
+        )
+        VALUES
+          (${"30000000-0000-0000-0000-000000000301"}, ${"batch-301"}, ${"00000000-0000-0000-0000-000000000001"}, ${"COMPLETED"}::ingestion_status, ${"10000000-0000-0000-0000-000000000001"}, ${"1.0"}, ${"document"}::ingestion_classification_type, ${"document"}::ingest_item_kind, ${"en"}, ${"auto"}::ingestion_pipeline_preset, ${"private"}::object_access_level, now() - interval '8 day'),
+          (${"30000000-0000-0000-0000-000000000302"}, ${"batch-302"}, ${"00000000-0000-0000-0000-000000000001"}, ${"COMPLETED_WITH_ERRORS"}::ingestion_status, ${"10000000-0000-0000-0000-000000000001"}, ${"1.0"}, ${"document"}::ingestion_classification_type, ${"document"}::ingest_item_kind, ${"en"}, ${"auto"}::ingestion_pipeline_preset, ${"private"}::object_access_level, now() - interval '8 day'),
+          (${"30000000-0000-0000-0000-000000000303"}, ${"batch-303"}, ${"00000000-0000-0000-0000-000000000001"}, ${"FAILED"}::ingestion_status, ${"10000000-0000-0000-0000-000000000001"}, ${"1.0"}, ${"document"}::ingestion_classification_type, ${"document"}::ingest_item_kind, ${"en"}, ${"auto"}::ingestion_pipeline_preset, ${"private"}::object_access_level, now() - interval '15 day'),
+          (${"30000000-0000-0000-0000-000000000304"}, ${"batch-304"}, ${"00000000-0000-0000-0000-000000000001"}, ${"CANCELED"}::ingestion_status, ${"10000000-0000-0000-0000-000000000001"}, ${"1.0"}, ${"document"}::ingestion_classification_type, ${"document"}::ingest_item_kind, ${"en"}, ${"auto"}::ingestion_pipeline_preset, ${"private"}::object_access_level, now() - interval '15 day'),
+          (${"30000000-0000-0000-0000-000000000305"}, ${"batch-305"}, ${"00000000-0000-0000-0000-000000000001"}, ${"COMPLETED"}::ingestion_status, ${"10000000-0000-0000-0000-000000000001"}, ${"1.0"}, ${"document"}::ingestion_classification_type, ${"document"}::ingest_item_kind, ${"en"}, ${"auto"}::ingestion_pipeline_preset, ${"private"}::object_access_level, now() - interval '8 day')
+      `;
+
+      const [first, second] = await Promise.all([
+        runWithRuntimeConfig(runtimeConfig, () => claimStagingPurgeBatch(config)),
+        runWithRuntimeConfig(runtimeConfig, () => claimStagingPurgeBatch(config)),
+      ]);
+      const claims = [...first, ...second];
+
+      expect(claims).toHaveLength(4);
+      expect(new Set(claims.map((claim) => claim.ingestionId)).size).toBe(4);
+
+      await Promise.all(claims.map((claim) =>
+        runWithRuntimeConfig(runtimeConfig, () => completeStagingPurge(claim)),
+      ));
+
+      const completedRows = await sql<Array<{ count: string }>>`
+        SELECT count(*)::text AS count
+        FROM ingestions
+        WHERE id IN (
+          ${"30000000-0000-0000-0000-000000000301"},
+          ${"30000000-0000-0000-0000-000000000302"},
+          ${"30000000-0000-0000-0000-000000000303"},
+          ${"30000000-0000-0000-0000-000000000304"}
+        )
+          AND staging_purged_at IS NOT NULL
+      `;
+      expect(completedRows[0]?.count).toBe("4");
+
+      await sql`
+        UPDATE ingestions
+        SET staging_purge_started_at = now() - interval '16 minute',
+            staging_purge_claim_token = ${"00000000-0000-0000-0000-000000000305"},
+            staging_purge_claimed_at = now() - interval '16 minute',
+            staging_purge_attempt_count = 1
+        WHERE id = ${"30000000-0000-0000-0000-000000000305"}
+      `;
+
+      const reclaimed = await runWithRuntimeConfig(runtimeConfig, () => claimStagingPurgeBatch(config));
+      expect(reclaimed).toHaveLength(1);
+      expect(reclaimed[0]?.ingestionId).toBe("30000000-0000-0000-0000-000000000305");
+      await runWithRuntimeConfig(runtimeConfig, () => completeStagingPurge(reclaimed[0]!));
+
+      const remaining = await runWithRuntimeConfig(runtimeConfig, () => claimStagingPurgeBatch(config));
+      expect(remaining).toEqual([]);
     } finally {
       await sql.close();
     }

@@ -57,3 +57,14 @@ export function db(): ReturnType<typeof createSqlClient> {
     cachedClientsByKey.set(cacheKey, createdClient);
     return createdClient;
 }
+
+export async function closeDatabaseClients(params: {
+    timeoutMs: number;
+    force?: boolean;
+}): Promise<void> {
+    const clients = [...new Set(cachedClientsByKey.values())];
+    cachedClientsByKey.clear();
+    const timeout = params.force ? 0 : Math.max(0, params.timeoutMs) / 1000;
+
+    await Promise.allSettled(clients.map((client) => client.close({ timeout })));
+}

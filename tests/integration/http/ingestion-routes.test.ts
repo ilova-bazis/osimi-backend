@@ -14,6 +14,47 @@ function sha256Hex(value: string): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 
+async function createAndLinkItem(params: {
+  app: ReturnType<typeof createApp>;
+  token: string;
+  ingestionId: string;
+  fileId: string;
+  itemIndex?: number;
+}): Promise<string> {
+  const createItemResponse = await params.app.fetch(
+    new Request(`http://localhost/api/ingestions/${params.ingestionId}/items`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${params.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ item_index: params.itemIndex ?? 1 }),
+    }),
+  );
+  expect(createItemResponse.status).toBe(201);
+  const createItemBody = (await createItemResponse.json()) as { item: { id: string } };
+
+  const linkResponse = await params.app.fetch(
+    new Request(
+      `http://localhost/api/ingestions/${params.ingestionId}/items/${createItemBody.item.id}/files`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${params.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          ingestion_file_id: params.fileId,
+          sort_order: 1,
+        }),
+      },
+    ),
+  );
+  expect(linkResponse.status).toBe(201);
+
+  return createItemBody.item.id;
+}
+
 function buildSummary(overrides?: Record<string, unknown>): Record<string, unknown> {
   return {
     title: {
@@ -311,6 +352,13 @@ describe("ingestion routes", () => {
       file: { status: string };
     };
     expect(commitBody.file.status).toBe("UPLOADED");
+
+    await createAndLinkItem({
+      app,
+      token: authToken,
+      ingestionId,
+      fileId: presignBody.file_id,
+    });
 
     const submitResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
@@ -1277,6 +1325,13 @@ describe("ingestion routes", () => {
 
     expect(commitResponse.status).toBe(200);
 
+    await createAndLinkItem({
+      app,
+      token: authToken,
+      ingestionId,
+      fileId: presignBody.file_id,
+    });
+
     const submitResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
         method: "POST",
@@ -1549,6 +1604,13 @@ describe("ingestion routes", () => {
     );
 
     expect(commitResponse.status).toBe(200);
+
+    await createAndLinkItem({
+      app,
+      token: authToken,
+      ingestionId,
+      fileId: presignBody.file_id,
+    });
 
     const submitResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
@@ -2921,6 +2983,13 @@ describe("ingestion routes", () => {
     );
     expect(commitResponse.status).toBe(200);
 
+    await createAndLinkItem({
+      app,
+      token: authToken,
+      ingestionId,
+      fileId: firstPresignBody.file_id,
+    });
+
     const submitResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
         method: "POST",
@@ -3002,16 +3071,6 @@ describe("ingestion routes", () => {
     );
     expect(uploadResponse.status).toBe(200);
 
-    const submitResponse = await app.fetch(
-      new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${authToken}`,
-        },
-      }),
-    );
-    expect(submitResponse.status).toBe(409);
-
     const commitResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/files/commit`, {
         method: "POST",
@@ -3027,6 +3086,13 @@ describe("ingestion routes", () => {
     );
 
     expect(commitResponse.status).toBe(200);
+
+    await createAndLinkItem({
+      app,
+      token: authToken,
+      ingestionId,
+      fileId: presignBody.file_id,
+    });
 
     const submittedAfterCommit = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
@@ -3296,6 +3362,12 @@ describe("ingestion routes", () => {
             custom_field: {
               keep: true,
             },
+            people: {
+              authors: ["Existing Author"],
+              contributors: ["Existing Contributor"],
+              subjects: ["Existing Subject"],
+              mentioned: ["Existing Mention"],
+            },
           },
         }),
       }),
@@ -3314,6 +3386,7 @@ describe("ingestion routes", () => {
           title: "Updated Item Title",
           description: "Updated description",
           tags: ["tag-a", "tag-b", "tag-a"],
+          people: [" Ada Lovelace ", "Grace Hopper", "Ada Lovelace"],
           dates: {
             published: {
               value: "1960-05",
@@ -3337,6 +3410,12 @@ describe("ingestion routes", () => {
             published: { value: string | null; approximate: boolean; confidence: string; note: string | null };
           };
           custom_field: { keep: boolean };
+          people: {
+            authors: string[];
+            contributors: string[];
+            subjects: string[];
+            mentioned: string[];
+          };
         };
       };
     };
@@ -3347,6 +3426,70 @@ describe("ingestion routes", () => {
     expect(patchBody.item.summary.dates.created.value).toBe("1950");
     expect(patchBody.item.summary.dates.published.value).toBe("1960-05");
     expect(patchBody.item.summary.custom_field.keep).toBe(true);
+    expect(patchBody.item.summary.people).toEqual({
+      authors: ["Existing Author"],
+      contributors: ["Existing Contributor"],
+      subjects: ["Existing Subject"],
+      mentioned: ["Ada Lovelace", "Grace Hopper"],
+    });
+
+    const omitPeopleResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items/${createItemBody.item.id}`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ description: "People remain unchanged" }),
+      }),
+    );
+    expect(omitPeopleResponse.status).toBe(200);
+    const omitPeopleBody = (await omitPeopleResponse.json()) as {
+      item: { summary: { people: { mentioned: string[] } } };
+    };
+    expect(omitPeopleBody.item.summary.people.mentioned).toEqual(["Ada Lovelace", "Grace Hopper"]);
+
+    const clearPeopleResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items/${createItemBody.item.id}`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ people: [] }),
+      }),
+    );
+    expect(clearPeopleResponse.status).toBe(200);
+    const clearPeopleBody = (await clearPeopleResponse.json()) as {
+      item: {
+        summary: {
+          people: {
+            authors: string[];
+            contributors: string[];
+            subjects: string[];
+            mentioned: string[];
+          };
+        };
+      };
+    };
+    expect(clearPeopleBody.item.summary.people).toEqual({
+      authors: ["Existing Author"],
+      contributors: ["Existing Contributor"],
+      subjects: ["Existing Subject"],
+      mentioned: [],
+    });
+
+    const blankPeopleResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items/${createItemBody.item.id}`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ people: ["   "] }),
+      }),
+    );
+    expect(blankPeopleResponse.status).toBe(400);
   });
 
   test("rejects incompatible classification type and item kind on ingestion create", async () => {
@@ -3675,5 +3818,98 @@ describe("ingestion routes", () => {
     );
 
     expect(linkResponse.status).toBe(409);
+  });
+
+  test("replays a completed ingestion create request and rejects a mismatched reuse", async () => {
+    const app = createTestApp();
+    const idempotencyKey = `create-replay-${crypto.randomUUID()}`;
+    const body = buildIngestionBody({ batch_label: `batch-idempotency-${crypto.randomUUID()}` });
+
+    const request = () => new Request("http://localhost/api/ingestions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${authToken}`,
+        "content-type": "application/json",
+        "x-idempotency-key": idempotencyKey,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const firstResponse = await app.fetch(request());
+    const firstBody = await firstResponse.json();
+    expect(firstResponse.status).toBe(201);
+
+    const replayResponse = await app.fetch(request());
+    expect(replayResponse.status).toBe(201);
+    expect(await replayResponse.json()).toEqual(firstBody);
+
+    const mismatchResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+          "x-idempotency-key": idempotencyKey,
+        },
+        body: JSON.stringify({ ...body, batch_label: `batch-mismatch-${crypto.randomUUID()}` }),
+      }),
+    );
+    expect(mismatchResponse.status).toBe(409);
+  });
+
+  test("serializes concurrent ingestion create requests with the same idempotency key", async () => {
+    const app = createTestApp();
+    const idempotencyKey = `create-concurrent-${crypto.randomUUID()}`;
+    const body = buildIngestionBody({ batch_label: `batch-idempotency-${crypto.randomUUID()}` });
+    const request = () => new Request("http://localhost/api/ingestions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${authToken}`,
+        "content-type": "application/json",
+        "x-idempotency-key": idempotencyKey,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const [firstResponse, secondResponse] = await Promise.all([
+      app.fetch(request()),
+      app.fetch(request()),
+    ]);
+    expect(firstResponse.status).toBe(201);
+    expect(secondResponse.status).toBe(201);
+    expect(await firstResponse.json()).toEqual(await secondResponse.json());
+  });
+
+  test("does not retain a failed ingestion mutation as an idempotency replay", async () => {
+    const app = createTestApp();
+    const idempotencyKey = `create-failure-${crypto.randomUUID()}`;
+    const headers = {
+      authorization: `Bearer ${authToken}`,
+      "content-type": "application/json",
+      "x-idempotency-key": idempotencyKey,
+    };
+
+    const failedResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(buildIngestionBody({
+          classification_type: "image",
+          item_kind: "video",
+        })),
+      }),
+    );
+    expect(failedResponse.status).toBe(409);
+
+    const successfulResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: `batch-idempotency-${crypto.randomUUID()}`,
+        })),
+      }),
+    );
+    expect(successfulResponse.status).toBe(201);
   });
 });

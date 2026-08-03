@@ -16,6 +16,7 @@ import {
   ValidationError,
 } from "../http/errors.ts";
 import { hasActiveLease } from "../repos/lease-repo.ts";
+import { withMutableIngestion } from "./ingestion-manifest.ts";
 import { findIngestionById } from "../repos/ingestion-repo.ts";
 import {
   createIngestionItem,
@@ -201,10 +202,10 @@ function mergeJsonObjects(base: JsonObject, patch: JsonObject): JsonObject {
   return result;
 }
 
-function normalizeTags(tags: string[]): string[] {
+function normalizeList(values: string[]): string[] {
   const unique = new Set<string>();
-  for (const tag of tags) {
-    const normalized = tag.trim();
+  for (const value of values) {
+    const normalized = value.trim();
     if (normalized.length === 0) {
       continue;
     }
@@ -224,10 +225,16 @@ function buildSummaryPatch(body: UpdateIngestionItemBody): JsonObject | undefine
   }
 
   if (body.tags !== undefined) {
-    const normalizedTags = normalizeTags(body.tags);
+    const normalizedTags = normalizeList(body.tags);
     patch.classification = {
       ...((patch.classification as JsonObject | undefined) ?? {}),
       tags: normalizedTags,
+    };
+  }
+
+  if (body.people !== undefined) {
+    patch.people = {
+      mentioned: normalizeList(body.people),
     };
   }
 
@@ -274,17 +281,25 @@ export async function createIngestionItemForIngestion(params: {
     }),
   });
 
-  const item = await createIngestionItem({
-    id: crypto.randomUUID(),
+  const item = await withMutableIngestion({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
-    itemIndex: params.body.item_index,
-    classificationType: params.body.classification_type,
-    itemKind: params.body.item_kind,
-    languageCode: params.body.language_code,
-    title: params.body.title,
-    summary: params.body.summary,
+    handler: (_, executor) => createIngestionItem({
+      id: crypto.randomUUID(),
+      tenantId: params.auth.tenantId,
+      ingestionId: params.ingestionId,
+      itemIndex: params.body.item_index,
+      classificationType: params.body.classification_type,
+      itemKind: params.body.item_kind,
+      languageCode: params.body.language_code,
+      title: params.body.title,
+      summary: params.body.summary,
+      executor,
+    }),
   });
+  if (!item) {
+    throw new ConflictError("Ingestion item could not be created.");
+  }
 
   return {
     item: serializeIngestionItem(item),
@@ -356,18 +371,26 @@ export async function addIngestionFileToItem(params: {
     });
   }
 
-  const linked = await createIngestionItemFile({
-    id: crypto.randomUUID(),
+  const linked = await withMutableIngestion({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
-    ingestionItemId: params.ingestionItemId,
-    ingestionFileId: params.body.ingestion_file_id,
-    role: params.body.role,
-    sortOrder: params.body.sort_order,
-    pageNumber: params.body.page_number,
-    isPrimary: params.body.is_primary,
-    logicalLabel: params.body.logical_label,
+    handler: (_, executor) => createIngestionItemFile({
+      id: crypto.randomUUID(),
+      tenantId: params.auth.tenantId,
+      ingestionId: params.ingestionId,
+      ingestionItemId: params.ingestionItemId,
+      ingestionFileId: params.body.ingestion_file_id,
+      role: params.body.role,
+      sortOrder: params.body.sort_order,
+      pageNumber: params.body.page_number,
+      isPrimary: params.body.is_primary,
+      logicalLabel: params.body.logical_label,
+      executor,
+    }),
   });
+  if (!linked) {
+    throw new ConflictError("Ingestion file could not be linked to item.");
+  }
 
   return {
     file: serializeIngestionItemFile(linked),
@@ -425,14 +448,19 @@ export async function reorderFilesInIngestionItem(params: {
     throw new ValidationError("Field 'files' must contain unique ingestion_file_id values.");
   }
 
-  const updated = await reorderIngestionItemFiles({
+  const updated = await withMutableIngestion({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
-    ingestionItemId: params.ingestionItemId,
-    files: params.body.files.map((entry) => ({
-      ingestionFileId: entry.ingestion_file_id,
-      sortOrder: entry.sort_order,
-    })),
+    handler: (_, executor) => reorderIngestionItemFiles({
+      tenantId: params.auth.tenantId,
+      ingestionId: params.ingestionId,
+      ingestionItemId: params.ingestionItemId,
+      files: params.body.files.map((entry) => ({
+        ingestionFileId: entry.ingestion_file_id,
+        sortOrder: entry.sort_order,
+      })),
+      executor,
+    }),
   });
 
   if (updated.length === 0) {
@@ -467,13 +495,18 @@ export async function reorderIngestionItemsForIngestion(params: {
     throw new ValidationError("Field 'items' must contain unique ingestion_item_id values.");
   }
 
-  const reordered = await reorderIngestionItems({
+  const reordered = await withMutableIngestion({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
-    items: params.body.items.map((entry) => ({
-      ingestionItemId: entry.ingestion_item_id,
-      itemIndex: entry.item_index,
-    })),
+    handler: (_, executor) => reorderIngestionItems({
+      tenantId: params.auth.tenantId,
+      ingestionId: params.ingestionId,
+      items: params.body.items.map((entry) => ({
+        ingestionItemId: entry.ingestion_item_id,
+        itemIndex: entry.item_index,
+      })),
+      executor,
+    }),
   });
 
   if (reordered.length === 0) {
@@ -530,15 +563,20 @@ export async function updateIngestionItemMetadata(params: {
     ? mergeJsonObjects(existingItem.summary, summaryPatch)
     : undefined;
 
-  const updated = await updateIngestionItem({
+  const updated = await withMutableIngestion({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
-    ingestionItemId: params.ingestionItemId,
-    classificationType: params.body.classification_type,
-    itemKind: params.body.item_kind,
-    languageCode: params.body.language_code,
-    title: params.body.title,
-    summary: nextSummary,
+    handler: (_, executor) => updateIngestionItem({
+      tenantId: params.auth.tenantId,
+      ingestionId: params.ingestionId,
+      ingestionItemId: params.ingestionItemId,
+      classificationType: params.body.classification_type,
+      itemKind: params.body.item_kind,
+      languageCode: params.body.language_code,
+      title: params.body.title,
+      summary: nextSummary,
+      executor,
+    }),
   });
 
   if (!updated) {

@@ -178,11 +178,11 @@ What should not go here:
 - page arrays
 - curated file content
 
-### 3. `INGESTION_COMPLETED`
+### 3. `INGESTION_ITEM_COMPLETED`
 
 Role:
 
-- final object-ready summary event
+- final item/object-ready event
 - tells VPS object is available and whether richer text state should already exist
 
 Recommended payload:
@@ -190,8 +190,6 @@ Recommended payload:
 ```json
 {
   "step": "ingest",
-  "item_count": 1,
-  "successful_item_count": 1,
   "object_id": "OBJ-20260417-000002",
   "media_type": "audio",
   "has_object_text_manifest": true,
@@ -206,10 +204,9 @@ Recommended payload:
 
 Recommended fields:
 
-- existing fields retained:
-  - `step`
-  - `item_count`
-  - `successful_item_count`
+- required envelope fields:
+  - `ingestion_item_id`
+  - `object_id`
   - `ingest_json`
 - new summary fields:
   - `object_id`
@@ -227,7 +224,16 @@ What should not go here:
 - OCR/transcript full text
 - full artifact version history
 
-### 4. `ARTIFACT_CREATED`
+### 4. `INGESTION_COMPLETED`
+
+Role:
+
+- aggregate batch-completion signal
+- has no `object_id` or `ingestion_item_id`
+- creates no object and does not update an individual object projection
+- VPS derives terminal ingestion status from all item outcomes
+
+### 5. `ARTIFACT_CREATED`
 
 Role:
 
@@ -294,12 +300,17 @@ Current supported manifest kinds:
 - store pipeline completion summary
 - optionally mark text state as refresh-needed
 
-### On `INGESTION_COMPLETED`
+### On `INGESTION_ITEM_COMPLETED`
 
 - mark object available
 - update top-level readiness state
 - persist `ingest_json`
 - trust that `object_text_manifest` will be or has been published separately
+
+### On `INGESTION_COMPLETED`
+
+- record aggregate completion activity
+- derive batch terminal status only after every item is terminal
 
 ### On `object_text_manifest`
 
@@ -314,7 +325,7 @@ Please confirm the following alignment points:
 2. `object_text_manifest` should be the authoritative text/editing artifact read model.
 3. `OBJECT_CREATED` should be enriched with object/media bootstrap summary fields.
 4. `PIPELINE_STEP_COMPLETED` should be enriched with OCR/transcript summary fields.
-5. `INGESTION_COMPLETED` should include top-level text readiness flags and `projection_version`, but not full text data.
+5. `INGESTION_ITEM_COMPLETED` should include item-level text readiness flags and `projection_version`, but not full text data.
 6. VPS should not expect segment identities or segment-level apply semantics from archive.
 
 ## Proposed Rollout Strategy
@@ -328,7 +339,7 @@ Please confirm the following alignment points:
 
 - enrich `OBJECT_CREATED`
 - enrich OCR/transcript `PIPELINE_STEP_COMPLETED`
-- enrich `INGESTION_COMPLETED`
+- enrich `INGESTION_ITEM_COMPLETED`
 
 ### Phase C
 

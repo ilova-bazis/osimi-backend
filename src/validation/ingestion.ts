@@ -96,6 +96,7 @@ export const ingestionPreviewStatusSchema = z.enum([
     "ready",
     "failed",
     "unsupported",
+    "purged",
 ]);
 
 const workerPreviewErrorSchema = z.strictObject({
@@ -330,6 +331,7 @@ export const updateIngestionItemBodySchema = z
         title: z.string().trim().min(1).nullable().optional(),
         description: z.string().nullable().optional(),
         tags: z.array(z.string().trim().min(1)).optional(),
+        people: z.array(z.string().trim().min(1)).optional(),
         dates: ingestionItemDatesPatchSchema.optional(),
     })
     .refine((value) => Object.keys(value).length > 0, {

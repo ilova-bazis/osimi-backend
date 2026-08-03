@@ -14,7 +14,7 @@ interface MigrationRecord {
   checksum_sha256: string;
 }
 
-interface MigrationFile {
+export interface MigrationFile {
   name: string;
   sql: string;
   checksum: string;
@@ -78,7 +78,9 @@ export function resolveMigrationSchema(params: {
   return { schema, warnings };
 }
 
-async function readMigrationFiles(migrationsDir: string): Promise<MigrationFile[]> {
+export async function readMigrationFiles(
+  migrationsDir = DEFAULT_MIGRATIONS_DIR,
+): Promise<MigrationFile[]> {
   try {
     const glob = new Bun.Glob("*.sql");
     const names = await Array.fromAsync(glob.scan({ cwd: migrationsDir }));

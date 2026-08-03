@@ -5,10 +5,18 @@ const DEFAULT_FAILED_CANCELED_RETENTION_DAYS = 14;
 const DEFAULT_STUCK_THRESHOLD_MINUTES = 60;
 const DEFAULT_RETENTION_INTERVAL_SECONDS = 300;
 const DEFAULT_STUCK_INTERVAL_SECONDS = 120;
+const DEFAULT_RETENTION_BATCH_SIZE = 25;
+const DEFAULT_RETENTION_CLAIM_TIMEOUT_SECONDS = 900;
 
-interface JobRuntime {
-  stop: () => void;
+export interface JobRuntime {
+  stop: () => Promise<void>;
+  activeCount: () => number;
 }
+
+const disabledJobRuntime: JobRuntime = {
+  stop: () => Promise.resolve(),
+  activeCount: () => 0,
+};
 
 function parseIntegerEnv(rawValue: string | undefined, fallback: number, label: string): number {
   if (!rawValue) {
@@ -63,14 +71,14 @@ function logJobEvent(level: "INFO" | "WARN" | "ERROR", event: string, fields: Re
   console.info(JSON.stringify(payload));
 }
 
-export function startBackgroundJobs(): JobRuntime | undefined {
+export function startBackgroundJobs(): JobRuntime {
   const enabled = parseBooleanEnv(process.env.BACKGROUND_JOBS_ENABLED, true);
 
   if (!enabled) {
     logJobEvent("INFO", "jobs.disabled", {
       reason: "BACKGROUND_JOBS_ENABLED=false",
     });
-    return undefined;
+    return disabledJobRuntime;
   }
 
   const completedRetentionDays = parseIntegerEnv(
@@ -94,6 +102,16 @@ export function startBackgroundJobs(): JobRuntime | undefined {
     DEFAULT_RETENTION_INTERVAL_SECONDS,
     "STAGING_RETENTION_SWEEP_INTERVAL_SECONDS",
   );
+  const retentionBatchSize = parseIntegerEnv(
+    process.env.STAGING_RETENTION_BATCH_SIZE,
+    DEFAULT_RETENTION_BATCH_SIZE,
+    "STAGING_RETENTION_BATCH_SIZE",
+  );
+  const retentionClaimTimeoutSeconds = parseIntegerEnv(
+    process.env.STAGING_RETENTION_CLAIM_TIMEOUT_SECONDS,
+    DEFAULT_RETENTION_CLAIM_TIMEOUT_SECONDS,
+    "STAGING_RETENTION_CLAIM_TIMEOUT_SECONDS",
+  );
   const stuckIntervalSeconds = parseIntegerEnv(
     process.env.STUCK_ATTENTION_INTERVAL_SECONDS,
     DEFAULT_STUCK_INTERVAL_SECONDS,
@@ -105,12 +123,15 @@ export function startBackgroundJobs(): JobRuntime | undefined {
       const result = await runStagingRetentionSweep({
         completedRetentionDays,
         failedCanceledRetentionDays,
+        batchSize: retentionBatchSize,
+        claimTimeoutSeconds: retentionClaimTimeoutSeconds,
       });
 
       logJobEvent("INFO", "jobs.staging_retention", {
-        scanned: result.scanned,
-        deleted: result.deleted,
+        claimed: result.claimed,
+        purged: result.purged,
         missing: result.missing,
+        failed: result.failed,
         completed_retention_days: completedRetentionDays,
         failed_canceled_retention_days: failedCanceledRetentionDays,
       });
@@ -139,15 +160,42 @@ export function startBackgroundJobs(): JobRuntime | undefined {
     }
   };
 
-  void runRetention();
-  void runStuckAttention();
+  const activeJobs = new Set<Promise<void>>();
+  let stopping = false;
+  let retentionRunning = false;
+  let stopPromise: Promise<void> | undefined;
+
+  const track = (job: () => Promise<void>): void => {
+    if (stopping) {
+      return;
+    }
+    const active = job();
+    activeJobs.add(active);
+    void active.finally(() => activeJobs.delete(active));
+  };
+
+  const runRetentionSingleFlight = async (): Promise<void> => {
+    if (retentionRunning) {
+      logJobEvent("INFO", "jobs.staging_retention.skipped", { reason: "already_running" });
+      return;
+    }
+    retentionRunning = true;
+    try {
+      await runRetention();
+    } finally {
+      retentionRunning = false;
+    }
+  };
+
+  track(runRetentionSingleFlight);
+  track(runStuckAttention);
 
   const retentionTimer = setInterval(() => {
-    void runRetention();
+    track(runRetentionSingleFlight);
   }, retentionIntervalSeconds * 1000);
 
   const stuckTimer = setInterval(() => {
-    void runStuckAttention();
+    track(runStuckAttention);
   }, stuckIntervalSeconds * 1000);
 
   logJobEvent("INFO", "jobs.started", {
@@ -155,15 +203,24 @@ export function startBackgroundJobs(): JobRuntime | undefined {
     stuck_interval_seconds: stuckIntervalSeconds,
     completed_retention_days: completedRetentionDays,
     failed_canceled_retention_days: failedCanceledRetentionDays,
+    batch_size: retentionBatchSize,
+    claim_timeout_seconds: retentionClaimTimeoutSeconds,
     stuck_threshold_minutes: stuckThresholdMinutes,
   });
 
   return {
-    stop: () => {
+    stop: (): Promise<void> => {
+      if (stopPromise) {
+        return stopPromise;
+      }
+      stopping = true;
       clearInterval(retentionTimer);
       clearInterval(stuckTimer);
 
       logJobEvent("INFO", "jobs.stopped", {});
+      stopPromise = Promise.all([...activeJobs]).then(() => undefined);
+      return stopPromise;
     },
+    activeCount: () => activeJobs.size,
   };
 }

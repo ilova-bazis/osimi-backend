@@ -13,12 +13,12 @@ The UI work is ready to adopt both contracts after backend deployment.
 
 ### Current State
 
-`GET /api/objects/:object_id/artifacts/:artifact_id/view` returns a full-file `200 OK` response from:
+`GET /api/objects/:object_id/artifacts/:artifact_id/view` supports full-file and single byte-range responses from:
 
 - `src/routes/objects.ts`
 - `src/services/object-service.ts` (`viewObjectArtifactForTenant`)
 
-The service uses `new Response(Bun.file(...))` and does not inspect `Range` or return validators.
+The service streams full files or `Bun.file(...).slice(...)` range responses, honors `If-Range`, and returns strong ETag and Last-Modified validators.
 
 ### Required Contract
 
@@ -103,7 +103,7 @@ The UI already accepts and conditionally sends:
 { "people": ["Ada Lovelace"] }
 ```
 
-However, backend `updateIngestionItemBodySchema` rejects `people`. The existing metadata merger already supports nested JSON patches.
+The backend accepts `people` and maps it to `summary.people.mentioned` while the existing metadata merger preserves sibling fields.
 
 Relevant files:
 

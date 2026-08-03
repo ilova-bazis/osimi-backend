@@ -10,6 +10,7 @@ export type ErrorCode =
   | "REVISION_CONFLICT"
   | "LOCKED"
   | "VALIDATION_FAILED"
+  | "SERVICE_UNAVAILABLE"
   | "CONFIGURATION_ERROR"
   | "INTERNAL_SERVER_ERROR";
 
@@ -88,6 +89,12 @@ export class LockedError extends AppError {
 export class UnprocessableEntityError extends AppError {
   constructor(message: string, details?: unknown) {
     super(422, "VALIDATION_FAILED", message, { details });
+  }
+}
+
+export class ServiceUnavailableError extends AppError {
+  constructor(message = "Server is shutting down.") {
+    super(503, "SERVICE_UNAVAILABLE", message);
   }
 }
 

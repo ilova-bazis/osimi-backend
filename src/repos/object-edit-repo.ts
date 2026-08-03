@@ -1,4 +1,6 @@
 import { withSchemaClient } from "../db/client.ts";
+import type { UserRole } from "../auth/types.ts";
+import { isObjectAccessAuthorized } from "../domain/objects/access-policy.ts";
 import {
   type ArchiveRequestSqlExecutor,
   createArchiveRequestWithExecutor,
@@ -112,6 +114,8 @@ export interface ListObjectEditEventsResult {
 
 export type UpdateCuratedDocumentPagesResult =
   | { status: "not_found" }
+  | { status: "unauthorized" }
+  | { status: "locked"; lockedBy: string; lockedUntil: Date }
   | { status: "invalid_media_type" }
   | { status: "revision_conflict"; latestRevision: number }
   | { status: "invalid_page_numbers"; invalidPageNumbers: number[] }
@@ -119,6 +123,8 @@ export type UpdateCuratedDocumentPagesResult =
 
 export type SubmitDocumentCurationResult =
   | { status: "not_found" }
+  | { status: "unauthorized" }
+  | { status: "locked"; lockedBy: string; lockedUntil: Date }
   | { status: "invalid_media_type" }
   | { status: "revision_conflict"; latestRevision: number }
   | { status: "deduped"; record: ObjectEditRecord; request: SubmittedCurationRequestRecord }
@@ -126,6 +132,8 @@ export type SubmitDocumentCurationResult =
 
 export type UpdateObjectEditMetadataResult =
   | { status: "not_found" }
+  | { status: "unauthorized" }
+  | { status: "locked"; lockedBy: string; lockedUntil: Date }
   | { status: "revision_conflict"; latestRevision: number }
   | { status: "updated"; record: ObjectEditRecord };
 
@@ -142,6 +150,43 @@ export type ReleaseObjectEditLockResult =
 
 function normalizeList(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))];
+}
+
+function getActiveLockHeldByAnotherUser(
+  row: ObjectEditRow,
+  userId: string,
+): { lockedBy: string; lockedUntil: Date } | undefined {
+  if (
+    row.locked_by &&
+    row.locked_until &&
+    row.locked_until > new Date() &&
+    row.locked_by !== userId
+  ) {
+    return {
+      lockedBy: row.locked_by,
+      lockedUntil: row.locked_until,
+    };
+  }
+}
+
+async function isObjectEditAuthorized(
+  sql: ArchiveRequestSqlExecutor,
+  params: { tenantId: string; objectId: string; userId: string; role: UserRole; accessLevel: ObjectEditRow["access_level"] },
+): Promise<boolean> {
+  const assignments = await sql<{ granted_level: "family" | "private" }[]>`
+    SELECT granted_level
+    FROM object_access_assignments
+    WHERE tenant_id = ${params.tenantId}
+      AND object_id = ${params.objectId}
+      AND user_id = ${params.userId}
+    FOR KEY SHARE
+  `;
+
+  return isObjectAccessAuthorized({
+    role: params.role,
+    accessLevel: params.accessLevel,
+    assignmentLevel: assignments[0]?.granted_level,
+  });
 }
 
 function mapObjectEdit(row: ObjectEditRow): ObjectEditRecord {
@@ -508,6 +553,7 @@ export async function updateObjectEditMetadata(params: {
   tenantId: string;
   objectId: string;
   actorUserId: string;
+  actorRole: UserRole;
   revision: number;
   title: string;
   publicationDate: string;
@@ -530,6 +576,21 @@ export async function updateObjectEditMetadata(params: {
 
       if (!currentRow) {
         return { status: "not_found" };
+      }
+
+      if (!await isObjectEditAuthorized(transaction, {
+        tenantId: params.tenantId,
+        objectId: params.objectId,
+        userId: params.actorUserId,
+        role: params.actorRole,
+        accessLevel: currentRow.access_level,
+      })) {
+        return { status: "unauthorized" };
+      }
+
+      const activeLock = getActiveLockHeldByAnotherUser(currentRow, params.actorUserId);
+      if (activeLock) {
+        return { status: "locked", ...activeLock };
       }
 
       await transaction`
@@ -734,6 +795,7 @@ export async function updateCuratedDocumentPages(params: {
   tenantId: string;
   objectId: string;
   actorUserId: string;
+  actorRole: UserRole;
   revision: number;
   pages: Array<{ pageNumber: number; curatedText: string }>;
 }): Promise<UpdateCuratedDocumentPagesResult> {
@@ -747,6 +809,21 @@ export async function updateCuratedDocumentPages(params: {
 
       if (!currentRow) {
         return { status: "not_found" };
+      }
+
+      if (!await isObjectEditAuthorized(transaction, {
+        tenantId: params.tenantId,
+        objectId: params.objectId,
+        userId: params.actorUserId,
+        role: params.actorRole,
+        accessLevel: currentRow.access_level,
+      })) {
+        return { status: "unauthorized" };
+      }
+
+      const activeLock = getActiveLockHeldByAnotherUser(currentRow, params.actorUserId);
+      if (activeLock) {
+        return { status: "locked", ...activeLock };
       }
 
       if (currentRow.type !== "DOCUMENT") {
@@ -859,6 +936,7 @@ export async function submitDocumentCuration(params: {
   tenantId: string;
   objectId: string;
   actorUserId: string;
+  actorRole: UserRole;
   revision: number;
   requestId: string;
   idempotencyKey: string;
@@ -875,6 +953,21 @@ export async function submitDocumentCuration(params: {
 
       if (!currentRow) {
         return { status: "not_found" };
+      }
+
+      if (!await isObjectEditAuthorized(transaction, {
+        tenantId: params.tenantId,
+        objectId: params.objectId,
+        userId: params.actorUserId,
+        role: params.actorRole,
+        accessLevel: currentRow.access_level,
+      })) {
+        return { status: "unauthorized" };
+      }
+
+      const activeLock = getActiveLockHeldByAnotherUser(currentRow, params.actorUserId);
+      if (activeLock) {
+        return { status: "locked", ...activeLock };
       }
 
       if (currentRow.type !== "DOCUMENT") {

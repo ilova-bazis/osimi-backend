@@ -15,6 +15,7 @@ describe("object routes", () => {
     let stagingRoot = "";
 
     let operatorToken = "";
+    let unassignedArchiverToken = "";
     let viewerToken = "";
     let adminToken = "";
 
@@ -23,6 +24,7 @@ describe("object routes", () => {
     const tenantOneObjectId = "OBJ-20260209-ABC123";
     const tenantOneObjectIdTwo = "OBJ-20260209-DEF456";
     const tenantOneObjectIdThree = "OBJ-20260209-GHI789";
+    const editPolicyObjectId = "OBJ-20260209-POLICY1";
     const tenantTwoObjectId = "OBJ-20260209-XYZ789";
     const sourceIngestionId = "30000000-0000-4000-8000-000000000001";
     const artifactId = "60000000-0000-4000-8000-000000000001";
@@ -89,6 +91,7 @@ describe("object routes", () => {
 
         try {
             const operatorHash = await Bun.password.hash("operator123");
+            const unassignedArchiverHash = await Bun.password.hash("unassigned123");
             const viewerHash = await Bun.password.hash("viewer123");
             const adminHash = await Bun.password.hash("admin123");
 
@@ -105,6 +108,7 @@ describe("object routes", () => {
         INSERT INTO users (id, username, username_normalized, password_hash)
         VALUES
           (${"10000000-0000-0000-0000-000000000001"}, ${"archiver@osimi.local"}, ${"archiver@osimi.local"}, ${operatorHash}),
+          (${"10000000-0000-0000-0000-000000000004"}, ${"unassigned@osimi.local"}, ${"unassigned@osimi.local"}, ${unassignedArchiverHash}),
           (${"10000000-0000-0000-0000-000000000002"}, ${"viewer@osimi.local"}, ${"viewer@osimi.local"}, ${viewerHash}),
           (${"10000000-0000-0000-0000-000000000003"}, ${"admin@osimi.local"}, ${"admin@osimi.local"}, ${adminHash})
       `;
@@ -113,6 +117,7 @@ describe("object routes", () => {
         INSERT INTO tenant_memberships (id, tenant_id, user_id, role)
         VALUES
           (${"20000000-0000-0000-0000-000000000001"}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000001"}, ${"archiver"}),
+          (${"20000000-0000-0000-0000-000000000004"}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000004"}, ${"archiver"}),
           (${"20000000-0000-0000-0000-000000000002"}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000002"}, ${"viewer"}),
           (${"20000000-0000-0000-0000-000000000003"}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000003"}, ${"admin"})
       `;
@@ -201,6 +206,13 @@ describe("object routes", () => {
       `;
 
             await sql`
+        INSERT INTO object_access_assignments (object_id, tenant_id, user_id, granted_level, created_by)
+        VALUES
+          (${tenantOneObjectId}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000001"}, ${"private"}::object_access_granted_level, ${"10000000-0000-0000-0000-000000000003"}),
+          (${tenantOneObjectIdTwo}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000001"}, ${"private"}::object_access_granted_level, ${"10000000-0000-0000-0000-000000000003"})
+      `;
+
+            await sql`
         UPDATE objects
         SET
           created_at = ${"2026-02-09T10:00:00.000Z"}::timestamptz,
@@ -280,6 +292,20 @@ describe("object routes", () => {
 
         const operatorBody = (await operatorLogin.json()) as { token: string };
         operatorToken = operatorBody.token;
+
+        const unassignedArchiverLogin = await app.fetch(
+            new Request("http://localhost/api/auth/login", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    username: "unassigned@osimi.local",
+                    password: "unassigned123",
+                }),
+            }),
+        );
+
+        const unassignedArchiverBody = (await unassignedArchiverLogin.json()) as { token: string };
+        unassignedArchiverToken = unassignedArchiverBody.token;
 
         const viewerLogin = await app.fetch(
             new Request("http://localhost/api/auth/login", {
@@ -752,7 +778,64 @@ describe("object routes", () => {
         expect(viewResponse.status).toBe(200);
         expect(viewResponse.headers.get("content-type")).toBe("application/pdf");
         expect(viewResponse.headers.get("content-disposition")).toContain("inline");
+        expect(viewResponse.headers.get("content-length")).toBe("12");
+        expect(viewResponse.headers.get("accept-ranges")).toBe("bytes");
+        expect(viewResponse.headers.get("content-range")).toBeNull();
+        const etag = viewResponse.headers.get("etag");
+        const lastModified = viewResponse.headers.get("last-modified");
+        expect(etag).toBe(`"artifact-${pdfArtifactId}"`);
+        expect(lastModified).not.toBeNull();
         expect(await viewResponse.text()).toBe("pdf-content\n");
+
+        const viewUrl = `http://localhost/api/objects/${objectId}/artifacts/${pdfArtifactId}/view`;
+        const rangeResponse = await app.fetch(new Request(viewUrl, {
+            headers: { authorization: `Bearer ${viewerToken}`, range: "bytes=0-2" },
+        }));
+        expect(rangeResponse.status).toBe(206);
+        expect(rangeResponse.headers.get("content-range")).toBe("bytes 0-2/12");
+        expect(rangeResponse.headers.get("content-length")).toBe("3");
+        expect(await rangeResponse.text()).toBe("pdf");
+
+        const openEndedResponse = await app.fetch(new Request(viewUrl, {
+            headers: { authorization: `Bearer ${viewerToken}`, range: "bytes=3-" },
+        }));
+        expect(openEndedResponse.status).toBe(206);
+        expect(openEndedResponse.headers.get("content-range")).toBe("bytes 3-11/12");
+        expect(await openEndedResponse.text()).toBe("-content\n");
+
+        const suffixResponse = await app.fetch(new Request(viewUrl, {
+            headers: { authorization: `Bearer ${viewerToken}`, range: "bytes=-3" },
+        }));
+        expect(suffixResponse.status).toBe(206);
+        expect(suffixResponse.headers.get("content-range")).toBe("bytes 9-11/12");
+        expect(await suffixResponse.text()).toBe("nt\n");
+
+        const unsatisfiableResponse = await app.fetch(new Request(viewUrl, {
+            headers: { authorization: `Bearer ${viewerToken}`, range: "bytes=12-" },
+        }));
+        expect(unsatisfiableResponse.status).toBe(416);
+        expect(unsatisfiableResponse.headers.get("content-range")).toBe("bytes */12");
+        expect(await unsatisfiableResponse.text()).toBe("");
+
+        const matchingIfRangeResponse = await app.fetch(new Request(viewUrl, {
+            headers: {
+                authorization: `Bearer ${viewerToken}`,
+                range: "bytes=0-2",
+                "if-range": etag!,
+            },
+        }));
+        expect(matchingIfRangeResponse.status).toBe(206);
+
+        const staleIfRangeResponse = await app.fetch(new Request(viewUrl, {
+            headers: {
+                authorization: `Bearer ${viewerToken}`,
+                range: "bytes=0-2",
+                "if-range": '"stale"',
+            },
+        }));
+        expect(staleIfRangeResponse.status).toBe(200);
+        expect(staleIfRangeResponse.headers.get("content-range")).toBeNull();
+        expect(await staleIfRangeResponse.text()).toBe("pdf-content\n");
     });
 
     test("returns request-required viewer state and rejects non-viewable artifacts", async () => {
@@ -984,6 +1067,199 @@ describe("object routes", () => {
         );
 
         expect(viewerPatchResponse.status).toBe(403);
+    });
+
+    test("enforces object assignment policy across edit operations", async () => {
+        const app = createTestApp();
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        const metadataBody = {
+            revision: 0,
+            metadata: {
+                title: "Denied edit",
+                publication_date: "",
+                date_precision: "none",
+                date_approximate: false,
+                language: null,
+                tags: [],
+                people: [],
+                description: null,
+            },
+            rights: {
+                rights_note: null,
+                sensitivity_note: null,
+            },
+        };
+        const protectedRequests = [
+            new Request(`http://localhost/api/objects/${editPolicyObjectId}`, {
+                method: "PATCH",
+                headers: { authorization: `Bearer ${unassignedArchiverToken}`, "content-type": "application/json" },
+                body: JSON.stringify({ title: "Denied title" }),
+            }),
+            new Request(`http://localhost/api/objects/${editPolicyObjectId}/edit`, {
+                headers: { authorization: `Bearer ${unassignedArchiverToken}` },
+            }),
+            new Request(`http://localhost/api/objects/${editPolicyObjectId}/metadata`, {
+                method: "PATCH",
+                headers: { authorization: `Bearer ${unassignedArchiverToken}`, "content-type": "application/json" },
+                body: JSON.stringify(metadataBody),
+            }),
+            new Request(`http://localhost/api/objects/${editPolicyObjectId}/curation/document`, {
+                method: "PUT",
+                headers: { authorization: `Bearer ${unassignedArchiverToken}`, "content-type": "application/json" },
+                body: JSON.stringify({ revision: 0, pages: [{ page_number: 1, curated_text: "Denied" }] }),
+            }),
+            new Request(`http://localhost/api/objects/${editPolicyObjectId}/curation/submit`, {
+                method: "POST",
+                headers: { authorization: `Bearer ${unassignedArchiverToken}`, "content-type": "application/json" },
+                body: JSON.stringify({ revision: 0, review_note: null }),
+            }),
+            new Request(`http://localhost/api/objects/${editPolicyObjectId}/edit-lock`, {
+                method: "DELETE",
+                headers: { authorization: `Bearer ${unassignedArchiverToken}` },
+            }),
+            new Request(`http://localhost/api/objects/${editPolicyObjectId}/curation/history`, {
+                headers: { authorization: `Bearer ${unassignedArchiverToken}` },
+            }),
+        ];
+
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+                INSERT INTO objects (object_id, tenant_id, type, title, metadata, availability_state)
+                VALUES (
+                    ${editPolicyObjectId},
+                    ${tenantOneId},
+                    ${"DOCUMENT"}::object_type,
+                    ${"Edit Policy Object"},
+                    ${{}},
+                    ${"AVAILABLE"}::object_availability_state
+                )
+            `;
+
+            const protectedResponses = await Promise.all(protectedRequests.map((request) => app.fetch(request)));
+            expect(protectedResponses.map((response) => response.status)).toEqual([403, 403, 403, 403, 403, 403, 403]);
+
+            const untouched = await sql<Array<{ title: string; event_count: string; page_count: string }>>`
+                SELECT obj.title,
+                  (SELECT count(*)::text FROM object_edit_events WHERE object_id = obj.object_id) AS event_count,
+                  (SELECT count(*)::text FROM object_curated_document_pages WHERE object_id = obj.object_id) AS page_count
+                FROM objects obj
+                WHERE obj.object_id = ${editPolicyObjectId}
+            `;
+            expect(untouched[0]).toEqual({ title: "Edit Policy Object", event_count: "0", page_count: "0" });
+
+            await sql`
+                INSERT INTO object_access_assignments (object_id, tenant_id, user_id, granted_level, created_by)
+                VALUES (${editPolicyObjectId}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000004"}, ${"family"}::object_access_granted_level, ${"10000000-0000-0000-0000-000000000003"})
+            `;
+            await sql`
+                UPDATE objects
+                SET access_level = ${"family"}::object_access_level
+                WHERE object_id = ${editPolicyObjectId}
+            `;
+
+            const familyEdit = await app.fetch(
+                new Request(`http://localhost/api/objects/${editPolicyObjectId}`, {
+                    method: "PATCH",
+                    headers: { authorization: `Bearer ${unassignedArchiverToken}`, "content-type": "application/json" },
+                    body: JSON.stringify({ title: "Family editor title" }),
+                }),
+            );
+            expect(familyEdit.status).toBe(200);
+
+            await sql`
+                UPDATE objects
+                SET access_level = ${"private"}::object_access_level
+                WHERE object_id = ${editPolicyObjectId}
+            `;
+            const familyPrivateEdit = await app.fetch(
+                new Request(`http://localhost/api/objects/${editPolicyObjectId}/edit`, {
+                    headers: { authorization: `Bearer ${unassignedArchiverToken}` },
+                }),
+            );
+            expect(familyPrivateEdit.status).toBe(403);
+
+            await sql`
+                UPDATE object_access_assignments
+                SET granted_level = ${"private"}::object_access_granted_level
+                WHERE object_id = ${editPolicyObjectId}
+                  AND user_id = ${"10000000-0000-0000-0000-000000000004"}
+            `;
+            const privateEdit = await app.fetch(
+                new Request(`http://localhost/api/objects/${editPolicyObjectId}/edit`, {
+                    headers: { authorization: `Bearer ${unassignedArchiverToken}` },
+                }),
+            );
+            expect(privateEdit.status).toBe(200);
+
+            const adminPrivateEdit = await app.fetch(
+                new Request(`http://localhost/api/objects/${editPolicyObjectId}/edit`, {
+                    headers: { authorization: `Bearer ${adminToken}` },
+                }),
+            );
+            expect(adminPrivateEdit.status).toBe(200);
+
+            const releaseLock = await app.fetch(
+                new Request(`http://localhost/api/objects/${editPolicyObjectId}/edit-lock`, {
+                    method: "DELETE",
+                    headers: { authorization: `Bearer ${unassignedArchiverToken}` },
+                }),
+            );
+            expect(releaseLock.status).toBe(200);
+
+            await sql`
+                DELETE FROM object_access_assignments
+                WHERE object_id = ${editPolicyObjectId}
+                  AND user_id = ${"10000000-0000-0000-0000-000000000004"}
+            `;
+            await sql`
+                UPDATE objects
+                SET access_level = ${"public"}::object_access_level
+                WHERE object_id = ${editPolicyObjectId}
+            `;
+            const publicEdit = await app.fetch(
+                new Request(`http://localhost/api/objects/${editPolicyObjectId}/edit`, {
+                    headers: { authorization: `Bearer ${unassignedArchiverToken}` },
+                }),
+            );
+            expect(publicEdit.status).toBe(200);
+
+            const publicHistory = await app.fetch(
+                new Request(`http://localhost/api/objects/${editPolicyObjectId}/curation/history`, {
+                    headers: { authorization: `Bearer ${viewerToken}` },
+                }),
+            );
+            expect(publicHistory.status).toBe(200);
+
+            await sql`
+                UPDATE objects
+                SET access_level = ${"private"}::object_access_level
+                WHERE object_id = ${editPolicyObjectId}
+            `;
+            await sql`
+                INSERT INTO object_access_assignments (object_id, tenant_id, user_id, granted_level, created_by)
+                VALUES (${editPolicyObjectId}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000002"}, ${"private"}::object_access_granted_level, ${"10000000-0000-0000-0000-000000000003"})
+            `;
+            const assignedViewerHistory = await app.fetch(
+                new Request(`http://localhost/api/objects/${editPolicyObjectId}/curation/history`, {
+                    headers: { authorization: `Bearer ${viewerToken}` },
+                }),
+            );
+            expect(assignedViewerHistory.status).toBe(200);
+
+            const crossTenantEdit = await app.fetch(
+                new Request(`http://localhost/api/objects/${tenantTwoObjectId}/edit`, {
+                    headers: { authorization: `Bearer ${adminToken}` },
+                }),
+            );
+            expect(crossTenantEdit.status).toBe(404);
+        } finally {
+            await sql`
+                DELETE FROM objects
+                WHERE object_id = ${editPolicyObjectId}
+            `;
+            await sql.close();
+        }
     });
 
     test("returns object edit payload with metadata foundation", async () => {
@@ -1719,6 +1995,64 @@ describe("object routes", () => {
 
         expect(body.error.code).toBe("REVISION_CONFLICT");
         expect(body.error.details.latest_revision).toBe(1);
+    });
+
+    test("serializes concurrent metadata edits at the object revision", async () => {
+        const app = createTestApp();
+
+        await resetObjectEditState({
+            objectId: tenantOneObjectId,
+            metadata: { source: "scanner-a" },
+            updatedAtIso: "2026-02-09T10:00:00.000Z",
+        });
+
+        const request = (title: string) => app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/metadata`, {
+                method: "PATCH",
+                headers: {
+                    authorization: `Bearer ${operatorToken}`,
+                    "content-type": "application/json",
+                },
+                body: JSON.stringify({
+                    revision: 0,
+                    metadata: {
+                        title,
+                        publication_date: "",
+                        date_precision: "none",
+                        date_approximate: false,
+                        language: null,
+                        tags: [],
+                        people: [],
+                        description: null,
+                    },
+                    rights: {
+                        rights_note: null,
+                        sensitivity_note: null,
+                    },
+                }),
+            }),
+        );
+
+        const responses = await Promise.all([
+            request("Concurrent metadata edit one"),
+            request("Concurrent metadata edit two"),
+        ]);
+
+        expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            const rows = await sql<Array<{ revision: number; event_count: string }>>`
+                SELECT edit.revision,
+                       (SELECT count(*)::text FROM object_edit_events WHERE object_id = edit.object_id) AS event_count
+                FROM object_edits edit
+                WHERE edit.object_id = ${tenantOneObjectId}
+            `;
+            expect(rows).toEqual([{ revision: 1, event_count: "1" }]);
+        } finally {
+            await sql.close();
+        }
     });
 
     test("rejects invalid document OCR page updates", async () => {

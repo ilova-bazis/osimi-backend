@@ -1022,7 +1022,7 @@ describe("lease routes", () => {
     expect(leaseBody.lease.items[0]?.files.map((file) => file.sort_order)).toEqual([1, 2]);
   });
 
-  test("rejects lease when committed files are not linked to ingestion items", async () => {
+  test("rejects submission when committed files are not linked to ingestion items", async () => {
     const app = createTestApp();
 
     const createResponse = await app.fetch(
@@ -1092,35 +1092,9 @@ describe("lease routes", () => {
         },
       }),
     );
-    expect(submitResponse.status).toBe(200);
-
-    const leaseResponse = await app.fetch(
-      new Request("http://localhost/api/ingestions/lease", {
-        method: "POST",
-        headers: {
-          "x-worker-auth-token": "worker-secret",
-          "x-worker-id": "worker-unlinked",
-        },
-      }),
-    );
-    expect(leaseResponse.status).toBe(409);
+    expect(submitResponse.status).toBe(409);
     expect(await getLeaseState(schema, ingestionId)).toEqual({
-      status: "QUEUED",
-      activeLeaseCount: 0,
-    });
-
-    const targetedLeaseResponse = await app.fetch(
-      new Request(`http://localhost/api/ingestions/${ingestionId}/lease`, {
-        method: "POST",
-        headers: {
-          "x-worker-auth-token": "worker-secret",
-          "x-worker-id": "worker-unlinked",
-        },
-      }),
-    );
-    expect(targetedLeaseResponse.status).toBe(409);
-    expect(await getLeaseState(schema, ingestionId)).toEqual({
-      status: "QUEUED",
+      status: "UPLOADING",
       activeLeaseCount: 0,
     });
   });

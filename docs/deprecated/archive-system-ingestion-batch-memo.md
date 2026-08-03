@@ -104,7 +104,6 @@ Validation requirements:
 
 - `ingestion_item_id` is required for `INGESTION_ITEM_*` events
 - `object_id` is required for:
-  - `INGESTION_COMPLETED`
   - `INGESTION_ITEM_COMPLETED`
   - `OBJECT_CREATED`
   - `ARTIFACT_CREATED`
@@ -122,10 +121,10 @@ Item-level completion/failure updates `ingestion_items` state.
 Ingestion aggregate status is derived from item outcomes:
 
 - `COMPLETED` when all items complete successfully
-- `COMPLETED_WITH_ERRORS` when mixed success/failure/skip exists
-- `FAILED` when all terminal and no useful success
+- `COMPLETED_WITH_ERRORS` when at least one item completed and at least one failed
+- `FAILED` when failed items exist and no item completed, including failed-plus-skipped
 
-Legacy ingestion-level completion events continue to work.
+`INGESTION_COMPLETED` is aggregate-only: it has no `object_id` or `ingestion_item_id`, creates no object, and may not terminalize a batch while an item remains active.
 
 ---
 
@@ -196,4 +195,4 @@ Legacy ingestion-level completion events continue to work.
 1. Parse and store `lease.items[]` and `item.catalog_json`.
 2. Switch processing planner from flat file list to item-group aware batches.
 3. Emit `INGESTION_ITEM_*` events as primary progress channel.
-4. Keep existing ingestion-level completion events during transition for compatibility.
+4. Send `INGESTION_COMPLETED` only as an aggregate event without object or item identity.

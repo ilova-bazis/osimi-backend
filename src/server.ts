@@ -1,7 +1,12 @@
 import { createAppWithOptions } from "./app.ts";
 import { ConfigurationError, createErrorResponse } from "./http/errors.ts";
 import { startBackgroundJobs } from "./jobs/index.ts";
+import { runWithRuntimeConfig, resolveShutdownGracePeriodMs } from "./runtime/config.ts";
 import type { RuntimeConfig } from "./runtime/config.ts";
+import { LifecycleController } from "./runtime/lifecycle.ts";
+import { createShutdownCoordinator } from "./runtime/shutdown.ts";
+import type { ShutdownResult } from "./runtime/shutdown.ts";
+import type { RouteDefinition } from "./routes/types.ts";
 
 const DEFAULT_PORT = 3000;
 const DEFAULT_HOSTNAME = "0.0.0.0";
@@ -10,6 +15,14 @@ export interface ServerOptions {
   port?: number;
   hostname?: string;
   runtimeConfig?: RuntimeConfig;
+  routeDefinitions?: RouteDefinition[];
+}
+
+export interface RunningServer {
+  server: Bun.Server<unknown>;
+  lifecycle: LifecycleController;
+  shutdown(reason: string): Promise<ShutdownResult>;
+  forceShutdown(reason: string): Promise<ShutdownResult>;
 }
 
 function resolvePort(rawValue: string | undefined): number {
@@ -28,8 +41,14 @@ function resolvePort(rawValue: string | undefined): number {
   return parsed;
 }
 
-export function startServer(options: ServerOptions = {}): Bun.Server<unknown> {
-  const app = createAppWithOptions({ runtimeConfig: options.runtimeConfig });
+export function startServer(options: ServerOptions = {}): RunningServer {
+  const lifecycle = new LifecycleController();
+  const runtimeConfig = options.runtimeConfig ?? {};
+  const app = createAppWithOptions({
+    runtimeConfig,
+    lifecycle,
+    routeDefinitions: options.routeDefinitions,
+  });
   const port = options.port ?? resolvePort(process.env.PORT);
   const hostname = options.hostname ?? process.env.HOST ?? DEFAULT_HOSTNAME;
 
@@ -45,15 +64,25 @@ export function startServer(options: ServerOptions = {}): Bun.Server<unknown> {
     },
   });
 
-  const jobs = startBackgroundJobs();
-
-  const shutdown = (): void => {
-    jobs?.stop();
-  };
-
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  let jobs;
+  try {
+    jobs = runWithRuntimeConfig(runtimeConfig, startBackgroundJobs);
+  } catch (error) {
+    void server.stop(true);
+    throw error;
+  }
+  const shutdown = createShutdownCoordinator({
+    lifecycle,
+    server,
+    jobs,
+    gracePeriodMs: resolveShutdownGracePeriodMs(runtimeConfig),
+  });
 
   console.info(`[server] listening on http://${hostname}:${port}`);
-  return server;
+  return {
+    server,
+    lifecycle,
+    shutdown: shutdown.shutdown,
+    forceShutdown: shutdown.forceShutdown,
+  };
 }

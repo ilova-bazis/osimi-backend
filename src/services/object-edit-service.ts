@@ -1,12 +1,16 @@
+import { rm } from "node:fs/promises";
+
 import { encodeCursor } from "../http/pagination.ts";
 import {
   ConflictError,
+  ForbiddenError,
   LockedError,
   NotFoundError,
   RevisionConflictError,
   UnprocessableEntityError,
 } from "../http/errors.ts";
 import type { AuthenticatedContext } from "../auth/guards.ts";
+import { requireObjectEditAccess } from "./object-edit-authorization.ts";
 import { listArtifactsByObjectId, type ObjectArtifactRecord } from "../repos/object-repo.ts";
 import {
   acquireObjectEditLock,
@@ -212,6 +216,11 @@ export async function getObjectEditDetail(params: {
   auth: AuthenticatedContext;
   objectId: string;
 }): Promise<ObjectEditResponse> {
+  await requireObjectEditAccess({
+    auth: params.auth,
+    objectId: params.objectId,
+  });
+
   const record = await findObjectEditById({
     tenantId: params.auth.tenantId,
     objectId: params.objectId,
@@ -256,24 +265,11 @@ export async function patchObjectMetadataForTenant(params: {
   objectId: string;
   body: PatchObjectMetadataBody;
 }): Promise<PatchObjectMetadataResponse> {
-  const lockRecord = await findObjectEditById({
-    tenantId: params.auth.tenantId,
-    objectId: params.objectId,
-  });
-
-  if (lockRecord && lockRecord.lockedBy && lockRecord.lockedUntil && lockRecord.lockedUntil > new Date()) {
-    if (lockRecord.lockedBy !== params.auth.userId) {
-      throw new LockedError("Object is currently being edited by another user.", {
-        locked_by: lockRecord.lockedBy,
-        locked_until: lockRecord.lockedUntil.toISOString(),
-      });
-    }
-  }
-
   const result = await updateObjectEditMetadata({
     tenantId: params.auth.tenantId,
     objectId: params.objectId,
     actorUserId: params.auth.userId,
+    actorRole: params.auth.role,
     revision: params.body.revision,
     title: params.body.metadata.title,
     publicationDate: params.body.metadata.publication_date,
@@ -289,6 +285,17 @@ export async function patchObjectMetadataForTenant(params: {
 
   if (result.status === "not_found") {
     throw new NotFoundError(`Object '${params.objectId}' was not found.`);
+  }
+
+  if (result.status === "unauthorized") {
+    throw new ForbiddenError("You are not authorized to edit this object.");
+  }
+
+  if (result.status === "locked") {
+    throw new LockedError("Object is currently being edited by another user.", {
+      locked_by: result.lockedBy,
+      locked_until: result.lockedUntil.toISOString(),
+    });
   }
 
   if (result.status === "revision_conflict") {
@@ -310,24 +317,11 @@ export async function putDocumentCurationForTenant(params: {
   objectId: string;
   body: PutDocumentCurationBody;
 }): Promise<PutDocumentCurationResponse> {
-  const lockRecord = await findObjectEditById({
-    tenantId: params.auth.tenantId,
-    objectId: params.objectId,
-  });
-
-  if (lockRecord && lockRecord.lockedBy && lockRecord.lockedUntil && lockRecord.lockedUntil > new Date()) {
-    if (lockRecord.lockedBy !== params.auth.userId) {
-      throw new LockedError("Object is currently being edited by another user.", {
-        locked_by: lockRecord.lockedBy,
-        locked_until: lockRecord.lockedUntil.toISOString(),
-      });
-    }
-  }
-
   const result = await updateCuratedDocumentPages({
     tenantId: params.auth.tenantId,
     objectId: params.objectId,
     actorUserId: params.auth.userId,
+    actorRole: params.auth.role,
     revision: params.body.revision,
     pages: params.body.pages.map((page) => ({
       pageNumber: page.page_number,
@@ -337,6 +331,17 @@ export async function putDocumentCurationForTenant(params: {
 
   if (result.status === "not_found") {
     throw new NotFoundError(`Object '${params.objectId}' was not found.`);
+  }
+
+  if (result.status === "unauthorized") {
+    throw new ForbiddenError("You are not authorized to edit this object.");
+  }
+
+  if (result.status === "locked") {
+    throw new LockedError("Object is currently being edited by another user.", {
+      locked_by: result.lockedBy,
+      locked_until: result.lockedUntil.toISOString(),
+    });
   }
 
   if (result.status === "invalid_media_type") {
@@ -376,6 +381,11 @@ export async function submitObjectCurationForTenant(params: {
   objectId: string;
   body: SubmitObjectCurationBody;
 }): Promise<SubmitObjectCurationResponse> {
+  await requireObjectEditAccess({
+    auth: params.auth,
+    objectId: params.objectId,
+  });
+
   const record = await findObjectEditById({
     tenantId: params.auth.tenantId,
     objectId: params.objectId,
@@ -393,20 +403,6 @@ export async function submitObjectCurationForTenant(params: {
         object_id: params.objectId,
       },
     );
-  }
-
-  const lockRecord = await findObjectEditById({
-    tenantId: params.auth.tenantId,
-    objectId: params.objectId,
-  });
-
-  if (lockRecord && lockRecord.lockedBy && lockRecord.lockedUntil && lockRecord.lockedUntil > new Date()) {
-    if (lockRecord.lockedBy !== params.auth.userId) {
-      throw new LockedError("Object is currently being edited by another user.", {
-        locked_by: lockRecord.lockedBy,
-        locked_until: lockRecord.lockedUntil.toISOString(),
-      });
-    }
   }
 
   const documentPayload = await buildDocumentCurationPayload(record);
@@ -449,6 +445,7 @@ export async function submitObjectCurationForTenant(params: {
     tenantId: params.auth.tenantId,
     objectId: params.objectId,
     actorUserId: params.auth.userId,
+    actorRole: params.auth.role,
     revision: params.body.revision,
     requestId,
     idempotencyKey,
@@ -468,6 +465,19 @@ export async function submitObjectCurationForTenant(params: {
 
   if (result.status === "not_found") {
     throw new NotFoundError(`Object '${params.objectId}' was not found.`);
+  }
+
+  if (result.status === "unauthorized") {
+    await rm(filePath, { force: true });
+    throw new ForbiddenError("You are not authorized to edit this object.");
+  }
+
+  if (result.status === "locked") {
+    await rm(filePath, { force: true });
+    throw new LockedError("Object is currently being edited by another user.", {
+      locked_by: result.lockedBy,
+      locked_until: result.lockedUntil.toISOString(),
+    });
   }
 
   if (result.status === "invalid_media_type") {
@@ -504,6 +514,11 @@ export async function releaseObjectEditLockForTenant(params: {
   auth: AuthenticatedContext;
   objectId: string;
 }): Promise<{ object_id: string; released: boolean }> {
+  await requireObjectEditAccess({
+    auth: params.auth,
+    objectId: params.objectId,
+  });
+
   const result = await releaseObjectEditLock({
     tenantId: params.auth.tenantId,
     objectId: params.objectId,
@@ -525,6 +540,11 @@ export async function getObjectEditHistoryForTenant(params: {
   objectId: string;
   query: ObjectEditHistoryQuery;
 }): Promise<ObjectEditHistoryResponse> {
+  await requireObjectEditAccess({
+    auth: params.auth,
+    objectId: params.objectId,
+  });
+
   const record = await findObjectEditById({
     tenantId: params.auth.tenantId,
     objectId: params.objectId,

@@ -45,6 +45,7 @@ import {
   updateIngestionFileOverrides as updateIngestionFileOverridesRecord,
   uploadFileBySignedToken as uploadFileBySignedTokenRecord,
 } from "../services/ingestion-service.ts";
+import { runIdempotentIngestionMutation } from "../services/ingestion-idempotency-service.ts";
 import { extractPathParam } from "./params.ts";
 import type { RouteDefinition } from "./types.ts";
 
@@ -54,15 +55,15 @@ const createIngestionRoute: RouteDefinition = {
   handler: async (request, context) => {
     const auth = requireRole(context, ["archiver", "admin"]);
     const body = parseCreateIngestionBody(await parseJsonBody(request));
-    return jsonResponse(
-      await createIngestionDraftRecord({
-        auth,
-        body,
-      }),
-      {
-        status: 201,
-      },
-    );
+    const result = await runIdempotentIngestionMutation({
+      auth,
+      idempotencyKey: context.idempotencyKey,
+      endpoint: "ingestions.create.v1",
+      request: { body },
+      statusCode: 201,
+      handler: (executor) => createIngestionDraftRecord({ auth, body, executor }),
+    });
+    return jsonResponse(result.body, { status: result.statusCode });
   },
 };
 
@@ -159,16 +160,20 @@ const presignFileRoute: RouteDefinition = {
     );
     const body = parseCreatePresignedUploadBody(await parseJsonBody(request));
 
-    return jsonResponse(
-      await createPresignedUploadRecord({
+    const result = await runIdempotentIngestionMutation({
+      auth,
+      idempotencyKey: context.idempotencyKey,
+      endpoint: "ingestions.files.presign.v1",
+      request: { ingestion_id: ingestionId, body },
+      statusCode: 201,
+      handler: (executor) => createPresignedUploadRecord({
         auth,
         ingestionId,
         body,
+        executor,
       }),
-      {
-        status: 201,
-      },
-    );
+    });
+    return jsonResponse(result.body, { status: result.statusCode });
   },
 };
 
@@ -253,13 +258,20 @@ const commitFileRoute: RouteDefinition = {
     );
     const body = parseCommitUploadedFileBody(await parseJsonBody(request));
 
-    return jsonResponse(
-      await commitUploadedFileRecord({
+    const result = await runIdempotentIngestionMutation({
+      auth,
+      idempotencyKey: context.idempotencyKey,
+      endpoint: "ingestions.files.commit.v1",
+      request: { ingestion_id: ingestionId, body },
+      statusCode: 200,
+      handler: (executor) => commitUploadedFileRecord({
         auth,
         ingestionId,
         body,
+        executor,
       }),
-    );
+    });
+    return jsonResponse(result.body, { status: result.statusCode });
   },
 };
 
@@ -302,12 +314,15 @@ const submitIngestionRoute: RouteDefinition = {
       extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/submit$/, "id"),
     );
 
-    return jsonResponse(
-      await submitIngestionRecord({
-        auth,
-        ingestionId,
-      }),
-    );
+    const result = await runIdempotentIngestionMutation({
+      auth,
+      idempotencyKey: context.idempotencyKey,
+      endpoint: "ingestions.submit.v1",
+      request: { ingestion_id: ingestionId },
+      statusCode: 200,
+      handler: (executor) => submitIngestionRecord({ auth, ingestionId, executor }),
+    });
+    return jsonResponse(result.body, { status: result.statusCode });
   },
 };
 
@@ -359,12 +374,15 @@ const retryIngestionRoute: RouteDefinition = {
       extractPathParam(pathname, /^\/api\/ingestions\/([^/]+)\/retry$/, "id"),
     );
 
-    return jsonResponse(
-      await retryIngestionRecord({
-        auth,
-        ingestionId,
-      }),
-    );
+    const result = await runIdempotentIngestionMutation({
+      auth,
+      idempotencyKey: context.idempotencyKey,
+      endpoint: "ingestions.retry.v1",
+      request: { ingestion_id: ingestionId },
+      statusCode: 200,
+      handler: (executor) => retryIngestionRecord({ auth, ingestionId, executor }),
+    });
+    return jsonResponse(result.body, { status: result.statusCode });
   },
 };
 

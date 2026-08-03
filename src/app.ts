@@ -3,14 +3,20 @@ import {
   createErrorResponse,
   MethodNotAllowedError,
   NotFoundError,
+  ServiceUnavailableError,
 } from "./http/errors.ts";
-import { routes as defaultRoutes } from "./routes/index.ts";
+import { createRoutes } from "./routes/index.ts";
 import type { RouteDefinition } from "./routes/types.ts";
+import {
+  createReadinessService,
+  type ReadinessService,
+} from "./services/readiness-service.ts";
 import {
   runWithRuntimeConfig,
   validateRuntimeConfiguration,
   type RuntimeConfig,
 } from "./runtime/config.ts";
+import { LifecycleController } from "./runtime/lifecycle.ts";
 
 interface App {
   fetch: (request: Request) => Promise<Response>;
@@ -88,7 +94,7 @@ interface DynamicRoute {
 }
 
 export function createApp(
-  routeDefinitions: RouteDefinition[] = defaultRoutes,
+  routeDefinitions?: RouteDefinition[],
 ): App {
   return createAppWithOptions({ routeDefinitions });
 }
@@ -96,11 +102,15 @@ export function createApp(
 interface CreateAppOptions {
   routeDefinitions?: RouteDefinition[];
   runtimeConfig?: RuntimeConfig;
+  lifecycle?: LifecycleController;
+  readinessService?: ReadinessService;
 }
 
 export function createAppWithOptions(options: CreateAppOptions = {}): App {
-  const routeDefinitions = options.routeDefinitions ?? defaultRoutes;
   const runtimeConfig = options.runtimeConfig ?? {};
+  const lifecycle = options.lifecycle ?? new LifecycleController();
+  const readiness = options.readinessService ?? createReadinessService({ lifecycle });
+  const routeDefinitions = options.routeDefinitions ?? createRoutes(readiness);
   validateRuntimeConfiguration(runtimeConfig);
   const handlers = new Map<string, RouteDefinition["handler"]>();
   const methodsByPath = new Map<string, Set<string>>();
@@ -135,7 +145,18 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
 
   return {
     async fetch(request: Request): Promise<Response> {
-      return runWithRuntimeConfig(runtimeConfig, async () => {
+      const probePath = normalizePath(new URL(request.url).pathname);
+      const isProbe = probePath === "/healthz" || probePath === "/readyz";
+      const releaseRequest = isProbe ? undefined : lifecycle.admitRequest();
+      if (!isProbe && !releaseRequest) {
+        const requestId = crypto.randomUUID();
+        const response = createErrorResponse(new ServiceUnavailableError(), requestId);
+        response.headers.set("x-request-id", requestId);
+        return response;
+      }
+
+      try {
+        return await runWithRuntimeConfig(runtimeConfig, async () => {
         const corsHeaders = resolveCorsHeaders(request.headers.get("origin"));
 
         if (request.method.toUpperCase() === "OPTIONS") {
@@ -194,6 +215,8 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
             }
 
             return await handler(request, context);
+          }, {
+            skipAuth: isProbe,
           });
         } catch (error) {
           const fallbackRequestId = crypto.randomUUID();
@@ -208,7 +231,10 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
         }
 
         return response;
-      });
+        });
+      } finally {
+        releaseRequest?.();
+      }
     },
   };
 }

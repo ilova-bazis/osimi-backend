@@ -931,6 +931,8 @@ const viewArtifactRoute: RouteDefinition = {
             auth: authenticated,
             objectId,
             artifactId,
+            rangeHeader: request.headers.get("range"),
+            ifRangeHeader: request.headers.get("if-range"),
         });
     },
 };

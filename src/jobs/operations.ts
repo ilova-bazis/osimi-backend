@@ -1,11 +1,18 @@
-import { rm } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 
-import { listStagingCleanupCandidates, listStuckIngestions } from "../repos/ingestion-repo.ts";
-import { resolveStagingPath } from "../storage/staging.ts";
+import {
+  claimStagingPurgeBatch,
+  completeStagingPurge,
+  failStagingPurge,
+  listStuckIngestions,
+} from "../repos/ingestion-repo.ts";
+import { buildIngestionStagingDirectory, resolveStagingPath } from "../storage/staging.ts";
 
 export interface StagingRetentionConfig {
   completedRetentionDays: number;
   failedCanceledRetentionDays: number;
+  batchSize?: number;
+  claimTimeoutSeconds?: number;
 }
 
 export interface StuckAttentionConfig {
@@ -13,9 +20,10 @@ export interface StuckAttentionConfig {
 }
 
 export interface StagingRetentionResult {
-  scanned: number;
-  deleted: number;
+  claimed: number;
+  purged: number;
   missing: number;
+  failed: number;
 }
 
 export interface StuckAttentionResult {
@@ -31,34 +39,45 @@ export interface StuckAttentionResult {
 }
 
 export async function runStagingRetentionSweep(config: StagingRetentionConfig): Promise<StagingRetentionResult> {
-  const candidates = await listStagingCleanupCandidates({
+  const claims = await claimStagingPurgeBatch({
     completedRetentionDays: config.completedRetentionDays,
     failedCanceledRetentionDays: config.failedCanceledRetentionDays,
+    batchSize: config.batchSize ?? 25,
+    claimTimeoutSeconds: config.claimTimeoutSeconds ?? 900,
   });
 
-  let deleted = 0;
+  let purged = 0;
   let missing = 0;
+  let failed = 0;
 
-  for (const candidate of candidates) {
-    const filePath = resolveStagingPath(candidate.storageKey);
-    const file = Bun.file(filePath);
-
-    if (!(await file.exists())) {
-      missing += 1;
-      continue;
+  for (const claim of claims) {
+    const directory = resolveStagingPath(buildIngestionStagingDirectory({
+      tenantId: claim.tenantId,
+      ingestionId: claim.ingestionId,
+    }));
+    const existed = await stat(directory).then(() => true).catch(() => false);
+    try {
+      await rm(directory, { recursive: true, force: true });
+      if (await completeStagingPurge(claim)) {
+        purged += 1;
+        if (!existed) {
+          missing += 1;
+        }
+      }
+    } catch (error) {
+      failed += 1;
+      await failStagingPurge({
+        ...claim,
+        message: "filesystem_error",
+      });
     }
-
-    await rm(filePath, { force: true });
-    if (candidate.previewStorageKey) {
-      await rm(resolveStagingPath(candidate.previewStorageKey), { force: true });
-    }
-    deleted += 1;
   }
 
   return {
-    scanned: candidates.length,
-    deleted,
+    claimed: claims.length,
+    purged,
     missing,
+    failed,
   };
 }
 

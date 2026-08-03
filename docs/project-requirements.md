@@ -44,7 +44,7 @@ Responsibilities:
 - Accept files
 - Track progress and errors
 - Spawn processing pipelines
-- Produce exactly one object (MVP)
+- Act as a submission container for one or more item-scoped objects
 
 ### Object
 Represents a durable, ingested item.
@@ -68,6 +68,14 @@ Backend must support:
   - `admin` – destructive actions, user management
 
 All endpoints must be tenant-aware.
+
+### Object Editing Authorization
+
+- Object editing first requires the endpoint's role gate: mutations and edit-lock operations require `archiver` or `admin`; edit history permits `viewer`, `archiver`, or `admin`.
+- After the role gate, object access assignments govern title changes, edit-detail access, metadata, curation, curation submission, edit history, and edit-lock release.
+- `public` objects require no assignment; `family` objects require a `family` or `private` assignment; `private` objects require a `private` assignment.
+- `admin` bypasses object assignment checks. Embargo and artifact availability do not limit editing authorization.
+- An in-tenant object denied by this policy returns `403 FORBIDDEN`; missing or cross-tenant objects return `404 NOT_FOUND`.
 
 ### Session Persistence Requirements
 
@@ -101,11 +109,20 @@ DRAFT → UPLOADING → QUEUED → PROCESSING → COMPLETED
 ### Behavioral Requirements
 
 - Enforce authorization per action and state
-- Ensure idempotency for create/submit/retry operations
+- Support optional request idempotency for ingestion create, file presign, file commit, submit, and retry operations
+- Scope an idempotency key by tenant, actor, and endpoint; reject a reused key with a different canonical request as `409 CONFLICT`
+- Replay the original successful status and body for seven days; domain failures do not create a replay record
 - Validate inputs and normalize error responses
 - Apply concurrency limits per tenant/user
 - Persist audit events alongside emission for UI updates
 - As part of the v1 long polling to be used as a events delivery strategy (later expandable to SSE or WebSocket) 
+
+### Submission Manifest
+
+- Submission atomically freezes the ingestion manifest: metadata, files, items, links, and ordering can change only while the ingestion is `DRAFT`, `UPLOADING`, or `CANCELED` and has no active lease.
+- A submission requires every ingestion file to be committed (`UPLOADED` or `VALIDATED`).
+- A submission requires at least one item, every item to have a linked file, and every committed ingestion file to be linked to an item.
+- Manifest validation and the `UPLOADING` to `QUEUED` transition occur in one transaction under a parent ingestion row lock, so submission cannot race a mutable manifest write or lease assignment.
 
 ### Worker Lease Protocol
 
@@ -170,9 +187,12 @@ Compatibility expectations:
 ### Staging Cleanup & Retention
 
 - `COMPLETED`: retain staging files for 7 days, then purge
+- `COMPLETED_WITH_ERRORS`: retain staging files for 7 days, then purge
 - `FAILED` and `CANCELED`: retain staging files for 14 days, then purge
 - `DRAFT`, `UPLOADING`, `QUEUED`, `PROCESSING`: retain indefinitely
 - Temporary ingestion previews stored on VPS staging follow the same retention and purge rules as their source staged uploads.
+- Purge claims are bounded, exclusive across shared-volume backend instances, and irreversible: once claimed, staging mutations, retry, and restore are blocked.
+- Purge removes the complete ingestion staging directory, including previews, superseded immutable uploads, and temporary residue. Purged previews expose `status = purged` with no URL.
 
 #### Stuck Attention
 
@@ -252,7 +272,7 @@ Backend must provide:
 | content_type | string |
 | size_bytes | int |
 | storage_key | string |
-| preview_status | enum (`pending`, `ready`, `failed`, `unsupported`, nullable until classified) |
+| preview_status | enum (`pending`, `ready`, `failed`, `unsupported`, `purged`, nullable until classified) |
 | preview_storage_key | string (nullable) |
 | preview_content_type | string (nullable) |
 | preview_size_bytes | int (nullable) |
@@ -437,8 +457,11 @@ Purpose: allow the private worker to report ingestion progress and outcomes to t
 - `event_type` (enum)
 - `ingestion_id` (UUID)
 - `object_id` (string, conditional)
-  - required for `INGESTION_COMPLETED`, `OBJECT_CREATED`, `ARTIFACT_CREATED`
-  - nullable for ingestion/lease/pipeline progress events
+  - required for `INGESTION_ITEM_COMPLETED`, `OBJECT_CREATED`, `ARTIFACT_CREATED`
+  - not allowed for aggregate `INGESTION_COMPLETED`
+- `ingestion_item_id` (UUID, conditional)
+  - required for all `INGESTION_ITEM_*` events
+  - not allowed for aggregate `INGESTION_COMPLETED`
 - `timestamp` (UTC)
 - `payload` (JSON)
 
@@ -447,7 +470,9 @@ Purpose: allow the private worker to report ingestion progress and outcomes to t
 - At-least-once delivery; VPS must deduplicate by `event_id`
 - Ordering is best-effort and not guaranteed
 - VPS must reject events without a valid lease
-- VPS must reject conflicting object identity for the same ingestion
+- `INGESTION_ITEM_COMPLETED` is the sole object-materialization event and establishes one object identity per ingestion item.
+- `INGESTION_COMPLETED` is an aggregate batch event. It must not create, update, or identify an individual object.
+- An ingestion becomes terminal only when all of its items are terminal. All completed/skipped items produce `COMPLETED`; completed plus failed produces `COMPLETED_WITH_ERRORS`; failed-only or failed-plus-skipped produces `FAILED`.
 - Each event reservation and every database projection derived from it commit atomically.
 - Deduplication happens before event-derived writes; exact duplicates perform no projection writes.
 - Reusing an `event_id` with a different event type, scope, object identity, or payload is rejected.
@@ -456,7 +481,7 @@ Purpose: allow the private worker to report ingestion progress and outcomes to t
 #### Storage
 
 - Events are persisted in `object_events`
-- Ingestion-level events have `object_id = null`
+- Ingestion-level events have `object_id = null`; item completion events retain their item-scoped object identity.
 
 #### Recommended Event Types
 

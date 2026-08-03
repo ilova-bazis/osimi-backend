@@ -4,6 +4,8 @@ import { ConfigurationError } from "../http/errors.ts";
 
 const MINIMUM_SIGNING_SECRET_LENGTH = 32;
 export const DEFAULT_MAX_UPLOAD_SIZE_BYTES = 2 * 1024 * 1024 * 1024;
+export const DEFAULT_READINESS_TIMEOUT_MS = 1_000;
+export const DEFAULT_SHUTDOWN_GRACE_PERIOD_MS = 60_000;
 
 export interface RuntimeConfig {
   databaseUrl?: string;
@@ -13,6 +15,8 @@ export interface RuntimeConfig {
   uploadSigningSecret?: string;
   leaseSigningSecret?: string;
   maxUploadSizeBytes?: number;
+  readinessTimeoutMs?: number;
+  shutdownGracePeriodMs?: number;
 }
 
 const runtimeConfigStore = new AsyncLocalStorage<RuntimeConfig>();
@@ -90,6 +94,51 @@ export function resolveMaxUploadSizeBytes(config: RuntimeConfig = getRuntimeConf
 export function validateRuntimeConfiguration(config: RuntimeConfig = getRuntimeConfig()): void {
   validateSigningConfiguration(config);
   resolveMaxUploadSizeBytes(config);
+}
+
+function resolvePositiveInteger(params: {
+  runtimeValue: number | undefined;
+  environmentValue: string | undefined;
+  defaultValue: number;
+  source: string;
+}): number {
+  if (params.runtimeValue !== undefined) {
+    return validateMaxUploadSizeBytes(params.runtimeValue, params.source);
+  }
+  if (params.environmentValue === undefined) {
+    return params.defaultValue;
+  }
+  if (!/^[1-9][0-9]*$/.test(params.environmentValue)) {
+    throw new ConfigurationError(`${params.source} must be a positive decimal integer.`);
+  }
+  return validateMaxUploadSizeBytes(Number(params.environmentValue), params.source);
+}
+
+export function resolveReadinessTimeoutMs(config: RuntimeConfig = getRuntimeConfig()): number {
+  return resolvePositiveInteger({
+    runtimeValue: config.readinessTimeoutMs,
+    environmentValue: process.env.READINESS_TIMEOUT_MS,
+    defaultValue: DEFAULT_READINESS_TIMEOUT_MS,
+    source: "READINESS_TIMEOUT_MS",
+  });
+}
+
+export function validateWorkerConfiguration(config: RuntimeConfig = getRuntimeConfig()): void {
+  const value = config.workerAuthToken ?? process.env.WORKER_AUTH_TOKEN;
+  if (!value || value.trim().length === 0) {
+    throw new ConfigurationError("Environment variable 'WORKER_AUTH_TOKEN' is required.");
+  }
+}
+
+export function resolveShutdownGracePeriodMs(
+  config: RuntimeConfig = getRuntimeConfig(),
+): number {
+  return resolvePositiveInteger({
+    runtimeValue: config.shutdownGracePeriodMs,
+    environmentValue: process.env.SHUTDOWN_GRACE_PERIOD_MS,
+    defaultValue: DEFAULT_SHUTDOWN_GRACE_PERIOD_MS,
+    source: "SHUTDOWN_GRACE_PERIOD_MS",
+  });
 }
 
 export function runWithRuntimeConfig<T>(

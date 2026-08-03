@@ -27,9 +27,9 @@ Detailed worker integration contract: `docs/archive-system-integration.md`.
 3) Home worker leases a batch from VPS (outbound request)
 4) VPS returns lease token + signed download URLs
 5) Worker downloads files, verifies checksums, runs pipelines
-6) Worker posts progress/events to VPS (including archive-generated `object_id` on completion/object events)
-7) Worker sends `ingest_json` in completion event payload
-8) VPS marks ingestion complete and UI updates
+6) Worker posts progress/events to VPS, including one `INGESTION_ITEM_COMPLETED` per materialized object
+7) Each item completion includes its archive-generated `object_id` and `ingest_json`
+8) Worker posts aggregate `INGESTION_COMPLETED` after item outcomes; VPS derives terminal batch status from all item states
 
 ## Data Ownership
 
@@ -48,6 +48,12 @@ Detailed worker integration contract: `docs/archive-system-integration.md`.
 
 ## Failure and Recovery
 
+- `/healthz` is process liveness; `/readyz` gates traffic on lifecycle state,
+  required configuration, PostgreSQL connectivity, and exact migration history.
+- Readiness becomes false before shutdown draining begins.
+- The first process signal stops new connections and drains in-flight HTTP work,
+  jobs, and database pools within a 60-second configurable deadline. A second
+  signal or deadline expiry force-closes resources.
 - Lease expiry re-queues ingestions for another worker
 - Redundancy sweep re-queues expired leases if auto-requeue fails
 - Failed/canceled ingestions retain staging data for a limited time
@@ -78,7 +84,7 @@ sequenceDiagram
   Worker->>Worker: Verify checksums + process
   Worker->>VPS: Post events (progress)
   Worker->>Archive: Store originals + derivatives
-  Worker->>VPS: Send INGESTION_COMPLETED with ingest_json payload
-  Worker->>VPS: Mark completed
+  Worker->>VPS: Send INGESTION_ITEM_COMPLETED with object_id + ingest_json
+  Worker->>VPS: Send aggregate INGESTION_COMPLETED after item outcomes
   VPS-->>UI: Updated status/activity
 ```

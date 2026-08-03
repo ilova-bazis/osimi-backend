@@ -322,7 +322,7 @@ describe("event routes", () => {
     await resetActiveIngestions(schema);
   });
 
-  test("ingests worker events with dedupe and completion object finalization", async () => {
+  test("ingests item completion events with dedupe and object finalization", async () => {
     const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken, {
       item_kind: "scanned_document",
@@ -359,7 +359,8 @@ describe("event routes", () => {
         },
         {
           event_id: crypto.randomUUID(),
-          event_type: "INGESTION_COMPLETED",
+          event_type: "INGESTION_ITEM_COMPLETED",
+          ingestion_item_id: lease.ingestionItemId,
           object_id: "OBJ-20260213-EVT001",
           timestamp: new Date().toISOString(),
           payload: {
@@ -390,12 +391,12 @@ describe("event routes", () => {
     const firstBody = (await firstEventsResponse.json()) as {
       inserted_events: number;
       duplicate_events: number;
-      object_id: string | null;
+      object_ids: string[];
     };
 
     expect(firstBody.inserted_events).toBe(2);
     expect(firstBody.duplicate_events).toBe(0);
-    expect(typeof firstBody.object_id).toBe("string");
+    expect(firstBody.object_ids).toEqual(["OBJ-20260213-EVT001"]);
 
     const secondEventsResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
@@ -412,11 +413,12 @@ describe("event routes", () => {
     const secondBody = (await secondEventsResponse.json()) as {
       inserted_events: number;
       duplicate_events: number;
-      object_id: string | null;
+      object_ids: string[];
     };
 
     expect(secondBody.inserted_events).toBe(0);
     expect(secondBody.duplicate_events).toBe(2);
+    expect(secondBody.object_ids).toEqual(["OBJ-20260213-EVT001"]);
 
     const detailResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}`, {
@@ -504,6 +506,58 @@ describe("event routes", () => {
     }
   });
 
+  test("replays object-id-bearing event envelopes without conflict", async () => {
+    const app = createTestApp();
+    const ingestionId = await createQueuedIngestion(app, authToken);
+    const lease = await leaseIngestion(app);
+    expect(lease.ingestionId).toBe(ingestionId);
+
+    const eventPayload = {
+      lease_token: lease.leaseToken,
+      events: [
+        {
+          event_id: crypto.randomUUID(),
+          event_type: "OBJECT_CREATED",
+          object_id: "OBJ-20260213-EVT002",
+          timestamp: new Date().toISOString(),
+          payload: { source: "worker" },
+        },
+        {
+          event_id: crypto.randomUUID(),
+          event_type: "ARTIFACT_CREATED",
+          object_id: "OBJ-20260213-EVT003",
+          timestamp: new Date().toISOString(),
+          payload: { kind: "original" },
+        },
+      ],
+    };
+
+    const submit = (): Promise<Response> => app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(eventPayload),
+      }),
+    );
+
+    const first = await submit();
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({
+      inserted_events: 2,
+      duplicate_events: 0,
+    });
+
+    const replay = await submit();
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      inserted_events: 0,
+      duplicate_events: 2,
+    });
+  });
+
   test("rejects events when lease token does not match ingestion id", async () => {
     const app = createTestApp();
     const ingestionOne = await createQueuedIngestion(app, authToken);
@@ -577,7 +631,7 @@ describe("event routes", () => {
     expect(body.error.code).toBe("BAD_REQUEST");
   });
 
-  test("rejects completion event with invalid object_id format", async () => {
+  test("rejects aggregate completion events scoped to an object or item", async () => {
     const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
     const lease = await leaseIngestion(app);
@@ -596,10 +650,11 @@ describe("event routes", () => {
             {
               event_id: crypto.randomUUID(),
               event_type: "INGESTION_COMPLETED",
-              object_id: "not-an-object-id",
+              object_id: "OBJ-20260213-INVALID1",
+              ingestion_item_id: lease.ingestionItemId,
               timestamp: new Date().toISOString(),
               payload: {
-                title: "Invalid object id",
+                title: "Invalid aggregate scope",
               },
             },
           ],
@@ -656,7 +711,7 @@ describe("event routes", () => {
     expect(body.error.code).toBe("BAD_REQUEST");
   });
 
-  test("accepts out-of-order events and keeps ingestion completed", async () => {
+  test("keeps the ingestion processing when aggregate completion arrives before item outcomes", async () => {
     const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
     const lease = await leaseIngestion(app);
@@ -675,10 +730,9 @@ describe("event routes", () => {
             {
               event_id: crypto.randomUUID(),
               event_type: "INGESTION_COMPLETED",
-              object_id: "OBJ-20260213-OOO001",
               timestamp: new Date().toISOString(),
               payload: {
-                title: "Out of order object",
+                step: "aggregate-completion",
               },
             },
             {
@@ -695,6 +749,8 @@ describe("event routes", () => {
     );
 
     expect(response.status).toBe(200);
+    const body = (await response.json()) as { object_ids: string[] };
+    expect(body.object_ids).toEqual([]);
 
     const detailResponse = await app.fetch(
       new Request(`http://localhost/api/ingestions/${ingestionId}`, {
@@ -709,7 +765,20 @@ describe("event routes", () => {
     const detailBody = (await detailResponse.json()) as {
       ingestion: { status: string };
     };
-    expect(detailBody.ingestion.status).toBe("COMPLETED");
+    expect(detailBody.ingestion.status).toBe("PROCESSING");
+
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+    try {
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      const objects = await sql<Array<{ count: number }>>`
+        SELECT COUNT(*)::int AS count
+        FROM objects
+        WHERE source_ingestion_id = ${ingestionId}
+      `;
+      expect(objects[0]?.count).toBe(0);
+    } finally {
+      await sql.close();
+    }
   });
 
   test("uses ingestion item language override when creating item object", async () => {
@@ -1113,7 +1182,7 @@ describe("event routes", () => {
     expect(detailBody.ingestion.status).toBe("COMPLETED_WITH_ERRORS");
   });
 
-  test("does not duplicate object and keeps latest ingest manifest on repeated completion events", async () => {
+  test("does not duplicate an item object and keeps the latest manifest", async () => {
     const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
     const lease = await leaseIngestion(app);
@@ -1147,7 +1216,8 @@ describe("event routes", () => {
           events: [
             {
               event_id: crypto.randomUUID(),
-              event_type: "INGESTION_COMPLETED",
+              event_type: "INGESTION_ITEM_COMPLETED",
+              ingestion_item_id: lease.ingestionItemId,
               object_id: completionObjectId,
               timestamp: new Date().toISOString(),
               payload: completionPayloadUpdated,
@@ -1171,7 +1241,8 @@ describe("event routes", () => {
           events: [
             {
               event_id: crypto.randomUUID(),
-              event_type: "INGESTION_COMPLETED",
+              event_type: "INGESTION_ITEM_COMPLETED",
+              ingestion_item_id: lease.ingestionItemId,
               object_id: completionObjectId,
               timestamp: new Date().toISOString(),
               payload: completionPayload,
@@ -1211,7 +1282,7 @@ describe("event routes", () => {
     }
   });
 
-  test("does not create duplicate objects under concurrent completion requests", async () => {
+  test("does not create duplicate item objects under concurrent completion requests", async () => {
     const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken);
     const lease = await leaseIngestion(app);
@@ -1222,7 +1293,8 @@ describe("event routes", () => {
       events: [
         {
           event_id: crypto.randomUUID(),
-          event_type: "INGESTION_COMPLETED",
+          event_type: "INGESTION_ITEM_COMPLETED",
+          ingestion_item_id: lease.ingestionItemId,
           object_id: "OBJ-20260213-CONCUR1",
           timestamp: new Date().toISOString(),
           payload: {
@@ -1237,7 +1309,8 @@ describe("event routes", () => {
       events: [
         {
           event_id: crypto.randomUUID(),
-          event_type: "INGESTION_COMPLETED",
+          event_type: "INGESTION_ITEM_COMPLETED",
+          ingestion_item_id: lease.ingestionItemId,
           object_id: "OBJ-20260213-CONCUR1",
           timestamp: new Date().toISOString(),
           payload: {
@@ -1286,6 +1359,183 @@ describe("event routes", () => {
     } finally {
       await sql.close();
     }
+  });
+
+  test("returns every item-scoped object id from a multi-item completion batch", async () => {
+    const app = createTestApp();
+    const ingestionId = await createQueuedIngestion(app, authToken);
+    const lease = await leaseIngestion(app);
+    expect(lease.ingestionId).toBe(ingestionId);
+
+    const secondItemId = crypto.randomUUID();
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+    try {
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      await sql`
+        INSERT INTO ingestion_items (id, ingestion_id, item_index, title)
+        VALUES (${secondItemId}, ${ingestionId}, 2, ${"Events Item 002"})
+      `;
+    } finally {
+      await sql.close();
+    }
+
+    const response = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          lease_token: lease.leaseToken,
+          events: [
+            {
+              event_id: crypto.randomUUID(),
+              event_type: "INGESTION_ITEM_COMPLETED",
+              ingestion_item_id: lease.ingestionItemId,
+              object_id: "OBJ-20260319-MULTI01",
+              timestamp: new Date().toISOString(),
+              payload: { ingest_json: { schema_version: "1.0" } },
+            },
+            {
+              event_id: crypto.randomUUID(),
+              event_type: "INGESTION_ITEM_COMPLETED",
+              ingestion_item_id: secondItemId,
+              object_id: "OBJ-20260319-MULTI02",
+              timestamp: new Date().toISOString(),
+              payload: { ingest_json: { schema_version: "1.0" } },
+            },
+          ],
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { object_ids: string[] };
+    expect(body.object_ids).toEqual([
+      "OBJ-20260319-MULTI01",
+      "OBJ-20260319-MULTI02",
+    ]);
+
+    const itemResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/items`, {
+        headers: { authorization: `Bearer ${authToken}` },
+      }),
+    );
+    expect(itemResponse.status).toBe(200);
+    const itemBody = (await itemResponse.json()) as {
+      items: Array<{ id: string; object_id: string | null }>;
+    };
+    expect(itemBody.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: lease.ingestionItemId,
+        object_id: "OBJ-20260319-MULTI01",
+      }),
+      expect.objectContaining({
+        id: secondItemId,
+        object_id: "OBJ-20260319-MULTI02",
+      }),
+    ]));
+  });
+
+  test("derives completed from all skipped items", async () => {
+    const app = createTestApp();
+    const ingestionId = await createQueuedIngestion(app, authToken);
+    const lease = await leaseIngestion(app);
+    expect(lease.ingestionId).toBe(ingestionId);
+
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+    try {
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      await sql`
+        UPDATE ingestion_items
+        SET status = 'SKIPPED'
+        WHERE id = ${lease.ingestionItemId}
+      `;
+    } finally {
+      await sql.close();
+    }
+
+    const response = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          lease_token: lease.leaseToken,
+          events: [{
+            event_id: crypto.randomUUID(),
+            event_type: "INGESTION_COMPLETED",
+            timestamp: new Date().toISOString(),
+            payload: { step: "aggregate-completion" },
+          }],
+        }),
+      }),
+    );
+    expect(response.status).toBe(200);
+
+    const detailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}`, {
+        headers: { authorization: `Bearer ${authToken}` },
+      }),
+    );
+    const detailBody = (await detailResponse.json()) as { ingestion: { status: string } };
+    expect(detailBody.ingestion.status).toBe("COMPLETED");
+  });
+
+  test("derives failed from failed and skipped items without a completed item", async () => {
+    const app = createTestApp();
+    const ingestionId = await createQueuedIngestion(app, authToken);
+    const lease = await leaseIngestion(app);
+    expect(lease.ingestionId).toBe(ingestionId);
+
+    const secondItemId = crypto.randomUUID();
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+    try {
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      await sql`
+        INSERT INTO ingestion_items (id, ingestion_id, item_index, title)
+        VALUES (${secondItemId}, ${ingestionId}, 2, ${"Skipped and failed item"})
+      `;
+      await sql`
+        UPDATE ingestion_items
+        SET status = 'SKIPPED'
+        WHERE id = ${lease.ingestionItemId}
+      `;
+    } finally {
+      await sql.close();
+    }
+
+    const response = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          lease_token: lease.leaseToken,
+          events: [{
+            event_id: crypto.randomUUID(),
+            event_type: "INGESTION_ITEM_FAILED",
+            ingestion_item_id: secondItemId,
+            timestamp: new Date().toISOString(),
+            payload: { reason: "simulated failure" },
+          }],
+        }),
+      }),
+    );
+    expect(response.status).toBe(200);
+
+    const detailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}`, {
+        headers: { authorization: `Bearer ${authToken}` },
+      }),
+    );
+    const detailBody = (await detailResponse.json()) as { ingestion: { status: string } };
+    expect(detailBody.ingestion.status).toBe("FAILED");
   });
 
 });

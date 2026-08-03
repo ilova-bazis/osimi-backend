@@ -30,7 +30,7 @@ export interface AccessDecision {
   accessReasonCode: AccessReasonCode;
 }
 
-function isAuthorized(params: {
+export function isObjectAccessAuthorized(params: {
   role: UserRole;
   accessLevel: AccessLevel;
   assignmentLevel?: AssignmentLevel;
@@ -112,7 +112,7 @@ export function buildAccessDecision(params: {
   now?: number;
 }): AccessDecision {
   const now = params.now ?? Date.now();
-  const authorized = isAuthorized({
+  const authorized = isObjectAccessAuthorized({
     role: params.role,
     accessLevel: params.accessLevel,
     assignmentLevel: params.assignmentLevel,
