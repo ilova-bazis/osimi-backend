@@ -15,6 +15,7 @@ describe("ingestion state machine", () => {
     ["QUEUED", "PROCESSING"],
     ["PROCESSING", "QUEUED"],
     ["PROCESSING", "COMPLETED"],
+    ["PROCESSING", "COMPLETED_WITH_ERRORS"],
     ["FAILED", "QUEUED"],
     ["CANCELED", "QUEUED"],
     ["QUEUED", "QUEUED"],
@@ -27,6 +28,7 @@ describe("ingestion state machine", () => {
     ["DRAFT", "PROCESSING"],
     ["DRAFT", "COMPLETED"],
     ["COMPLETED", "QUEUED"],
+    ["COMPLETED_WITH_ERRORS", "QUEUED"],
     ["QUEUED", "COMPLETED"],
     ["FAILED", "COMPLETED"],
   ] as const)("rejects %s -> %s", (from, to) => {
@@ -37,7 +39,12 @@ describe("ingestion state machine", () => {
   });
 
   test("returns terminal statuses", () => {
-    const terminalStatuses: IngestionStatus[] = ["COMPLETED", "FAILED", "CANCELED"];
+    const terminalStatuses: IngestionStatus[] = [
+      "COMPLETED",
+      "COMPLETED_WITH_ERRORS",
+      "FAILED",
+      "CANCELED",
+    ];
     const activeStatuses: IngestionStatus[] = ["DRAFT", "UPLOADING", "QUEUED", "PROCESSING"];
 
     for (const status of terminalStatuses) {

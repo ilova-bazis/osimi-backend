@@ -338,6 +338,20 @@ export const updateIngestionItemBodySchema = z
         message: "At least one field must be provided.",
     });
 
+export const stagingPurgeSchema = z.object({
+    state: z.enum(["NOT_SCHEDULED", "PENDING", "PURGED"]),
+    started_at: z.string().nullable(),
+    purged_at: z.string().nullable(),
+});
+
+export const ingestionActionCapabilitiesSchema = z.object({
+    can_resume: z.boolean(),
+    can_retry: z.boolean(),
+    can_cancel: z.boolean(),
+    can_restore: z.boolean(),
+    can_delete: z.boolean(),
+});
+
 export const ingestionDtoSchema = z.object({
     id: z.string(),
     batch_label: z.string(),
@@ -357,6 +371,11 @@ export const ingestionDtoSchema = z.object({
     error_summary: jsonObjectSchema,
     created_at: z.string(),
     updated_at: z.string(),
+});
+
+export const ingestionResourceDtoSchema = ingestionDtoSchema.extend({
+    staging_purge: stagingPurgeSchema,
+    action_capabilities: ingestionActionCapabilitiesSchema,
 });
 
 export const ingestionFileDtoSchema = z.object({
@@ -413,7 +432,7 @@ export const ingestionItemFileDtoSchema = z.object({
 });
 
 export const ingestionListResultSchema = z.object({
-    items: z.array(ingestionDtoSchema),
+    items: z.array(ingestionResourceDtoSchema),
     nextCursor: z.string().optional(),
 });
 
@@ -426,7 +445,7 @@ export const updateIngestionResponseSchema = z.object({
 });
 
 export const getIngestionResponseSchema = z.object({
-    ingestion: ingestionDtoSchema,
+    ingestion: ingestionResourceDtoSchema,
     files: z.array(ingestionFileDtoSchema),
 });
 
@@ -563,6 +582,7 @@ export type IngestionPipelinePreset = z.infer<
     typeof ingestionPipelinePresetSchema
 >;
 export type IngestionDto = z.infer<typeof ingestionDtoSchema>;
+export type IngestionResourceDto = z.infer<typeof ingestionResourceDtoSchema>;
 export type IngestionFileDto = z.infer<typeof ingestionFileDtoSchema>;
 export type IngestionItemDto = z.infer<typeof ingestionItemDtoSchema>;
 export type IngestionItemFileDto = z.infer<typeof ingestionItemFileDtoSchema>;

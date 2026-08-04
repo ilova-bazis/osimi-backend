@@ -6,6 +6,10 @@ const MINIMUM_SIGNING_SECRET_LENGTH = 32;
 export const DEFAULT_MAX_UPLOAD_SIZE_BYTES = 2 * 1024 * 1024 * 1024;
 export const DEFAULT_READINESS_TIMEOUT_MS = 1_000;
 export const DEFAULT_SHUTDOWN_GRACE_PERIOD_MS = 60_000;
+export const DEFAULT_CORS_ALLOWED_ORIGINS = [
+  "http://localhost:4444",
+  "http://localhost:5173",
+] as const;
 
 export interface RuntimeConfig {
   databaseUrl?: string;
@@ -17,6 +21,7 @@ export interface RuntimeConfig {
   maxUploadSizeBytes?: number;
   readinessTimeoutMs?: number;
   shutdownGracePeriodMs?: number;
+  corsAllowedOrigins?: readonly string[];
 }
 
 const runtimeConfigStore = new AsyncLocalStorage<RuntimeConfig>();
@@ -91,9 +96,70 @@ export function resolveMaxUploadSizeBytes(config: RuntimeConfig = getRuntimeConf
   );
 }
 
+function normalizeCorsOrigin(value: string, source: string): string {
+  const trimmedValue = value.trim();
+
+  if (!trimmedValue) {
+    throw new ConfigurationError(`${source} must not include empty origins.`);
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmedValue);
+  } catch {
+    throw new ConfigurationError(`${source} must contain valid HTTP(S) origins.`);
+  }
+
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+    parsed.username ||
+    parsed.password ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new ConfigurationError(
+      `${source} must contain HTTP(S) origins without credentials, paths, queries, or fragments.`,
+    );
+  }
+
+  return parsed.origin;
+}
+
+function normalizeCorsOrigins(values: readonly string[], source: string): readonly string[] {
+  return [...new Set(values.map((value) => normalizeCorsOrigin(value, source)))];
+}
+
+export function parseCorsAllowedOrigins(value: string): readonly string[] {
+  if (value.trim() === "") {
+    return [];
+  }
+
+  return normalizeCorsOrigins(
+    value.split(","),
+    "Environment variable 'CORS_ALLOWED_ORIGINS'",
+  );
+}
+
+export function resolveCorsAllowedOrigins(
+  config: RuntimeConfig = getRuntimeConfig(),
+): readonly string[] {
+  if (config.corsAllowedOrigins !== undefined) {
+    return normalizeCorsOrigins(config.corsAllowedOrigins, "Runtime CORS allowed origins");
+  }
+
+  const rawValue = process.env.CORS_ALLOWED_ORIGINS;
+  if (rawValue === undefined) {
+    return [...DEFAULT_CORS_ALLOWED_ORIGINS];
+  }
+
+  return parseCorsAllowedOrigins(rawValue);
+}
+
 export function validateRuntimeConfiguration(config: RuntimeConfig = getRuntimeConfig()): void {
   validateSigningConfiguration(config);
   resolveMaxUploadSizeBytes(config);
+  resolveCorsAllowedOrigins(config);
 }
 
 function resolvePositiveInteger(params: {

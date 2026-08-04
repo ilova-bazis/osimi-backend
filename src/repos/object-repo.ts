@@ -64,9 +64,11 @@ interface ObjectArtifactRow {
     created_at: Date;
 }
 
-interface ObjectArtifactIdByObjectRow {
+interface ObjectArtifactSummaryRow {
     object_id: string;
-    artifact_id: string;
+    thumbnail_artifact_id: string | null;
+    has_access_pdf: boolean;
+    has_ocr: boolean;
 }
 
 export interface ObjectRecord {
@@ -103,6 +105,12 @@ export interface ObjectArtifactRecord {
     contentType: string;
     sizeBytes: number;
     createdAt: Date;
+}
+
+export interface ObjectArtifactSummary {
+    thumbnailArtifactId: string | null;
+    hasAccessPdf: boolean;
+    hasOcr: boolean;
 }
 
 export type ArtifactKind =
@@ -1118,53 +1126,6 @@ export async function findObjectByIdUnscoped(params: {
     return row ? mapObject(row) : undefined;
 }
 
-export async function updateObjectTitle(params: {
-    tenantId: string;
-    objectId: string;
-    title: string;
-}): Promise<ObjectRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
-        return await sql<ObjectRow[]>`
-      UPDATE objects
-      SET title = ${params.title},
-          updated_at = now()
-      WHERE tenant_id = ${params.tenantId}
-        AND object_id = ${params.objectId}
-      RETURNING
-        object_id,
-        tenant_id,
-        type,
-        title,
-        language_code,
-        metadata,
-        ingest_manifest,
-        source_ingestion_id,
-        source_ingestion_item_id,
-        (SELECT ing.batch_label FROM ingestions ing WHERE ing.id = source_ingestion_id) AS source_batch_label,
-        availability_state,
-        access_level,
-        embargo_kind,
-        processing_state,
-        curation_state,
-        embargo_until,
-        embargo_curation_state,
-        rights_note,
-        sensitivity_note,
-        created_at,
-        updated_at,
-        COALESCE((
-          SELECT array_agg(tag.name_normalized ORDER BY tag.name_normalized)
-          FROM object_tags otag
-          INNER JOIN tags tag ON tag.id = otag.tag_id
-          WHERE otag.object_id = ${params.objectId}
-        ), ARRAY[]::text[]) AS tags
-    `;
-    });
-
-    const row = rows[0];
-    return row ? mapObject(row) : undefined;
-}
-
 export async function updateObjectIngestManifest(params: {
     tenantId: string;
     objectId: string;
@@ -1453,33 +1414,59 @@ export async function findPreferredThumbnailArtifactIdByObjectId(params: {
     return rows[0]?.artifact_id;
 }
 
-export async function listPreferredThumbnailArtifactIdsByObjectIds(params: {
+export async function listObjectArtifactSummariesByObjectIds(params: {
     tenantId: string;
     objectIds: string[];
-}): Promise<Map<string, string>> {
+}): Promise<Map<string, ObjectArtifactSummary>> {
     if (params.objectIds.length === 0) {
         return new Map();
     }
 
     const rows = await withSchemaClient(async (sql) => {
-        return await sql<ObjectArtifactIdByObjectRow[]>`
-      SELECT DISTINCT ON (art.object_id)
+        return await sql<ObjectArtifactSummaryRow[]>`
+      WITH artifacts AS (
+        SELECT art.object_id, art.id, art.kind, art.variant, art.created_at
+        FROM object_artifacts art
+        INNER JOIN objects obj ON obj.object_id = art.object_id
+        WHERE obj.tenant_id = ${params.tenantId}
+          AND art.object_id IN ${sql(params.objectIds)}
+          AND art.kind IN (
+            ${"thumbnail"}::artifact_kind,
+            ${"pdf"}::artifact_kind,
+            ${"ocr_text"}::artifact_kind
+          )
+      ),
+      preferred_thumbnails AS (
+        SELECT DISTINCT ON (object_id) object_id, id AS thumbnail_artifact_id
+        FROM artifacts
+        WHERE kind = ${"thumbnail"}::artifact_kind
+        ORDER BY
+          object_id ASC,
+          CASE WHEN variant IS NULL THEN 0 ELSE 1 END ASC,
+          created_at DESC,
+          id DESC
+      )
+      SELECT
         art.object_id,
-        art.id AS artifact_id
-      FROM object_artifacts art
-      INNER JOIN objects obj ON obj.object_id = art.object_id
-      WHERE obj.tenant_id = ${params.tenantId}
-        AND art.object_id IN ${sql(params.objectIds)}
-        AND art.kind = ${"thumbnail"}::artifact_kind
-      ORDER BY
-        art.object_id ASC,
-        CASE WHEN art.variant IS NULL THEN 0 ELSE 1 END ASC,
-        art.created_at DESC,
-        art.id DESC
+        thumbnail.thumbnail_artifact_id,
+        BOOL_OR(art.kind = ${"pdf"}::artifact_kind) AS has_access_pdf,
+        BOOL_OR(art.kind = ${"ocr_text"}::artifact_kind) AS has_ocr
+      FROM artifacts art
+      LEFT JOIN preferred_thumbnails thumbnail ON thumbnail.object_id = art.object_id
+      GROUP BY art.object_id, thumbnail.thumbnail_artifact_id
     `;
     });
 
-    return new Map(rows.map((row) => [row.object_id, row.artifact_id]));
+    return new Map(
+        rows.map((row) => [
+            row.object_id,
+            {
+                thumbnailArtifactId: row.thumbnail_artifact_id,
+                hasAccessPdf: row.has_access_pdf,
+                hasOcr: row.has_ocr,
+            },
+        ]),
+    );
 }
 
 export async function findArtifactById(params: {

@@ -12,6 +12,7 @@ import {
   type ReadinessService,
 } from "./services/readiness-service.ts";
 import {
+  resolveCorsAllowedOrigins,
   runWithRuntimeConfig,
   validateRuntimeConfiguration,
   type RuntimeConfig,
@@ -22,15 +23,17 @@ interface App {
   fetch: (request: Request) => Promise<Response>;
 }
 
-const ALLOWED_ORIGINS = new Set(["http://localhost:4444", "http://localhost:5173"]);
 const ALLOWED_METHODS = "GET,POST,PATCH,PUT,DELETE,OPTIONS";
 const ALLOWED_HEADERS =
   "authorization,content-type,x-tenant-id,x-request-id,x-idempotency-key,x-worker-auth-token,x-worker-id";
 
 type CorsHeaders = Record<string, string>;
 
-function resolveCorsHeaders(origin: string | null): CorsHeaders | undefined {
-  if (!origin || !ALLOWED_ORIGINS.has(origin)) {
+function resolveCorsHeaders(
+  origin: string | null,
+  allowedOrigins: ReadonlySet<string>,
+): CorsHeaders | undefined {
+  if (!origin || !allowedOrigins.has(origin)) {
     return undefined;
   }
 
@@ -39,8 +42,18 @@ function resolveCorsHeaders(origin: string | null): CorsHeaders | undefined {
     "access-control-allow-methods": ALLOWED_METHODS,
     "access-control-allow-headers": ALLOWED_HEADERS,
     "access-control-max-age": "600",
-    vary: "Origin",
   };
+}
+
+function addVaryHeader(headers: Headers, value: string): void {
+  const existing = headers.get("vary");
+  const values = existing ? existing.split(",").map((item) => item.trim()).filter(Boolean) : [];
+
+  if (!values.some((item) => item.toLowerCase() === value.toLowerCase())) {
+    values.push(value);
+  }
+
+  headers.set("vary", values.join(", "));
 }
 
 function normalizePath(pathname: string): string {
@@ -112,6 +125,7 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
   const readiness = options.readinessService ?? createReadinessService({ lifecycle });
   const routeDefinitions = options.routeDefinitions ?? createRoutes(readiness);
   validateRuntimeConfiguration(runtimeConfig);
+  const corsAllowedOrigins = new Set(resolveCorsAllowedOrigins(runtimeConfig));
   const handlers = new Map<string, RouteDefinition["handler"]>();
   const methodsByPath = new Map<string, Set<string>>();
   const dynamicRoutes: DynamicRoute[] = [];
@@ -157,12 +171,17 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
 
       try {
         return await runWithRuntimeConfig(runtimeConfig, async () => {
-        const corsHeaders = resolveCorsHeaders(request.headers.get("origin"));
+        const origin = request.headers.get("origin");
+        const corsHeaders = resolveCorsHeaders(origin, corsAllowedOrigins);
 
         if (request.method.toUpperCase() === "OPTIONS") {
+          const headers = new Headers(corsHeaders ?? {});
+          if (origin !== null) {
+            addVaryHeader(headers, "Origin");
+          }
           return new Response(null, {
             status: 204,
-            headers: corsHeaders ?? {},
+            headers,
           });
         }
 
@@ -228,6 +247,9 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
           for (const [key, value] of Object.entries(corsHeaders)) {
             response.headers.set(key, value);
           }
+        }
+        if (origin !== null) {
+          addVaryHeader(response.headers, "Origin");
         }
 
         return response;

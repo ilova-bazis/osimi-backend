@@ -16,7 +16,6 @@ import {
     parseObjectIdParam,
     parseObjectListQuery,
     parsePatchObjectMetadataBody,
-    parsePatchObjectTitleBody,
     parsePutDocumentCurationBody,
     parseReplaceObjectTextManifestBody,
     parseSubmitObjectCurationBody,
@@ -69,7 +68,6 @@ import {
     listObjectDownloadRequestsForTenant,
     listObjectResyncRequestsForTenant,
     listObjectsForTenant,
-    patchObjectTitleForTenant,
     presignObjectArtifactUpload,
     releaseObjectDownloadRequestLeaseByToken,
     requestObjectResyncForTenant,
@@ -158,30 +156,6 @@ const getObjectRoute: RouteDefinition = {
             await getObjectDetail({
                 auth: authenticated,
                 objectId,
-            }),
-        );
-    },
-};
-
-const patchObjectRoute: RouteDefinition = {
-    method: "PATCH",
-    path: "/api/objects/:object_id",
-    handler: async (request, context) => {
-        const authenticated = requireRole(context, ["archiver", "admin"]);
-        const pathname = new URL(request.url).pathname;
-        const objectId = parseObjectIdParam(
-            extractPathParam(
-                pathname,
-                /^\/api\/objects\/([^/]+)$/,
-                "object_id",
-            ),
-        );
-        const body = parsePatchObjectTitleBody(await parseJsonBody(request));
-        return jsonResponse(
-            await patchObjectTitleForTenant({
-                auth: authenticated,
-                objectId,
-                body,
             }),
         );
     },
@@ -1166,7 +1140,6 @@ export const objectRoutes: RouteDefinition[] = [
     listObjectsRoute,
     listArchiveRequestsRoute,
     getObjectRoute,
-    patchObjectRoute,
     getObjectEditRoute,
     patchObjectMetadataRoute,
     listArtifactsRoute,

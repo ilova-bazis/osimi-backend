@@ -236,7 +236,7 @@ const objectEditLockSchema = z.object({
     locked_until: z.string().nullable(),
 });
 
-const objectEditResponseSchema = z.object({
+export const objectEditResponseSchema = z.object({
     object_id: objectIdParamSchema,
     media_type: objectEditMediaTypeSchema,
     revision: z.number().int().min(0),
@@ -249,23 +249,23 @@ const objectEditResponseSchema = z.object({
     }),
     capabilities: objectEditCapabilitiesSchema,
     curation_payload: objectEditCurationPayloadSchema,
-});
+}).strict();
 
-const patchObjectMetadataResponseSchema = z.object({
+export const patchObjectMetadataResponseSchema = z.object({
     object_id: objectIdParamSchema,
     revision: z.number().int().min(0),
     curation_state: objectEditCurationStateSchema,
     updated_at: z.string(),
-});
+}).strict();
 
-const putDocumentCurationResponseSchema = z.object({
+export const putDocumentCurationResponseSchema = z.object({
     object_id: objectIdParamSchema,
     revision: z.number().int().min(0),
     updated_count: z.number().int().min(1),
     updated_at: z.string(),
-});
+}).strict();
 
-const submitObjectCurationResponseSchema = z.object({
+export const submitObjectCurationResponseSchema = z.object({
     object_id: objectIdParamSchema,
     revision: z.number().int().min(0),
     curation_state: objectEditCurationStateSchema,
@@ -276,7 +276,12 @@ const submitObjectCurationResponseSchema = z.object({
     }),
     submitted_at: z.string(),
     submitted_by: z.string(),
-});
+}).strict();
+
+export const releaseObjectEditLockResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    released: z.boolean(),
+}).strict();
 
 const objectEditHistoryEventTypeSchema = z.enum([
     "METADATA_UPDATED",
@@ -547,10 +552,6 @@ const archiveRequestListQueryWithCursorSchema = archiveRequestListQuerySchema.tr
     },
 );
 
-export const patchObjectTitleBodySchema = z.strictObject({
-    title: z.string().trim().min(1),
-});
-
 export const createObjectDownloadRequestBodySchema = z.strictObject({
     available_file_id: z.uuid(),
 });
@@ -720,6 +721,8 @@ export const objectDtoSchema = z.object({
 });
 
 export const objectListItemSchema = objectDtoSchema.extend({
+    has_access_pdf: z.boolean(),
+    has_ocr: z.boolean(),
     can_download: z.boolean(),
     access_reason_code: z.enum([
         "OK",
@@ -880,7 +883,7 @@ export const objectArtifactSchema = z.object({
 const objectDownloadRequestSchema = z.object({
     id: z.string(),
     object_id: objectIdParamSchema,
-    available_file_id: z.uuid().nullable(),
+    available_file_id: z.uuid(),
     requested_by: z.string(),
     artifact_kind: artifactKindSchema,
     variant: z.string().nullable(),
@@ -1013,7 +1016,7 @@ export const workerLeaseObjectDownloadRequestResponseSchema = z.object({
             lease_expires_at: z.string(),
             object_id: objectIdParamSchema,
             tenant_id: z.string(),
-            available_file_id: z.uuid().nullable(),
+            available_file_id: z.uuid(),
             artifact_kind: artifactKindSchema,
             variant: z.string().nullable(),
             available_file: objectAvailableFileSchema.nullable(),
@@ -1068,10 +1071,6 @@ export const workerUploadObjectArtifactByTokenResponseSchema = z.object({
 export const objectArtifactsResponseSchema = z.object({
     object_id: objectIdParamSchema,
     artifacts: z.array(objectArtifactSchema),
-});
-
-export const patchObjectTitleResponseSchema = z.object({
-    object: objectDtoSchema,
 });
 
 export const updateAccessPolicyResponseSchema = z.object({
@@ -1189,7 +1188,6 @@ export interface ObjectEditHistoryQuery {
     cursor?: z.infer<typeof objectEditHistoryCursorSchema>;
 }
 export type ObjectCursorPayload = z.infer<typeof objectCursorPayloadSchema>;
-export type PatchObjectTitleBody = z.infer<typeof patchObjectTitleBodySchema>;
 export type PatchObjectMetadataBody = z.infer<typeof patchObjectMetadataBodySchema>;
 export type PutDocumentCurationBody = z.infer<typeof putDocumentCurationBodySchema>;
 export type SubmitObjectCurationBody = z.infer<typeof submitObjectCurationBodySchema>;
@@ -1249,9 +1247,6 @@ export type ObjectViewerPreviewArtifacts = z.infer<
 export type ObjectViewerPayload = z.infer<typeof objectViewerPayloadSchema>;
 export type ObjectArtifactsResponse = z.infer<
     typeof objectArtifactsResponseSchema
->;
-export type PatchObjectTitleResponse = z.infer<
-    typeof patchObjectTitleResponseSchema
 >;
 export type PatchObjectMetadataResponse = z.infer<
     typeof patchObjectMetadataResponseSchema
@@ -1492,17 +1487,6 @@ export function parseObjectEditHistoryQuery(url: URL): ObjectEditHistoryQuery {
         limit: limit.data,
         cursor: parsedCursor.data,
     };
-}
-
-export function parsePatchObjectTitleBody(
-    value: unknown,
-): PatchObjectTitleBody {
-    const parsed = patchObjectTitleBodySchema.safeParse(value);
-    if (!parsed.success) {
-        throw mapZodErrorToValidation(parsed.error);
-    }
-
-    return parsed.data;
 }
 
 export function parsePatchObjectMetadataBody(

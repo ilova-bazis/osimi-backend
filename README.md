@@ -42,6 +42,27 @@ Every presign receives a unique immutable staging key. Re-presigning a pending
 file or artifact invalidates the earlier URL; uploads stream to a temporary
 file and are atomically promoted without replacing an existing object.
 
+## CORS and UI Deployment
+
+`CORS_ALLOWED_ORIGINS` is a comma-separated allowlist of exact browser UI
+origins that may call the API and direct-upload endpoints. Origins include the
+scheme, hostname, and optional port, for example:
+
+```bash
+CORS_ALLOWED_ORIGINS=https://archive.example,https://admin.archive.example
+```
+
+When unset, it preserves the local development origins
+`http://localhost:4444` and `http://localhost:5173`. Set it to an empty value
+to deny all cross-origin callers. Wildcards, credentials, paths, query strings,
+fragments, and embedded user credentials are rejected. Production origins
+should use HTTPS.
+
+Direct upload `PUT` requests use their signed path token and do not use cookies
+or bearer credentials. A same-origin reverse proxy needs no CORS entry. For a
+separately deployed UI, add its exact origin to `CORS_ALLOWED_ORIGINS` and make
+the browser-visible API base publicly reachable.
+
 ## Tests
 
 Run fast unit tests without PostgreSQL:
@@ -90,7 +111,23 @@ advisory lock so concurrent deployments cannot apply the same migration twice.
 
 ## Health Endpoint
 
-- `GET /healthz`
+- `GET /healthz` is a process liveness probe. It does not require a database or
+  configuration dependency check.
+- `GET /readyz` is a deployment readiness probe. It returns `200` only when
+  the process is accepting traffic, required configuration is valid, PostgreSQL
+  is reachable, and the configured schema's migration history exactly matches
+  the application migrations. It returns `503` with non-sensitive check codes
+  otherwise.
+- `READINESS_TIMEOUT_MS` bounds each readiness database check. It defaults to
+  `1000` and must be a positive integer.
+
+Deploy migrations before starting or promoting an application instance. A
+database with pending, changed, or unknown migration records is intentionally
+not ready. During shutdown the process marks readiness false before draining;
+the listener rejects new connections while active requests and jobs drain.
+`SHUTDOWN_GRACE_PERIOD_MS` defaults to `60000`. A first `SIGINT` or `SIGTERM`
+drains and exits `0`; a deadline expiry or second signal force-closes resources
+and exits `1`.
 
 ## Auth Endpoints
 
@@ -124,3 +161,5 @@ Optional environment variables:
 - `STAGING_RETENTION_SWEEP_INTERVAL_SECONDS` (default: `300`)
 - `STUCK_ATTENTION_THRESHOLD_MINUTES` (default: `60`)
 - `STUCK_ATTENTION_INTERVAL_SECONDS` (default: `120`)
+- `STAGING_RETENTION_BATCH_SIZE` (default: `25`)
+- `STAGING_RETENTION_CLAIM_TIMEOUT_SECONDS` (default: `900`)

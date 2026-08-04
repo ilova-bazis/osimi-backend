@@ -34,6 +34,10 @@ import {
   type IngestionRecord,
 } from "../repos/ingestion-repo.ts";
 import {
+  resolveIngestionActionCapabilities,
+  resolveStagingPurgeState,
+} from "../domain/ingestions/action-capabilities.ts";
+import {
   assertIngestionStatusTransition,
   InvalidIngestionTransitionError,
   type IngestionStatus,
@@ -85,6 +89,7 @@ import {
   type IngestionCapabilitiesResponse,
   type IngestItemKind,
   type IngestionDto,
+  type IngestionResourceDto,
   type IngestionFileDto,
   type IngestionClassificationType,
   type IngestionListQuery,
@@ -257,6 +262,38 @@ function serializeIngestion(record: IngestionRecord): IngestionDto {
   };
 }
 
+function serializeIngestionResource(
+  record: IngestionRecord,
+  auth: AuthenticatedContext,
+): IngestionResourceDto {
+  const purgeState = resolveStagingPurgeState({
+    startedAt: record.stagingPurgeStartedAt,
+    purgedAt: record.stagingPurgedAt,
+  });
+  const capabilities = resolveIngestionActionCapabilities({
+    status: record.status,
+    role: auth.role,
+    purgeState,
+    hasActiveLease: record.hasActiveLease,
+  });
+
+  return {
+    ...serializeIngestion(record),
+    staging_purge: {
+      state: purgeState,
+      started_at: record.stagingPurgeStartedAt?.toISOString() ?? null,
+      purged_at: record.stagingPurgedAt?.toISOString() ?? null,
+    },
+    action_capabilities: {
+      can_resume: capabilities.canResume,
+      can_retry: capabilities.canRetry,
+      can_cancel: capabilities.canCancel,
+      can_restore: capabilities.canRestore,
+      can_delete: capabilities.canDelete,
+    },
+  };
+}
+
 function serializeFile(record: IngestionFileRecord): IngestionFileDto {
   const previewStatus = serializePreviewStatus(record);
 
@@ -419,7 +456,7 @@ export async function getIngestion(params: {
   });
 
   return {
-    ingestion: serializeIngestion(ingestion),
+    ingestion: serializeIngestionResource(ingestion, params.auth),
     files: files.map(serializeFile),
   };
 }
@@ -582,7 +619,7 @@ export async function getIngestionList(params: {
   const lastItem = visibleItems.at(-1);
 
   return {
-    items: visibleItems.map(serializeIngestion),
+    items: visibleItems.map((record) => serializeIngestionResource(record, params.auth)),
     nextCursor:
       hasMore && lastItem
         ? encodeCursor({
@@ -1441,7 +1478,13 @@ async function transitionIngestionStatus(params: {
     executor: params.executor,
   });
 
-  return requireIngestion(updated, params.ingestionId);
+  if (!updated) {
+    throw new ConflictError("Ingestion state changed before the transition completed.", {
+      ingestion_id: params.ingestionId,
+    });
+  }
+
+  return updated;
 }
 
 export async function submitIngestion(params: {
@@ -1626,6 +1669,20 @@ export async function retryIngestion(params: {
   ingestionId: string;
   executor?: SqlExecutor;
 }): Promise<RetryIngestionResponse> {
+  const ingestion = requireIngestion(
+    await findIngestionById(params.auth.tenantId, params.ingestionId, params.executor),
+    params.ingestionId,
+  );
+
+  if (ingestion.status !== "FAILED") {
+    throw new ConflictError("Only failed ingestions can be retried.", {
+      ingestion_id: ingestion.id,
+      status: ingestion.status,
+    });
+  }
+
+  await ensureIngestionNotProcessing(ingestion);
+
   const updated = await transitionIngestionStatus({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,

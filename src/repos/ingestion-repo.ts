@@ -34,6 +34,8 @@ interface IngestionRow {
   created_at: Date;
   updated_at: Date;
   staging_purge_started_at?: Date | null;
+  staging_purged_at?: Date | null;
+  has_active_lease?: boolean;
 }
 
 interface IngestionFileRow {
@@ -91,6 +93,8 @@ export interface IngestionRecord {
   createdAt: Date;
   updatedAt: Date;
   stagingPurgeStartedAt?: Date;
+  stagingPurgedAt?: Date;
+  hasActiveLease: boolean;
 }
 
 export interface IngestionWithCreatorRecord extends IngestionRecord {
@@ -213,6 +217,10 @@ function mapIngestion(row: IngestionRow): IngestionRecord {
     stagingPurgeStartedAt: row.staging_purge_started_at
       ? new Date(row.staging_purge_started_at)
       : undefined,
+    stagingPurgedAt: row.staging_purged_at
+      ? new Date(row.staging_purged_at)
+      : undefined,
+    hasActiveLease: row.has_active_lease ?? false,
   };
 }
 
@@ -345,7 +353,7 @@ export async function createIngestion(params: {
       )
       RETURNING id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
         pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
-        created_at, updated_at, staging_purge_started_at
+        created_at, updated_at, staging_purge_started_at, staging_purged_at
     `;
   });
 
@@ -361,7 +369,13 @@ export async function findIngestionById(
     return await sql<IngestionRow[]>`
       SELECT id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
         pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
-        created_at, updated_at
+        created_at, updated_at, staging_purge_started_at, staging_purged_at,
+        EXISTS (
+          SELECT 1 FROM ingestion_leases lease
+          WHERE lease.ingestion_id = ingestions.id
+            AND lease.released_at IS NULL
+            AND lease.lease_expires_at > now()
+        ) AS has_active_lease
       FROM ingestions
       WHERE id = ${ingestionId}
         AND tenant_id = ${tenantId}
@@ -381,7 +395,7 @@ export async function findIngestionByIdForUpdate(
   const rows = await executor<IngestionRow[]>`
     SELECT id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
       pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
-      created_at, updated_at, staging_purge_started_at
+      created_at, updated_at, staging_purge_started_at, staging_purged_at
     FROM ingestions
     WHERE id = ${ingestionId}
       AND tenant_id = ${tenantId}
@@ -403,7 +417,13 @@ export async function listIngestions(params: {
       return await sql<IngestionRow[]>`
         SELECT id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
           pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
-          created_at, updated_at, staging_purge_started_at
+          created_at, updated_at, staging_purge_started_at, staging_purged_at,
+          EXISTS (
+            SELECT 1 FROM ingestion_leases lease
+            WHERE lease.ingestion_id = ingestions.id
+              AND lease.released_at IS NULL
+              AND lease.lease_expires_at > now()
+          ) AS has_active_lease
         FROM ingestions
         WHERE tenant_id = ${params.tenantId}
           AND (created_at, id) < (${params.cursorCreatedAt}::timestamptz, ${params.cursorId}::uuid)
@@ -415,7 +435,13 @@ export async function listIngestions(params: {
     return await sql<IngestionRow[]>`
       SELECT id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
         pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
-        created_at, updated_at
+        created_at, updated_at, staging_purge_started_at, staging_purged_at,
+        EXISTS (
+          SELECT 1 FROM ingestion_leases lease
+          WHERE lease.ingestion_id = ingestions.id
+            AND lease.released_at IS NULL
+            AND lease.lease_expires_at > now()
+        ) AS has_active_lease
       FROM ingestions
       WHERE tenant_id = ${params.tenantId}
       ORDER BY created_at DESC, id DESC
@@ -441,9 +467,10 @@ export async function updateIngestionStatus(params: {
       WHERE id = ${params.ingestionId}
         AND tenant_id = ${params.tenantId}
         AND status = ${params.fromStatus}
+        AND staging_purge_started_at IS NULL
       RETURNING id, batch_label, tenant_id, status, created_by, schema_version, classification_type, item_kind, language_code,
         pipeline_preset, access_level, embargo_until, rights_note, sensitivity_note, summary, error_summary,
-        created_at, updated_at
+        created_at, updated_at, staging_purge_started_at, staging_purged_at
     `;
   });
 

@@ -250,10 +250,13 @@ export async function getObjectEditDetail(params: {
   }
 
   const response = await serializeObjectEdit(lockResult.record);
+  const hasDocumentPageProjection =
+    response.curation_payload.kind === "document" &&
+    response.curation_payload.pages.length > 0;
   response.capabilities.can_edit_metadata =
     params.auth.role === "archiver" || params.auth.role === "admin";
   response.capabilities.can_curate_text =
-    response.media_type === "document" &&
+    hasDocumentPageProjection &&
     (params.auth.role === "archiver" || params.auth.role === "admin");
   response.capabilities.can_submit_review = response.capabilities.can_curate_text;
 

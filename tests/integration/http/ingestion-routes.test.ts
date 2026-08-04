@@ -1254,6 +1254,106 @@ describe("ingestion routes", () => {
     expect(body.mime_aliases["image/jpg"]).toBe("image/jpeg");
   });
 
+  test("exposes purge-aware action capabilities and rejects actions after purge intent", async () => {
+    const app = createTestApp();
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({ batch_label: "batch-purge-capabilities-001" })),
+      }),
+    );
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as { ingestion: { id: string } };
+    const ingestionId = createBody.ingestion.id;
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+
+    try {
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      await sql`
+        UPDATE ingestions
+        SET status = 'FAILED',
+            staging_purge_started_at = NULL,
+            staging_purged_at = NULL
+        WHERE id = ${ingestionId}
+      `;
+
+      const retainedResponse = await app.fetch(
+        new Request(`http://localhost/api/ingestions/${ingestionId}`, {
+          headers: { authorization: `Bearer ${authToken}` },
+        }),
+      );
+      expect(retainedResponse.status).toBe(200);
+      const retainedBody = (await retainedResponse.json()) as {
+        ingestion: {
+          staging_purge: { state: string; started_at: string | null; purged_at: string | null };
+          action_capabilities: Record<string, boolean>;
+        };
+      };
+      expect(retainedBody.ingestion.staging_purge).toEqual({
+        state: "NOT_SCHEDULED",
+        started_at: null,
+        purged_at: null,
+      });
+      expect(retainedBody.ingestion.action_capabilities).toEqual({
+        can_resume: false,
+        can_retry: true,
+        can_cancel: false,
+        can_restore: false,
+        can_delete: false,
+      });
+
+      await sql`
+        UPDATE ingestions
+        SET staging_purge_started_at = now()
+        WHERE id = ${ingestionId}
+      `;
+
+      const pendingResponse = await app.fetch(
+        new Request(`http://localhost/api/ingestions/${ingestionId}`, {
+          headers: { authorization: `Bearer ${authToken}` },
+        }),
+      );
+      const pendingBody = (await pendingResponse.json()) as {
+        ingestion: {
+          staging_purge: { state: string; started_at: string | null; purged_at: string | null };
+          action_capabilities: Record<string, boolean>;
+        };
+      };
+      expect(pendingBody.ingestion.staging_purge.state).toBe("PENDING");
+      expect(pendingBody.ingestion.staging_purge.started_at).not.toBeNull();
+      expect(pendingBody.ingestion.action_capabilities).toEqual({
+        can_resume: false,
+        can_retry: false,
+        can_cancel: false,
+        can_restore: false,
+        can_delete: false,
+      });
+
+      const retryResponse = await app.fetch(
+        new Request(`http://localhost/api/ingestions/${ingestionId}/retry`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${authToken}` },
+        }),
+      );
+      expect(retryResponse.status).toBe(409);
+
+      await sql`UPDATE ingestions SET status = 'CANCELED' WHERE id = ${ingestionId}`;
+      const restoreResponse = await app.fetch(
+        new Request(`http://localhost/api/ingestions/${ingestionId}/restore`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${authToken}` },
+        }),
+      );
+      expect(restoreResponse.status).toBe(409);
+    } finally {
+      await sql.close();
+    }
+  });
+
   test("cancels a queued ingestion back to uploading", async () => {
     const app = createTestApp();
 

@@ -4,14 +4,18 @@ import { describe, expect, test } from "bun:test";
 
 import { parseLeaseToken } from "../../../src/auth/worker-lease.ts";
 import {
+  DEFAULT_CORS_ALLOWED_ORIGINS,
   DEFAULT_MAX_UPLOAD_SIZE_BYTES,
   DEFAULT_READINESS_TIMEOUT_MS,
   DEFAULT_SHUTDOWN_GRACE_PERIOD_MS,
+  parseCorsAllowedOrigins,
+  resolveCorsAllowedOrigins,
   resolveMaxUploadSizeBytes,
   resolveReadinessTimeoutMs,
   resolveShutdownGracePeriodMs,
   runWithRuntimeConfig,
   validateSigningConfiguration,
+  validateRuntimeConfiguration,
   validateWorkerConfiguration,
 } from "../../../src/runtime/config.ts";
 import { startServer } from "../../../src/server.ts";
@@ -112,6 +116,50 @@ describe("upload size configuration", () => {
         "Runtime upload size limit",
       );
     }
+  });
+});
+
+describe("CORS origin configuration", () => {
+  test("uses localhost defaults and accepts runtime overrides", () => {
+    expect(DEFAULT_CORS_ALLOWED_ORIGINS).toEqual([
+      "http://localhost:4444",
+      "http://localhost:5173",
+    ]);
+    expect(resolveCorsAllowedOrigins({
+      corsAllowedOrigins: ["https://archive.example"],
+    })).toEqual(["https://archive.example"]);
+    expect(resolveCorsAllowedOrigins({ corsAllowedOrigins: [] })).toEqual([]);
+  });
+
+  test("normalizes comma-separated origins", () => {
+    expect(parseCorsAllowedOrigins(
+      " https://archive.example/ , http://localhost:4444,https://archive.example ",
+    )).toEqual([
+      "https://archive.example",
+      "http://localhost:4444",
+    ]);
+    expect(parseCorsAllowedOrigins("")).toEqual([]);
+  });
+
+  test("rejects malformed CORS origins", () => {
+    for (const value of [
+      "*",
+      "archive.example",
+      "file:///tmp/ui",
+      "https://user:pass@archive.example",
+      "https://archive.example/ui",
+      "https://archive.example?tenant=one",
+      "https://archive.example#upload",
+      "https://archive.example,,https://admin.example",
+    ]) {
+      expect(() => parseCorsAllowedOrigins(value)).toThrow("CORS_ALLOWED_ORIGINS");
+    }
+
+    expect(() => validateRuntimeConfiguration({
+      uploadSigningSecret: UPLOAD_SECRET,
+      leaseSigningSecret: LEASE_SECRET,
+      corsAllowedOrigins: ["https://archive.example/ui"],
+    })).toThrow("Runtime CORS allowed origins");
   });
 });
 

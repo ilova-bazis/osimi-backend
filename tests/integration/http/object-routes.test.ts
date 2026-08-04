@@ -372,6 +372,8 @@ describe("object routes", () => {
                 id: string;
                 object_id: string;
                 thumbnail_artifact_id: string | null;
+                has_access_pdf: boolean;
+                has_ocr: boolean;
                 title: string;
                 processing_state: string;
                 curation_state: string;
@@ -396,6 +398,8 @@ describe("object routes", () => {
         expect(body.objects[0]?.id).toBe(tenantOneObjectId);
         expect(body.objects[0]?.object_id).toBe(tenantOneObjectId);
         expect(body.objects[0]?.thumbnail_artifact_id).toBeNull();
+        expect(body.objects[0]?.has_access_pdf).toBe(false);
+        expect(body.objects[0]?.has_ocr).toBe(false);
         expect(body.objects[0]?.title).toBe("Tenant One Object");
         expect(body.objects[0]?.processing_state).toBe("queued");
         expect(body.objects[0]?.curation_state).toBe("needs_review");
@@ -815,7 +819,32 @@ describe("object routes", () => {
         }));
         expect(unsatisfiableResponse.status).toBe(416);
         expect(unsatisfiableResponse.headers.get("content-range")).toBe("bytes */12");
+        expect(unsatisfiableResponse.headers.get("accept-ranges")).toBe("bytes");
+        expect(unsatisfiableResponse.headers.get("etag")).toBe(etag);
+        expect(unsatisfiableResponse.headers.get("last-modified")).toBe(lastModified);
         expect(await unsatisfiableResponse.text()).toBe("");
+
+        const matchingUnsatisfiableIfRangeResponse = await app.fetch(new Request(viewUrl, {
+            headers: {
+                authorization: `Bearer ${viewerToken}`,
+                range: "bytes=12-",
+                "if-range": etag!,
+            },
+        }));
+        expect(matchingUnsatisfiableIfRangeResponse.status).toBe(416);
+        expect(matchingUnsatisfiableIfRangeResponse.headers.get("content-range")).toBe("bytes */12");
+
+        const staleUnsatisfiableIfRangeResponse = await app.fetch(new Request(viewUrl, {
+            headers: {
+                authorization: `Bearer ${viewerToken}`,
+                range: "bytes=12-",
+                "if-range": '"stale"',
+            },
+        }));
+        expect(staleUnsatisfiableIfRangeResponse.status).toBe(200);
+        expect(staleUnsatisfiableIfRangeResponse.headers.get("content-range")).toBeNull();
+        expect(staleUnsatisfiableIfRangeResponse.headers.get("content-length")).toBe("12");
+        expect(await staleUnsatisfiableIfRangeResponse.text()).toBe("pdf-content\n");
 
         const matchingIfRangeResponse = await app.fetch(new Request(viewUrl, {
             headers: {
@@ -949,6 +978,8 @@ describe("object routes", () => {
         const sql = createSqlClient(TEST_DATABASE_URL!);
         const variantThumbnailId = "60000000-0000-4000-8000-000000000310";
         const nullVariantThumbnailId = "60000000-0000-4000-8000-000000000311";
+        const pdfArtifactId = "60000000-0000-4000-8000-000000000314";
+        const ocrArtifactId = "60000000-0000-4000-8000-000000000315";
 
         try {
             await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
@@ -972,6 +1003,24 @@ describe("object routes", () => {
             ${`tenants/${tenantOneId}/objects/${tenantOneObjectIdThree}/artifacts/thumb-primary.jpg`},
             ${"image/jpeg"},
             ${2048}
+          ),
+          (
+            ${pdfArtifactId},
+            ${tenantOneObjectIdThree},
+            ${"pdf"}::artifact_kind,
+            ${null},
+            ${`tenants/${tenantOneId}/objects/${tenantOneObjectIdThree}/artifacts/access.pdf`},
+            ${"application/pdf"},
+            ${4096}
+          ),
+          (
+            ${ocrArtifactId},
+            ${tenantOneObjectIdThree},
+            ${"ocr_text"}::artifact_kind,
+            ${"full_v1"},
+            ${`tenants/${tenantOneId}/objects/${tenantOneObjectIdThree}/artifacts/ocr.txt`},
+            ${"text/plain"},
+            ${1024}
           )
       `;
 
@@ -1004,6 +1053,8 @@ describe("object routes", () => {
             objects: Array<{
                 object_id: string;
                 thumbnail_artifact_id: string | null;
+                has_access_pdf: boolean;
+                has_ocr: boolean;
             }>;
         };
 
@@ -1011,6 +1062,8 @@ describe("object routes", () => {
         expect(listBody.objects[0]?.thumbnail_artifact_id).toBe(
             nullVariantThumbnailId,
         );
+        expect(listBody.objects[0]?.has_access_pdf).toBe(true);
+        expect(listBody.objects[0]?.has_ocr).toBe(true);
 
         const detailResponse = await app.fetch(
             new Request(`http://localhost/api/objects/${tenantOneObjectIdThree}`, {
@@ -1031,7 +1084,7 @@ describe("object routes", () => {
         );
     });
 
-    test("patches title for archiver and blocks viewer", async () => {
+    test("does not expose the legacy title-only patch route", async () => {
         const app = createTestApp();
 
         const patchResponse = await app.fetch(
@@ -1047,26 +1100,7 @@ describe("object routes", () => {
             }),
         );
 
-        expect(patchResponse.status).toBe(200);
-        const patchBody = (await patchResponse.json()) as {
-            object: { title: string };
-        };
-        expect(patchBody.object.title).toBe("Retitled Object");
-
-        const viewerPatchResponse = await app.fetch(
-            new Request(`http://localhost/api/objects/${tenantOneObjectId}`, {
-                method: "PATCH",
-                headers: {
-                    authorization: `Bearer ${viewerToken}`,
-                    "content-type": "application/json",
-                },
-                body: JSON.stringify({
-                    title: "Viewer cannot patch",
-                }),
-            }),
-        );
-
-        expect(viewerPatchResponse.status).toBe(403);
+        expect(patchResponse.status).toBe(405);
     });
 
     test("enforces object assignment policy across edit operations", async () => {
@@ -1090,11 +1124,6 @@ describe("object routes", () => {
             },
         };
         const protectedRequests = [
-            new Request(`http://localhost/api/objects/${editPolicyObjectId}`, {
-                method: "PATCH",
-                headers: { authorization: `Bearer ${unassignedArchiverToken}`, "content-type": "application/json" },
-                body: JSON.stringify({ title: "Denied title" }),
-            }),
             new Request(`http://localhost/api/objects/${editPolicyObjectId}/edit`, {
                 headers: { authorization: `Bearer ${unassignedArchiverToken}` },
             }),
@@ -1137,7 +1166,7 @@ describe("object routes", () => {
             `;
 
             const protectedResponses = await Promise.all(protectedRequests.map((request) => app.fetch(request)));
-            expect(protectedResponses.map((response) => response.status)).toEqual([403, 403, 403, 403, 403, 403, 403]);
+            expect(protectedResponses.map((response) => response.status)).toEqual([403, 403, 403, 403, 403, 403]);
 
             const untouched = await sql<Array<{ title: string; event_count: string; page_count: string }>>`
                 SELECT obj.title,
@@ -1158,11 +1187,21 @@ describe("object routes", () => {
                 WHERE object_id = ${editPolicyObjectId}
             `;
 
+            const familyEditState = await app.fetch(
+                new Request(`http://localhost/api/objects/${editPolicyObjectId}/edit`, {
+                    headers: { authorization: `Bearer ${unassignedArchiverToken}` },
+                }),
+            );
+            expect(familyEditState.status).toBe(200);
+
             const familyEdit = await app.fetch(
-                new Request(`http://localhost/api/objects/${editPolicyObjectId}`, {
+                new Request(`http://localhost/api/objects/${editPolicyObjectId}/metadata`, {
                     method: "PATCH",
                     headers: { authorization: `Bearer ${unassignedArchiverToken}`, "content-type": "application/json" },
-                    body: JSON.stringify({ title: "Family editor title" }),
+                    body: JSON.stringify({
+                        ...metadataBody,
+                        metadata: { ...metadataBody.metadata, title: "Family editor title" },
+                    }),
                 }),
             );
             expect(familyEdit.status).toBe(200);
@@ -1262,6 +1301,167 @@ describe("object routes", () => {
         }
     });
 
+    test("handles edit-lock contention, expiry, and release ownership", async () => {
+        const app = createTestApp();
+        const metadata = {
+            title: "Lock test object",
+            publication_date: "",
+            date_precision: "none",
+            date_approximate: false,
+            language: null,
+            tags: [],
+            people: [],
+            description: null,
+        };
+
+        await resetObjectEditState({
+            objectId: tenantOneObjectId,
+            metadata: { source: "scanner-a" },
+            updatedAtIso: "2026-02-09T10:00:00.000Z",
+        });
+
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+                UPDATE object_edits
+                SET locked_by = NULL, locked_until = NULL
+                WHERE object_id = ${tenantOneObjectId}
+            `;
+        } finally {
+            await sql.close();
+        }
+
+        const ownerLoad = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit`, {
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+        expect(ownerLoad.status).toBe(200);
+        const ownerBody = (await ownerLoad.json()) as { revision: number; lock: { locked_by: string | null } };
+        expect(ownerBody.lock.locked_by).toBe("10000000-0000-0000-0000-000000000001");
+
+        const foreignLoad = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit`, {
+                headers: { authorization: `Bearer ${adminToken}` },
+            }),
+        );
+        expect(foreignLoad.status).toBe(200);
+        const foreignBody = (await foreignLoad.json()) as {
+            lock: { locked_by: string | null };
+            capabilities: { can_edit_metadata: boolean; can_curate_text: boolean; can_submit_review: boolean };
+        };
+        expect(foreignBody.lock.locked_by).toBe("10000000-0000-0000-0000-000000000001");
+        expect(foreignBody.capabilities).toEqual({
+            can_edit_metadata: false,
+            can_curate_text: false,
+            can_submit_review: false,
+        });
+
+        const lockedWrite = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/metadata`, {
+                method: "PATCH",
+                headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+                body: JSON.stringify({
+                    revision: ownerBody.revision,
+                    metadata,
+                    rights: { rights_note: null, sensitivity_note: null },
+                }),
+            }),
+        );
+        expect(lockedWrite.status).toBe(423);
+
+        const nonOwnerRelease = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit-lock`, {
+                method: "DELETE",
+                headers: { authorization: `Bearer ${adminToken}` },
+            }),
+        );
+        expect(await nonOwnerRelease.json()).toMatchObject({ released: false });
+
+        const ownerRelease = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit-lock`, {
+                method: "DELETE",
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+        expect(await ownerRelease.json()).toMatchObject({ released: true });
+
+        const expirySql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await expirySql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await expirySql`
+                UPDATE object_edits
+                SET locked_by = ${"10000000-0000-0000-0000-000000000001"},
+                    locked_until = now() - interval '1 minute'
+                WHERE object_id = ${tenantOneObjectId}
+            `;
+        } finally {
+            await expirySql.close();
+        }
+
+        const expiredLockLoad = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit`, {
+                headers: { authorization: `Bearer ${adminToken}` },
+            }),
+        );
+        expect(expiredLockLoad.status).toBe(200);
+        const expiredLockBody = (await expiredLockLoad.json()) as {
+            lock: { locked_by: string | null };
+            capabilities: { can_edit_metadata: boolean };
+        };
+        expect(expiredLockBody.lock.locked_by).toBe("10000000-0000-0000-0000-000000000003");
+        expect(expiredLockBody.capabilities.can_edit_metadata).toBe(true);
+
+        const expiredLockRelease = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit-lock`, {
+                method: "DELETE",
+                headers: { authorization: `Bearer ${adminToken}` },
+            }),
+        );
+        expect(await expiredLockRelease.json()).toMatchObject({ released: true });
+    });
+
+    test("rejects document curation operations for non-document objects", async () => {
+        const app = createTestApp();
+        const editResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectIdThree}/edit`, {
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+        expect(editResponse.status).toBe(200);
+        const editBody = (await editResponse.json()) as { revision: number };
+
+        const documentWrite = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectIdThree}/curation/document`, {
+                method: "PUT",
+                headers: { authorization: `Bearer ${operatorToken}`, "content-type": "application/json" },
+                body: JSON.stringify({
+                    revision: editBody.revision,
+                    pages: [{ page_number: 1, curated_text: "Not a document" }],
+                }),
+            }),
+        );
+        expect(documentWrite.status).toBe(409);
+
+        const submit = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectIdThree}/curation/submit`, {
+                method: "POST",
+                headers: { authorization: `Bearer ${operatorToken}`, "content-type": "application/json" },
+                body: JSON.stringify({ revision: editBody.revision, review_note: null }),
+            }),
+        );
+        expect(submit.status).toBe(409);
+
+        const release = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectIdThree}/edit-lock`, {
+                method: "DELETE",
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+        expect(await release.json()).toMatchObject({ released: true });
+    });
+
     test("returns object edit payload with metadata foundation", async () => {
         const app = createTestApp();
 
@@ -1334,8 +1534,8 @@ describe("object routes", () => {
         });
         expect(body.capabilities).toEqual({
             can_edit_metadata: true,
-            can_curate_text: true,
-            can_submit_review: true,
+            can_curate_text: false,
+            can_submit_review: false,
         });
         expect(body.curation_payload.kind).toBe("document");
         expect(body.curation_payload.machine_ocr_artifact_id).toBeNull();
@@ -1412,6 +1612,11 @@ describe("object routes", () => {
         expect(initialEditResponse.status).toBe(200);
         const initialEditBody = (await initialEditResponse.json()) as {
             revision: number;
+            capabilities: {
+                can_edit_metadata: boolean;
+                can_curate_text: boolean;
+                can_submit_review: boolean;
+            };
             curation_payload: {
                 kind: string;
                 machine_ocr_artifact_id: string | null;
@@ -1427,6 +1632,11 @@ describe("object routes", () => {
         };
 
         expect(initialEditBody.revision).toBe(0);
+        expect(initialEditBody.capabilities).toEqual({
+            can_edit_metadata: true,
+            can_curate_text: true,
+            can_submit_review: true,
+        });
         expect(initialEditBody.curation_payload.kind).toBe("document");
         if (initialEditBody.curation_payload.kind !== "document") {
             throw new Error("Expected document curation payload");
@@ -1489,6 +1699,24 @@ describe("object routes", () => {
         expect(updateBody.revision).toBe(1);
         expect(updateBody.updated_count).toBe(2);
         expect(Date.parse(updateBody.updated_at)).not.toBeNaN();
+
+        const stalePageResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectIdTwo}/curation/document`,
+                {
+                    method: "PUT",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 0,
+                        pages: [{ page_number: 1, curated_text: "stale page update" }],
+                    }),
+                },
+            ),
+        );
+        expect(stalePageResponse.status).toBe(409);
 
         const updatedEditResponse = await app.fetch(
             new Request(`http://localhost/api/objects/${tenantOneObjectIdTwo}/edit`, {
@@ -1648,6 +1876,24 @@ describe("object routes", () => {
             ),
         );
         expect(saveResponse.status).toBe(200);
+
+        const staleSubmitResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/submit`,
+                {
+                    method: "POST",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 0,
+                        review_note: null,
+                    }),
+                },
+            ),
+        );
+        expect(staleSubmitResponse.status).toBe(409);
 
         const submitResponse = await app.fetch(
             new Request(
@@ -2055,6 +2301,62 @@ describe("object routes", () => {
         }
     });
 
+    test("advances revision without creating history for a no-op metadata save", async () => {
+        const app = createTestApp();
+
+        await resetObjectEditState({
+            objectId: tenantOneObjectId,
+            metadata: { source: "scanner-a" },
+            updatedAtIso: "2026-02-09T10:00:00.000Z",
+        });
+
+        const beforeResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit`, {
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+        expect(beforeResponse.status).toBe(200);
+        const before = (await beforeResponse.json()) as {
+            revision: number;
+            metadata: Record<string, unknown>;
+            rights: { rights_note: string | null; sensitivity_note: string | null };
+        };
+
+        const saveResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/metadata`, {
+                method: "PATCH",
+                headers: { authorization: `Bearer ${operatorToken}`, "content-type": "application/json" },
+                body: JSON.stringify({
+                    revision: before.revision,
+                    metadata: before.metadata,
+                    rights: {
+                        rights_note: before.rights.rights_note,
+                        sensitivity_note: before.rights.sensitivity_note,
+                    },
+                }),
+            }),
+        );
+        expect(saveResponse.status).toBe(200);
+        expect((await saveResponse.json()) as { revision: number }).toMatchObject({
+            revision: before.revision + 1,
+        });
+
+        const historyResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/curation/history`, {
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+        expect(historyResponse.status).toBe(200);
+        expect((await historyResponse.json()) as { events: unknown[] }).toMatchObject({ events: [] });
+
+        await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit-lock`, {
+                method: "DELETE",
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+    });
+
     test("rejects invalid document OCR page updates", async () => {
         const app = createTestApp();
         const sql = createSqlClient(TEST_DATABASE_URL!);
@@ -2084,6 +2386,27 @@ describe("object routes", () => {
             }),
         );
         const editBody = (await editResponse.json()) as { revision: number };
+
+        const duplicatePageResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/document`,
+                {
+                    method: "PUT",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: editBody.revision,
+                        pages: [
+                            { page_number: 1, curated_text: "first" },
+                            { page_number: 1, curated_text: "duplicate" },
+                        ],
+                    }),
+                },
+            ),
+        );
+        expect(duplicatePageResponse.status).toBe(422);
 
         const response = await app.fetch(
             new Request(
@@ -2124,7 +2447,7 @@ describe("object routes", () => {
         ]);
     });
 
-    test("returns resolved thumbnail_artifact_id in patch responses", async () => {
+    test("keeps title synchronized through canonical metadata updates", async () => {
         const app = createTestApp();
         const sql = createSqlClient(TEST_DATABASE_URL!);
         const thumbnailArtifactId = "60000000-0000-4000-8000-000000000312";
@@ -2147,26 +2470,65 @@ describe("object routes", () => {
             await sql.close();
         }
 
-        const patchTitleResponse = await app.fetch(
-            new Request(`http://localhost/api/objects/${tenantOneObjectId}`, {
+        const editBeforeResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit`, {
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+        expect(editBeforeResponse.status).toBe(200);
+        const editBeforeBody = (await editBeforeResponse.json()) as { revision: number };
+
+        const patchMetadataResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/metadata`, {
                 method: "PATCH",
                 headers: {
                     authorization: `Bearer ${operatorToken}`,
                     "content-type": "application/json",
                 },
                 body: JSON.stringify({
-                    title: "Retitled With Thumbnail",
+                    revision: editBeforeBody.revision,
+                    metadata: {
+                        title: "Retitled With Thumbnail",
+                        publication_date: "",
+                        date_precision: "none",
+                        date_approximate: false,
+                        language: null,
+                        tags: [],
+                        people: [],
+                        description: null,
+                    },
+                    rights: {
+                        rights_note: null,
+                        sensitivity_note: null,
+                    },
                 }),
             }),
         );
 
-        expect(patchTitleResponse.status).toBe(200);
-        const patchTitleBody = (await patchTitleResponse.json()) as {
-            object: { thumbnail_artifact_id: string | null };
-        };
-        expect(patchTitleBody.object.thumbnail_artifact_id).toBe(
-            thumbnailArtifactId,
+        expect(patchMetadataResponse.status).toBe(200);
+
+        const editResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit`, {
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
         );
+        expect(editResponse.status).toBe(200);
+        const editBody = (await editResponse.json()) as {
+            metadata: { title: string };
+        };
+        expect(editBody.metadata.title).toBe("Retitled With Thumbnail");
+
+        const detailResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}`, {
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+        expect(detailResponse.status).toBe(200);
+        const detailBody = (await detailResponse.json()) as {
+            object: { title: string; thumbnail_artifact_id: string | null };
+        };
+        expect(detailBody.object.title).toBe("Retitled With Thumbnail");
+        expect(detailBody.object.thumbnail_artifact_id).toBe(thumbnailArtifactId);
 
         const patchPolicyResponse = await app.fetch(
             new Request(
@@ -2686,7 +3048,7 @@ describe("object routes", () => {
         expect(requestsResponse.status).toBe(200);
         const requestsBody = (await requestsResponse.json()) as {
             requests: Array<{
-                available_file_id: string | null;
+                available_file_id: string;
                 artifact_kind: string;
                 variant: string | null;
             }>;
@@ -2702,11 +3064,11 @@ describe("object routes", () => {
         expect(thumbnailRequests.length).toBe(1);
         expect(thumbnailRequests[0]?.variant).toBeNull();
         expect(
-            fileKeyById.get(thumbnailRequests[0]?.available_file_id ?? ""),
+            fileKeyById.get(thumbnailRequests[0]!.available_file_id),
         ).toBe("archive-thumb-primary");
         expect(ocrRequests.length).toBe(1);
         expect(ocrRequests[0]?.variant).toBeNull();
-        expect(fileKeyById.get(ocrRequests[0]?.available_file_id ?? "")).toBe(
+        expect(fileKeyById.get(ocrRequests[0]!.available_file_id)).toBe(
             "archive-ocr-primary",
         );
     });
@@ -2804,7 +3166,7 @@ describe("object routes", () => {
         expect(requestsResponse.status).toBe(200);
         const requestsBody = (await requestsResponse.json()) as {
             requests: Array<{
-                available_file_id: string | null;
+                available_file_id: string;
                 artifact_kind: string;
                 variant: string | null;
             }>;
@@ -2816,7 +3178,7 @@ describe("object routes", () => {
 
         expect(webRequests.length).toBe(1);
         expect(webRequests[0]?.variant).toBeNull();
-        expect(fileKeyById.get(webRequests[0]?.available_file_id ?? "")).toBe(
+        expect(fileKeyById.get(webRequests[0]!.available_file_id)).toBe(
             "archive-web-primary",
         );
     });
@@ -2989,7 +3351,7 @@ describe("object routes", () => {
         expect(requestsResponse.status).toBe(200);
         const requestsBody = (await requestsResponse.json()) as {
             requests: Array<{
-                available_file_id: string | null;
+                available_file_id: string;
                 artifact_kind: string;
             }>;
         };
@@ -3000,7 +3362,7 @@ describe("object routes", () => {
 
         expect(thumbnailRequests.length).toBe(1);
         expect(
-            fileKeyById.get(thumbnailRequests[0]?.available_file_id ?? ""),
+            fileKeyById.get(thumbnailRequests[0]!.available_file_id),
         ).toBe("archive-thumb-a");
     });
 
@@ -3337,7 +3699,7 @@ describe("object routes", () => {
                 id: string;
                 status: string;
                 artifact_kind: string;
-                available_file_id: string | null;
+                available_file_id: string;
             };
         };
         expect(firstBody.status).toBe("queued");
@@ -3382,10 +3744,15 @@ describe("object routes", () => {
 
         expect(listResponse.status).toBe(200);
         const listBody = (await listResponse.json()) as {
-            requests: Array<{ id: string; artifact_kind: string }>;
+            requests: Array<{
+                id: string;
+                available_file_id: string;
+                artifact_kind: string;
+            }>;
         };
         expect(listBody.requests.length).toBeGreaterThanOrEqual(1);
         expect(listBody.requests[0]?.id).toBe(firstBody.request.id);
+        expect(listBody.requests[0]?.available_file_id).toBe(availableFileId);
         expect(listBody.requests[0]?.artifact_kind).toBe("pdf");
     });
 
@@ -4163,7 +4530,7 @@ describe("object routes", () => {
             ${"object_resync"}::archive_request_action_type,
             ${{ marker: "second" }},
             ${"10000000-0000-0000-0000-000000000001"},
-            ${"resync:second"},
+            NULL,
             ${"COMPLETED"}::archive_request_status,
             ${"2026-03-06T11:00:00.000Z"}::timestamptz,
             ${"2026-03-06T11:00:00.000Z"}::timestamptz
@@ -4239,7 +4606,11 @@ describe("object routes", () => {
 
         expect(includePayloadResponse.status).toBe(200);
         const includePayloadBody = (await includePayloadResponse.json()) as {
-            requests: Array<{ id: string; action_payload?: { marker?: string } }>;
+            requests: Array<{
+                id: string;
+                dedupe_key: string | null;
+                action_payload?: { marker?: string };
+            }>;
             filtered_count: number;
         };
 
@@ -4248,6 +4619,28 @@ describe("object routes", () => {
         expect(includePayloadBody.requests[0]?.action_payload?.marker).toBe(
             "second",
         );
+        expect(includePayloadBody.requests[0]?.dedupe_key).toBeNull();
+
+        const compatibilityResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/resync-requests`,
+                {
+                    method: "GET",
+                    headers: {
+                        authorization: `Bearer ${viewerToken}`,
+                    },
+                },
+            ),
+        );
+
+        expect(compatibilityResponse.status).toBe(200);
+        const compatibilityBody = (await compatibilityResponse.json()) as {
+            requests: Array<{ id: string; dedupe_key: string | null }>;
+        };
+        expect(
+            compatibilityBody.requests.find((request) => request.id === requestTwoId)
+                ?.dedupe_key,
+        ).toBeNull();
     });
 
     test("supports admin-only access approvals and explicit assignment downloads", async () => {

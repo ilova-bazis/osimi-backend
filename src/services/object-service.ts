@@ -9,7 +9,6 @@ import {
     type AccessReasonCode,
 } from "../domain/objects/access-policy.ts";
 import type { AuthenticatedContext } from "../auth/guards.ts";
-import { requireObjectEditAccess } from "./object-edit-authorization.ts";
 import {
     createObjectAccessRequest,
     findPendingObjectAccessRequestForUser,
@@ -53,7 +52,7 @@ import {
     findPreferredThumbnailArtifactIdByObjectId,
     findObjectById,
     findObjectByIdUnscoped,
-    listPreferredThumbnailArtifactIdsByObjectIds,
+    listObjectArtifactSummariesByObjectIds,
     listArtifactsByObjectId,
     listObjects,
     createObjectArtifact,
@@ -61,7 +60,6 @@ import {
     type ObjectListSort,
     updateObjectAccessPolicy,
     updateObjectMetadataPages,
-    updateObjectTitle,
     type ObjectArtifactRecord,
     type ObjectRecord,
 } from "../repos/object-repo.ts";
@@ -101,8 +99,6 @@ import {
     type ObjectListResponse,
     type ObjectAvailableFileDto,
     type ListObjectAvailableFilesResponse,
-    type PatchObjectTitleBody,
-    type PatchObjectTitleResponse,
     type ResolveAccessRequestBody,
     type ReplaceObjectAvailableFilesBody,
     type ReplaceObjectAvailableFilesResponse,
@@ -2479,17 +2475,17 @@ export async function listObjectsForTenant(params: {
         : result.items;
     const lastItem = visible.at(-1);
 
-    const assignmentByObjectId =
-        await listObjectAccessAssignmentsForUserByObjectIds({
+    const [assignmentByObjectId, artifactSummaryByObjectId] = await Promise.all([
+        listObjectAccessAssignmentsForUserByObjectIds({
             tenantId: params.auth.tenantId,
             userId: params.auth.userId,
             objectIds: visible.map((item) => item.objectId),
-        });
-    const thumbnailArtifactIdByObjectId =
-        await listPreferredThumbnailArtifactIdsByObjectIds({
+        }),
+        listObjectArtifactSummariesByObjectIds({
             tenantId: params.auth.tenantId,
             objectIds: visible.map((item) => item.objectId),
-        });
+        }),
+    ]);
     let nextCursor: string | null = null;
     if (hasMore && lastItem) {
         if (sort === "created_at_desc" || sort === "created_at_asc") {
@@ -2518,10 +2514,15 @@ export async function listObjectsForTenant(params: {
                 role: params.auth.role,
                 assignmentLevel: assignmentByObjectId.get(record.objectId),
             });
+            const artifactSummary = artifactSummaryByObjectId.get(
+                record.objectId,
+            );
             return {
                 ...serializeObject(record),
                 thumbnail_artifact_id:
-                    thumbnailArtifactIdByObjectId.get(record.objectId) ?? null,
+                    artifactSummary?.thumbnailArtifactId ?? null,
+                has_access_pdf: artifactSummary?.hasAccessPdf ?? false,
+                has_ocr: artifactSummary?.hasOcr ?? false,
                 can_download: projection.canDownload,
                 access_reason_code: projection.accessReasonCode,
             };
@@ -2577,39 +2578,6 @@ export async function getObjectDetail(params: {
             access_reason_code: projection.accessReasonCode,
         },
         viewer,
-    };
-}
-
-export async function patchObjectTitleForTenant(params: {
-    auth: AuthenticatedContext;
-    objectId: string;
-    body: PatchObjectTitleBody;
-}): Promise<PatchObjectTitleResponse> {
-    await requireObjectEditAccess({
-        auth: params.auth,
-        objectId: params.objectId,
-    });
-
-    const updated = await updateObjectTitle({
-        tenantId: params.auth.tenantId,
-        objectId: params.objectId,
-        title: params.body.title,
-    });
-
-    if (!updated) {
-        throw new NotFoundError(`Object '${params.objectId}' was not found.`);
-    }
-
-    const thumbnailArtifactId = await findPreferredThumbnailArtifactIdByObjectId({
-        tenantId: params.auth.tenantId,
-        objectId: params.objectId,
-    });
-
-    return {
-        object: {
-            ...serializeObject(updated),
-            thumbnail_artifact_id: thumbnailArtifactId ?? null,
-        },
     };
 }
 
@@ -2726,8 +2694,11 @@ export async function viewObjectArtifactForTenant(params: {
         "last-modified": artifact.createdAt.toUTCString(),
     };
     const range = parseSingleByteRange(params.rangeHeader, artifact.sizeBytes);
+    const applies =
+        range.kind !== "ignore" &&
+        ifRangeMatches(params.ifRangeHeader, etag, artifact.createdAt);
 
-    if (range.kind === "unsatisfiable") {
+    if (range.kind === "unsatisfiable" && applies) {
         return new Response(null, {
             status: 416,
             headers: {
@@ -2737,7 +2708,7 @@ export async function viewObjectArtifactForTenant(params: {
         });
     }
 
-    if (range.kind === "range" && ifRangeMatches(params.ifRangeHeader, etag, artifact.createdAt)) {
+    if (range.kind === "range" && applies) {
         const length = range.range.end - range.range.start + 1;
         return new Response(file.slice(range.range.start, range.range.end + 1, artifact.contentType), {
             status: 206,

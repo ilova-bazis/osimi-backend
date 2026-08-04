@@ -163,6 +163,7 @@ export async function claimNextQueuedIngestion<T>(params: {
         SELECT ing.id, ing.batch_label, ing.tenant_id, ing.status
         FROM ingestions ing
         WHERE ing.status = 'QUEUED'
+          AND ing.staging_purge_started_at IS NULL
           AND NOT EXISTS (
             SELECT 1
             FROM ingestion_leases lease
@@ -233,7 +234,16 @@ export async function claimQueuedIngestionById<T>(params: {
             AND lease.lease_expires_at > now()
         ) AS exists
       `;
-      if (candidateRow.status !== "QUEUED" || activeLeaseRows[0]?.exists) {
+      const purgeStartedRows = await transaction<Array<{ started: boolean }>>`
+        SELECT staging_purge_started_at IS NOT NULL AS started
+        FROM ingestions
+        WHERE id = ${candidateRow.id}
+      `;
+      if (
+        candidateRow.status !== "QUEUED" ||
+        activeLeaseRows[0]?.exists ||
+        purgeStartedRows[0]?.started
+      ) {
         return { status: "not_leasable" as const };
       }
 
