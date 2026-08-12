@@ -6,8 +6,10 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { sql as sqlIdentifier } from "bun";
 
 import { createAppWithOptions as createApp } from "../../../src/app.ts";
+import { createDownloadRequestLeaseToken } from "../../../src/auth/worker-download-request.ts";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
+import { runWithRuntimeConfig } from "../../../src/runtime/config.ts";
 import { TEST_DATABASE_URL } from "../test-database.ts";
 
 describe("object routes", () => {
@@ -334,7 +336,7 @@ describe("object routes", () => {
 
         const adminBody = (await adminLogin.json()) as { token: string };
         adminToken = adminBody.token;
-    });
+    }, { timeout: 60_000 });
 
     afterAll(async () => {
         if (TEST_DATABASE_URL && schema) {
@@ -350,7 +352,7 @@ describe("object routes", () => {
         if (stagingRoot) {
             await rm(stagingRoot, { recursive: true, force: true });
         }
-    });
+    }, { timeout: 60_000 });
 
     test("lists tenant-scoped objects", async () => {
         const app = createTestApp();
@@ -2661,7 +2663,7 @@ describe("object routes", () => {
                                 display_name: "Original Bundle",
                                 content_type: "application/pdf",
                                 size_bytes: 1024,
-                                checksum_sha256: null,
+                                checksum_sha256: "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9",
                                 metadata: {},
                             },
                         ],
@@ -2686,7 +2688,11 @@ describe("object routes", () => {
 
         expect(listResponse.status).toBe(200);
         const listBody = (await listResponse.json()) as {
-            available_files: Array<{ artifact_kind: string; archive_file_key: string }>;
+            available_files: Array<{
+                artifact_kind: string;
+                archive_file_key: string;
+                checksum_sha256: string | null;
+            }>;
         };
 
         expect(listBody.available_files.length).toBe(1);
@@ -2694,6 +2700,31 @@ describe("object routes", () => {
         expect(listBody.available_files[0]?.archive_file_key).toBe(
             "archive-original-bundle",
         );
+        expect(listBody.available_files[0]?.checksum_sha256).toBe(
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+        );
+
+        const invalidChecksumResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/internal/objects/${tenantOneObjectId}/available-files`,
+                {
+                    method: "PUT",
+                    headers: {
+                        "x-worker-auth-token": "worker-secret",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        files: [{
+                            archive_file_key: "archive-invalid-checksum",
+                            artifact_kind: "original",
+                            display_name: "Invalid Checksum",
+                            checksum_sha256: "not-a-sha256",
+                        }],
+                    }),
+                },
+            ),
+        );
+        expect(invalidChecksumResponse.status).toBe(400);
     });
 
     test("sync snapshot marks omitted available files as unavailable", async () => {
@@ -3936,7 +3967,7 @@ describe("object routes", () => {
           ${tenantOneObjectIdTwo},
           ${tenantOneId},
           ${"archive-worker-web-v1"},
-          ${"web_version"}::artifact_kind,
+          ${"ocr_text"}::artifact_kind,
           ${artifactVariant},
           ${"Web Version"},
           true
@@ -4113,6 +4144,77 @@ describe("object routes", () => {
 
         expect(uploadResponse.status).toBe(200);
 
+        const verifiedSql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await verifiedSql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            const finalized = await verifiedSql<Array<{
+                status: string;
+                state: string;
+                artifact_id: string;
+                storage_key: string;
+                artifact_storage_key: string;
+            }>>`
+                SELECT req.status, attempt.state, attempt.artifact_id, attempt.storage_key,
+                       artifact.storage_key AS artifact_storage_key
+                FROM archive_requests req
+                INNER JOIN archive_artifact_upload_attempts attempt
+                  ON attempt.request_id = req.id
+                INNER JOIN object_artifacts artifact
+                  ON artifact.id = attempt.artifact_id
+                WHERE req.id = ${leasedRequest!.request_id}
+            `;
+            expect(finalized).toHaveLength(1);
+            expect(finalized[0]).toMatchObject({
+                status: "COMPLETED",
+                state: "MATERIALIZED",
+                storage_key: represignBody.storage_key,
+                artifact_storage_key: represignBody.storage_key,
+            });
+
+            const artifactId = finalized[0]!.artifact_id;
+            await verifiedSql`
+                UPDATE archive_artifact_upload_attempts
+                SET state = 'VERIFIED', artifact_id = NULL, materialized_at = NULL,
+                    updated_at = now()
+                WHERE request_id = ${leasedRequest!.request_id}
+                  AND state = 'MATERIALIZED'
+            `;
+            await verifiedSql`
+                UPDATE archive_requests
+                SET status = 'PROCESSING', completed_at = NULL, updated_at = now()
+                WHERE id = ${leasedRequest!.request_id}
+            `;
+            await verifiedSql`DELETE FROM object_artifact_search_documents WHERE artifact_id = ${artifactId}`;
+            await verifiedSql`DELETE FROM object_artifacts WHERE id = ${artifactId}`;
+        } finally {
+            await verifiedSql.close();
+        }
+
+        const verifiedDifferentReplayResponse = await app.fetch(
+            new Request(`http://localhost${represignBody.upload_url}`, {
+                method: "PUT",
+                headers: {
+                    "content-type": "text/plain",
+                    "content-length": "11",
+                },
+                body: "goodbye all",
+            }),
+        );
+        expect(verifiedDifferentReplayResponse.status).toBe(409);
+
+        const verifiedExactReplayResponse = await app.fetch(
+            new Request(`http://localhost${represignBody.upload_url}`, {
+                method: "PUT",
+                headers: {
+                    "content-type": "text/plain",
+                    "content-length": "11",
+                },
+                body: "hello world",
+            }),
+        );
+        expect(verifiedExactReplayResponse.status).toBe(200);
+        const immutablePath = join(stagingRoot, represignBody.storage_key);
+
         const missingUploadTokenResponse = await app.fetch(
             new Request(
                 `http://localhost/api/archive-requests/${leasedRequest!.request_id}/complete`,
@@ -4157,6 +4259,235 @@ describe("object routes", () => {
         expect(completeBody.request.status).toBe("COMPLETED");
         expect(completeBody.request.action_type).toBe("artifact_fetch");
 
+        await Bun.write(immutablePath, "goodbye all");
+        const corruptCompletionResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/archive-requests/${leasedRequest!.request_id}/complete`,
+                {
+                    method: "POST",
+                    headers: {
+                        "x-worker-auth-token": "worker-secret",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        lease_token: leasedRequest!.lease_token,
+                        upload_token: represignBody.upload_token,
+                    }),
+                },
+            ),
+        );
+        expect(corruptCompletionResponse.status).toBe(200);
+
+        const genericRetryResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/archive-requests/${leasedRequest!.request_id}/complete`,
+                {
+                    method: "POST",
+                    headers: {
+                        "x-worker-auth-token": "worker-secret",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        lease_token: leasedRequest!.lease_token,
+                        upload_token: represignBody.upload_token,
+                    }),
+                },
+            ),
+        );
+        expect(genericRetryResponse.status).toBe(200);
+
+        const projectionSql = createSqlClient(TEST_DATABASE_URL!);
+        let legacyLeaseToken = "";
+        let projectionBeforeAcknowledgements: {
+            artifact_id: string;
+            available_file_id: string;
+            text_content: string;
+            indexed_at: Date;
+            updated_at: Date;
+        } | undefined;
+        try {
+            await projectionSql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            const projections = await projectionSql<Array<{
+                artifact_id: string;
+                available_file_id: string;
+                text_content: string;
+                indexed_at: Date;
+                updated_at: Date;
+            }>>`
+                SELECT doc.artifact_id, doc.available_file_id, doc.text_content,
+                       doc.indexed_at, doc.updated_at
+                FROM object_artifact_search_documents doc
+                INNER JOIN object_artifacts artifact ON artifact.id = doc.artifact_id
+                WHERE artifact.object_id = ${tenantOneObjectIdTwo}
+                  AND artifact.variant = ${artifactVariant}
+            `;
+            expect(projections).toHaveLength(1);
+            expect(projections[0]?.available_file_id).toBe(availableFileId);
+            expect(projections[0]?.text_content).toBe("hello world");
+            expect(projections[0]?.indexed_at).toBeInstanceOf(Date);
+            expect(projections[0]?.updated_at).toBeInstanceOf(Date);
+            projectionBeforeAcknowledgements = projections[0];
+
+            const requests = await projectionSql<Array<{
+                lease_id: string;
+                lease_token_id: string;
+            }>>`
+                SELECT lease_id, lease_token_id
+                FROM archive_requests
+                WHERE id = ${leasedRequest!.request_id}
+            `;
+            const completedRequest = requests[0]!;
+            legacyLeaseToken = runWithRuntimeConfig(
+                { leaseSigningSecret: "object-routes-lease-signing-secret-0000" },
+                () => createDownloadRequestLeaseToken({
+                    request_id: leasedRequest!.request_id,
+                    lease_id: completedRequest.lease_id,
+                    lease_token_id: completedRequest.lease_token_id,
+                    object_id: tenantOneObjectIdTwo,
+                    tenant_id: tenantOneId,
+                    artifact_kind: "pdf",
+                    variant: "not-authoritative",
+                    exp: new Date(Date.now() + 60_000).toISOString(),
+                }),
+            );
+        } finally {
+            await projectionSql.close();
+        }
+
+        const legacyRetryResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/object-download-requests/${leasedRequest!.request_id}/complete`,
+                {
+                    method: "POST",
+                    headers: {
+                        "x-worker-auth-token": "worker-secret",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        lease_token: legacyLeaseToken,
+                        upload_token: represignBody.upload_token,
+                    }),
+                },
+            ),
+        );
+        expect(legacyRetryResponse.status).toBe(200);
+
+        const unchangedSql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await unchangedSql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            const unchanged = await unchangedSql<Array<{
+                artifact_id: string;
+                available_file_id: string;
+                text_content: string;
+                indexed_at: Date;
+                updated_at: Date;
+            }>>`
+                SELECT doc.artifact_id, doc.available_file_id, doc.text_content,
+                       doc.indexed_at, doc.updated_at
+                FROM object_artifact_search_documents doc
+                INNER JOIN object_artifacts artifact ON artifact.id = doc.artifact_id
+                WHERE artifact.object_id = ${tenantOneObjectIdTwo}
+                  AND artifact.variant = ${artifactVariant}
+            `;
+            expect(unchanged).toEqual([projectionBeforeAcknowledgements!]);
+            await unchangedSql`
+                DELETE FROM object_artifact_search_documents
+                WHERE artifact_id = ${projectionBeforeAcknowledgements!.artifact_id}
+            `;
+        } finally {
+            await unchangedSql.close();
+        }
+
+        const genericMissingProjectionResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/archive-requests/${leasedRequest!.request_id}/complete`,
+                {
+                    method: "POST",
+                    headers: {
+                        "x-worker-auth-token": "worker-secret",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        lease_token: leasedRequest!.lease_token,
+                        upload_token: represignBody.upload_token,
+                    }),
+                },
+            ),
+        );
+        expect(genericMissingProjectionResponse.status).toBe(200);
+
+        const legacyMissingProjectionResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/object-download-requests/${leasedRequest!.request_id}/complete`,
+                {
+                    method: "POST",
+                    headers: {
+                        "x-worker-auth-token": "worker-secret",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        lease_token: legacyLeaseToken,
+                        upload_token: represignBody.upload_token,
+                    }),
+                },
+            ),
+        );
+        expect(legacyMissingProjectionResponse.status).toBe(200);
+
+        const missingProjectionSql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await missingProjectionSql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            const missingProjection = await missingProjectionSql<Array<{ artifact_id: string }>>`
+                SELECT artifact_id
+                FROM object_artifact_search_documents
+                WHERE artifact_id = ${projectionBeforeAcknowledgements!.artifact_id}
+            `;
+            expect(missingProjection).toEqual([]);
+        } finally {
+            await missingProjectionSql.close();
+        }
+
+        await Bun.write(immutablePath, "hello world");
+
+        const identicalReplayResponse = await app.fetch(
+            new Request(`http://localhost${represignBody.upload_url}`, {
+                method: "PUT",
+                headers: {
+                    "content-type": "text/plain",
+                    "content-length": "11",
+                },
+                body: "hello world",
+            }),
+        );
+        expect(identicalReplayResponse.status).toBe(200);
+
+        await rm(immutablePath);
+        const missingDifferentReplayResponse = await app.fetch(
+            new Request(`http://localhost${represignBody.upload_url}`, {
+                method: "PUT",
+                headers: {
+                    "content-type": "text/plain",
+                    "content-length": "11",
+                },
+                body: "goodbye all",
+            }),
+        );
+        expect(missingDifferentReplayResponse.status).toBe(409);
+        expect(await Bun.file(immutablePath).exists()).toBe(false);
+
+        const restoreReplayResponse = await app.fetch(
+            new Request(`http://localhost${represignBody.upload_url}`, {
+                method: "PUT",
+                headers: {
+                    "content-type": "text/plain",
+                    "content-length": "11",
+                },
+                body: "hello world",
+            }),
+        );
+        expect(restoreReplayResponse.status).toBe(200);
+        expect(await Bun.file(immutablePath).text()).toBe("hello world");
+
         const replayResponse = await app.fetch(
             new Request(`http://localhost${represignBody.upload_url}`, {
                 method: "PUT",
@@ -4169,7 +4500,7 @@ describe("object routes", () => {
         );
 
         expect(replayResponse.status).toBe(409);
-        expect(await Bun.file(join(stagingRoot, represignBody.storage_key)).text()).toBe(
+        expect(await Bun.file(immutablePath).text()).toBe(
             "hello world",
         );
 
@@ -4909,5 +5240,369 @@ describe("object routes", () => {
         );
 
         expect(rejectResponse.status).toBe(200);
+    });
+
+    test("validates and preserves literal tenant-catalog search", async () => {
+        const app = createTestApp();
+        const catalogObjectId = "OBJ-20260805-CAT001";
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+                INSERT INTO objects (
+                    object_id, tenant_id, type, title, availability_state,
+                    access_level
+                )
+                VALUES (
+                    ${catalogObjectId}, ${tenantOneId}, 'DOCUMENT',
+                    'UM33 Private Catalog Compatibility Caf\u00e9', 'UNAVAILABLE', 'private'
+                )
+            `;
+        } finally {
+            await sql.close();
+        }
+
+        for (const sort of [
+            "created_at_desc",
+            "created_at_asc",
+            "updated_at_desc",
+            "updated_at_asc",
+            "title_asc",
+            "title_desc",
+        ]) {
+            const response = await app.fetch(
+                new Request(
+                    `http://localhost/api/objects?q=%20um33%20private%20catalog%20compatibility%20&sort=${sort}`,
+                    {
+                        headers: { authorization: `Bearer ${viewerToken}` },
+                    },
+                ),
+            );
+            expect(response.status).toBe(200);
+            const body = (await response.json()) as {
+                objects: Array<{ object_id: string }>;
+                filtered_count: number;
+            };
+            expect(body.objects.map((item) => item.object_id)).toEqual([
+                catalogObjectId,
+            ]);
+            expect(body.filtered_count).toBe(1);
+        }
+
+        const tooLong = await app.fetch(
+            new Request(`http://localhost/api/objects?q=${"x".repeat(257)}`, {
+                headers: { authorization: `Bearer ${viewerToken}` },
+            }),
+        );
+        expect(tooLong.status).toBe(400);
+
+        const nul = await app.fetch(
+            new Request("http://localhost/api/objects?q=before%00after", {
+                headers: { authorization: `Bearer ${viewerToken}` },
+            }),
+        );
+        expect(nul.status).toBe(400);
+        expect(await nul.json()).toMatchObject({
+            error: {
+                code: "BAD_REQUEST",
+                message: "Invalid request at 'q': Search query must not contain NUL characters.",
+            },
+        });
+
+        const unicode = await app.fetch(
+            new Request("http://localhost/api/objects?q=caf%C3%A9", {
+                headers: { authorization: `Bearer ${viewerToken}` },
+            }),
+        );
+        expect(unicode.status).toBe(200);
+        expect(await unicode.json()).toMatchObject({
+            objects: [{ object_id: catalogObjectId }],
+            filtered_count: 1,
+        });
+
+        const empty = await app.fetch(
+            new Request("http://localhost/api/objects?q=%20%20%20", {
+                headers: { authorization: `Bearer ${viewerToken}` },
+            }),
+        );
+        expect(empty.status).toBe(200);
+        const emptyBody = (await empty.json()) as {
+            filtered_count: number;
+            total_count: number;
+        };
+        expect(emptyBody.filtered_count).toBe(emptyBody.total_count);
+    });
+
+    test("searches only accessible materialized artifact data", async () => {
+        const app = createTestApp();
+        const publicObjectId = "OBJ-20260805-SRCH01";
+        const privateObjectId = "OBJ-20260805-SRCH02";
+        const familyObjectId = "OBJ-20260805-SRCH03";
+        const timedEmbargoObjectId = "OBJ-20260805-SRCH04";
+        const curationEmbargoObjectId = "OBJ-20260805-SRCH05";
+        const archivedObjectId = "OBJ-20260805-SRCH06";
+        const crossTenantObjectId = "OBJ-20260805-SRCH07";
+        const unavailableObjectId = "OBJ-20260805-SRCH08";
+        const publicArtifactId = "80000000-0000-4000-8000-000000000101";
+        const duplicateArtifactId = "80000000-0000-4000-8000-000000000102";
+        const privateArtifactId = "80000000-0000-4000-8000-000000000103";
+        const familyArtifactId = "80000000-0000-4000-8000-000000000104";
+        const timedArtifactId = "80000000-0000-4000-8000-000000000105";
+        const curationArtifactId = "80000000-0000-4000-8000-000000000106";
+        const archivedArtifactId = "80000000-0000-4000-8000-000000000107";
+        const crossTenantArtifactId = "80000000-0000-4000-8000-000000000108";
+        const pageOcrArtifactId = "80000000-0000-4000-8000-000000000109";
+        const pdfArtifactId = "80000000-0000-4000-8000-000000000110";
+        const unavailableArtifactId = "80000000-0000-4000-8000-000000000111";
+        const linkedFileId = "80000000-0000-4000-8000-000000000201";
+        const inventoryOnlyFileId = "80000000-0000-4000-8000-000000000202";
+        const pdfStorageKey = "um33/binary-search-source.pdf";
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+                INSERT INTO objects (
+                    object_id, tenant_id, type, title, availability_state,
+                    access_level, embargo_kind, embargo_until,
+                    embargo_curation_state, curation_state
+                )
+                VALUES
+                  (${publicObjectId}, ${tenantOneId}, 'DOCUMENT', 'UM33 literal needle%wild needle_wild needle\\wild', 'AVAILABLE', 'public', 'none', NULL, NULL, 'needs_review'),
+                  (${privateObjectId}, ${tenantOneId}, 'DOCUMENT', 'UM33 private catalog title', 'AVAILABLE', 'private', 'none', NULL, NULL, 'needs_review'),
+                  (${familyObjectId}, ${tenantOneId}, 'DOCUMENT', 'UM33 family', 'AVAILABLE', 'family', 'none', NULL, NULL, 'needs_review'),
+                  (${timedEmbargoObjectId}, ${tenantOneId}, 'DOCUMENT', 'UM33 timed embargo', 'AVAILABLE', 'public', 'timed', '2099-01-01T00:00:00Z', NULL, 'needs_review'),
+                  (${curationEmbargoObjectId}, ${tenantOneId}, 'DOCUMENT', 'UM33 curation embargo', 'AVAILABLE', 'public', 'curation_state', NULL, 'reviewed', 'needs_review'),
+                  (${archivedObjectId}, ${tenantOneId}, 'DOCUMENT', 'UM33 archived', 'ARCHIVED', 'public', 'none', NULL, NULL, 'needs_review'),
+                  (${crossTenantObjectId}, ${tenantTwoId}, 'DOCUMENT', 'UM33 cross tenant', 'AVAILABLE', 'public', 'none', NULL, NULL, 'needs_review'),
+                  (${unavailableObjectId}, ${tenantOneId}, 'DOCUMENT', 'UM35 unavailable', 'UNAVAILABLE', 'public', 'none', NULL, NULL, 'needs_review')
+            `;
+            await sql`
+                UPDATE objects
+                SET source_ingestion_id = ${sourceIngestionId},
+                    language_code = 'en',
+                    created_at = '2026-08-05T12:00:00Z'::timestamptz,
+                    updated_at = '2026-08-05T13:00:00Z'::timestamptz
+                WHERE object_id = ${publicObjectId}
+            `;
+            await sql`
+                INSERT INTO object_tags (object_id, tag_id)
+                VALUES (${publicObjectId}, ${"70000000-0000-0000-0000-000000000001"})
+            `;
+            await sql`
+                INSERT INTO object_access_assignments (
+                    object_id, tenant_id, user_id, granted_level, created_by
+                )
+                VALUES
+                  (${privateObjectId}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000001"}, 'private', ${"10000000-0000-0000-0000-000000000003"}),
+                  (${familyObjectId}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000002"}, 'family', ${"10000000-0000-0000-0000-000000000003"})
+            `;
+            await sql`
+                INSERT INTO object_artifacts (
+                    id, object_id, kind, variant, storage_key, content_type, size_bytes
+                )
+                VALUES
+                  (${publicArtifactId}, ${publicObjectId}, 'ocr_text', 'full_v1', 'um33/public-a.txt', 'text/x-um33-metadata', 10),
+                  (${duplicateArtifactId}, ${publicObjectId}, 'transcript', 'UM33DuplicateVariant', 'um33/public-b.txt', 'text/plain', 10),
+                  (${privateArtifactId}, ${privateObjectId}, 'ocr_text', NULL, 'um33/private.txt', 'text/plain', 10),
+                  (${familyArtifactId}, ${familyObjectId}, 'ocr_text', NULL, 'um33/family.txt', 'text/plain', 10),
+                  (${timedArtifactId}, ${timedEmbargoObjectId}, 'ocr_text', NULL, 'um33/timed.txt', 'text/plain', 10),
+                  (${curationArtifactId}, ${curationEmbargoObjectId}, 'ocr_text', NULL, 'um33/curation.txt', 'text/plain', 10),
+                  (${archivedArtifactId}, ${archivedObjectId}, 'ocr_text', NULL, 'um33/archived.txt', 'text/plain', 10),
+                  (${crossTenantArtifactId}, ${crossTenantObjectId}, 'ocr_text', NULL, 'um33/cross.txt', 'text/plain', 10),
+                  (${pageOcrArtifactId}, ${publicObjectId}, 'ocr_text', 'page_0001', 'um33/page-1.txt', 'text/plain', 10),
+                  (${pdfArtifactId}, ${publicObjectId}, 'pdf', NULL, ${pdfStorageKey}, 'application/pdf', 30),
+                  (${unavailableArtifactId}, ${unavailableObjectId}, 'ocr_text', NULL, 'um35/unavailable.txt', 'text/plain', 10)
+            `;
+            await sql`
+                INSERT INTO object_available_files (
+                    id, object_id, tenant_id, archive_file_key, artifact_kind,
+                    display_name, content_type
+                )
+                VALUES
+                  (${linkedFileId}, ${publicObjectId}, ${tenantOneId}, 'archive/UM33ProvenanceKey.txt', 'ocr_text', 'UM33 Provenance Display', 'text/plain'),
+                  (${inventoryOnlyFileId}, ${publicObjectId}, ${tenantOneId}, 'archive/UM33InventoryOnly.txt', 'ocr_text', 'UM33 Inventory Only', 'text/plain')
+            `;
+            await sql`
+                INSERT INTO object_artifact_search_documents (
+                    artifact_id, available_file_id, text_content, indexed_at
+                )
+                VALUES
+                  (${publicArtifactId}, ${linkedFileId}, 'UM35CombinedOcrTerm UM33DuplicateTerm ЮникодПоиск UM35CursorTerm', now()),
+                  (${duplicateArtifactId}, NULL, 'UM35SpokenBodyTerm UM33DuplicateTerm', now()),
+                  (${privateArtifactId}, NULL, 'UM33PrivateSecret', now()),
+                  (${familyArtifactId}, NULL, 'UM33FamilySecret UM35CursorTerm', now()),
+                  (${timedArtifactId}, NULL, 'UM33TimedSecret', now()),
+                  (${curationArtifactId}, NULL, 'UM33CurationEmbargoSecret', now()),
+                  (${archivedArtifactId}, NULL, 'UM33ArchivedSecret', now()),
+                  (${crossTenantArtifactId}, NULL, 'UM33CrossTenantSecret', now()),
+                  (${pageOcrArtifactId}, NULL, 'UM35PageOcrTerm', now()),
+                  (${unavailableArtifactId}, NULL, 'UM35UnavailableSecret', now())
+            `;
+            await sql`
+                INSERT INTO object_curated_document_pages (
+                    object_id, page_number, curated_text
+                )
+                VALUES (${publicObjectId}, 1, 'UM33CuratedTerm')
+            `;
+        } finally {
+            await sql.close();
+        }
+        const pdfPath = join(stagingRoot, pdfStorageKey);
+        await mkdir(dirname(pdfPath), { recursive: true });
+        await Bun.write(pdfPath, "%PDF-1.7 UM35BinaryPdfBytesOnly");
+
+        async function search(term: string, token = viewerToken, sort?: string) {
+            const response = await app.fetch(
+                new Request(
+                    `http://localhost/api/objects?q=${encodeURIComponent(term)}${sort ? `&sort=${sort}` : ""}`,
+                    { headers: { authorization: `Bearer ${token}` } },
+                ),
+            );
+            expect(response.status).toBe(200);
+            return (await response.json()) as {
+                objects: Array<{ object_id: string }>;
+                filtered_count: number;
+                next_cursor: string | null;
+            };
+        }
+
+        for (const term of [
+            publicArtifactId,
+            "full_v1",
+            "transcript",
+            "text/x-um33-metadata",
+            "UM35CombinedOcrTerm",
+            "UM35PageOcrTerm",
+            "UM35SpokenBodyTerm",
+            "UM33CuratedTerm",
+            "UM33 Provenance Display",
+            "UM33ProvenanceKey",
+            "ЮникодПоиск",
+        ]) {
+            const body = await search(term);
+            expect(body.objects.map((item) => item.object_id)).toEqual([
+                publicObjectId,
+            ]);
+            expect(body.filtered_count).toBe(1);
+        }
+
+        for (const sort of [
+            "created_at_desc",
+            "created_at_asc",
+            "updated_at_desc",
+            "updated_at_asc",
+            "title_asc",
+            "title_desc",
+        ]) {
+            const body = await search("UM33DuplicateTerm", viewerToken, sort);
+            expect(body.objects.map((item) => item.object_id)).toEqual([
+                publicObjectId,
+            ]);
+            expect(body.filtered_count).toBe(1);
+        }
+
+        for (const literal of ["needle%wild", "needle_wild", "needle\\wild"]) {
+            const body = await search(literal);
+            expect(body.objects.map((item) => item.object_id)).toEqual([
+                publicObjectId,
+            ]);
+        }
+        expect((await search("needleXwild")).filtered_count).toBe(0);
+        expect((await search("UM33InventoryOnly")).filtered_count).toBe(0);
+        expect((await search("UM35BinaryPdfBytesOnly")).filtered_count).toBe(0);
+
+        expect((await search("UM33PrivateSecret")).filtered_count).toBe(0);
+        expect(
+            (await search("UM33PrivateSecret", unassignedArchiverToken))
+                .filtered_count,
+        ).toBe(0);
+        expect(
+            (await search("UM33PrivateSecret", operatorToken)).objects[0]
+                ?.object_id,
+        ).toBe(privateObjectId);
+        expect(
+            (await search("UM33PrivateSecret", adminToken)).objects[0]?.object_id,
+        ).toBe(privateObjectId);
+        expect((await search("UM33FamilySecret")).objects[0]?.object_id).toBe(
+            familyObjectId,
+        );
+        expect(
+            (await search("UM33FamilySecret", unassignedArchiverToken))
+                .filtered_count,
+        ).toBe(0);
+
+        for (const term of [
+            "UM33TimedSecret",
+            "UM33CurationEmbargoSecret",
+            "UM33ArchivedSecret",
+            "UM33CrossTenantSecret",
+            "UM35UnavailableSecret",
+        ]) {
+            expect((await search(term, adminToken)).filtered_count).toBe(0);
+        }
+
+        for (const sort of [
+            "created_at_desc",
+            "created_at_asc",
+            "updated_at_desc",
+            "updated_at_asc",
+            "title_asc",
+            "title_desc",
+        ]) {
+            const firstResponse = await app.fetch(
+                new Request(
+                    `http://localhost/api/objects?q=UM35CursorTerm&sort=${sort}&limit=1`,
+                    { headers: { authorization: `Bearer ${viewerToken}` } },
+                ),
+            );
+            expect(firstResponse.status).toBe(200);
+            const first = (await firstResponse.json()) as {
+                objects: Array<{ object_id: string }>;
+                filtered_count: number;
+                next_cursor: string | null;
+            };
+            expect(first.filtered_count).toBe(2);
+            expect(first.objects).toHaveLength(1);
+            expect(first.next_cursor).not.toBeNull();
+
+            const secondResponse = await app.fetch(
+                new Request(
+                    `http://localhost/api/objects?q=UM35CursorTerm&sort=${sort}&limit=1&cursor=${encodeURIComponent(first.next_cursor!)}`,
+                    { headers: { authorization: `Bearer ${viewerToken}` } },
+                ),
+            );
+            expect(secondResponse.status).toBe(200);
+            const second = (await secondResponse.json()) as {
+                objects: Array<{ object_id: string }>;
+                filtered_count: number;
+                next_cursor: string | null;
+            };
+            expect(second.filtered_count).toBe(2);
+            expect(second.next_cursor).toBeNull();
+            expect(new Set([
+                first.objects[0]?.object_id,
+                second.objects[0]?.object_id,
+            ])).toEqual(new Set([publicObjectId, familyObjectId]));
+        }
+
+        const combinedFiltersResponse = await app.fetch(
+            new Request(
+                "http://localhost/api/objects?q=UM35CombinedOcrTerm&type=DOCUMENT&availability_state=AVAILABLE&access_level=public&language=en&batch_label=batch-alpha&from=2026-08-05T00%3A00%3A00Z&to=2026-08-06T00%3A00%3A00Z&tag=history",
+                { headers: { authorization: `Bearer ${viewerToken}` } },
+            ),
+        );
+        expect(combinedFiltersResponse.status).toBe(200);
+        const combinedFilters = (await combinedFiltersResponse.json()) as {
+            objects: Array<{ object_id: string }>;
+            filtered_count: number;
+        };
+        expect(combinedFilters.objects.map((item) => item.object_id)).toEqual([
+            publicObjectId,
+        ]);
+        expect(combinedFilters.filtered_count).toBe(1);
+
+        const catalogMatch = await search("UM33 private catalog title");
+        expect(catalogMatch.objects[0]?.object_id).toBe(privateObjectId);
     });
 });

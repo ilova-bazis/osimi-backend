@@ -114,6 +114,7 @@ export function createArchiveRequestLeaseToken(
 
 export function parseArchiveRequestLeaseToken(
   token: string,
+  options: { allowExpired?: boolean } = {},
 ): ArchiveRequestLeaseTokenPayload {
   const [encodedPayload, signature, ...rest] = token.split(".");
 
@@ -132,7 +133,7 @@ export function parseArchiveRequestLeaseToken(
   const payload = decodePayload(encodedPayload);
   const expiresAt = new Date(payload.exp);
 
-  if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) {
+  if (Number.isNaN(expiresAt.getTime()) || (!options.allowExpired && expiresAt.getTime() <= Date.now())) {
     throw new UnauthorizedError("Archive request lease token has expired.");
   }
 
@@ -143,8 +144,11 @@ export async function authorizeWorkerLeaseForArchiveRequest(params: {
   requestId: string;
   leaseToken: string;
   requireActiveLease?: boolean;
+  allowExpired?: boolean;
 }): Promise<AuthorizedWorkerArchiveRequestLease> {
-  const payload = parseArchiveRequestLeaseToken(params.leaseToken);
+  const payload = parseArchiveRequestLeaseToken(params.leaseToken, {
+    allowExpired: params.allowExpired,
+  });
 
   if (payload.request_id !== params.requestId) {
     throw new UnauthorizedError(

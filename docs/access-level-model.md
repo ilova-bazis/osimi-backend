@@ -88,7 +88,7 @@ Object editing uses the authorization portion of the access decision, without em
 - `private`: requires a `private` assignment in addition to the endpoint role requirement.
 - `admin`: bypasses assignment checks.
 
-This policy applies to title updates, edit detail and lock acquisition, metadata, curation, curation submission, edit history, and edit-lock release. A policy denial for an object in the current tenant returns `403`; a missing or cross-tenant object returns `404`.
+This policy applies to edit detail and lock acquisition, metadata, curation, curation submission, edit history, and edit-lock release. A policy denial for an object in the current tenant returns `403`; a missing or cross-tenant object returns `404`.
 
 ## API Direction
 

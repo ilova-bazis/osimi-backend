@@ -1,5 +1,7 @@
+import type { UserRole } from "../auth/types.ts";
 import { withExecutor, withSchemaClient } from "../db/client.ts";
 import type { SqlExecutor } from "../db/client.ts";
+import { escapeLikePattern } from "../db/like.ts";
 import { toSafeNumberFromDbInt, type DbInt } from "../db/number.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
 
@@ -130,6 +132,8 @@ export type ArtifactKind =
 
 export interface ListObjectsParams {
     tenantId: string;
+    userId: string;
+    role: UserRole;
     limit: number;
     sort: ObjectListSort;
     cursorCreatedAt?: string;
@@ -586,8 +590,9 @@ export async function createObjectArtifact(params: {
     storageKey: string;
     contentType: string;
     sizeBytes: number;
+    executor?: SqlExecutor;
 }): Promise<ObjectArtifactRecord> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ObjectArtifactRow[]>`
       INSERT INTO object_artifacts (
         id,
@@ -614,13 +619,64 @@ export async function createObjectArtifact(params: {
     return mapArtifact(rows[0]!);
 }
 
+export async function createOrFindObjectArtifactByStorageKey(params: {
+    objectId: string;
+    kind: ArtifactKind;
+    variant?: string | null;
+    storageKey: string;
+    contentType: string;
+    sizeBytes: number;
+    executor: SqlExecutor;
+}): Promise<ObjectArtifactRecord> {
+    const rows = await params.executor<ObjectArtifactRow[]>`
+      INSERT INTO object_artifacts (
+        id, object_id, kind, variant, storage_key, content_type, size_bytes
+      )
+      VALUES (
+        ${crypto.randomUUID()}, ${params.objectId}, ${params.kind},
+        ${params.variant ?? null}, ${params.storageKey}, ${params.contentType},
+        ${params.sizeBytes}
+      )
+      ON CONFLICT (storage_key) DO NOTHING
+      RETURNING id, object_id, kind, variant, storage_key, content_type, size_bytes, created_at
+    `;
+    const inserted = rows[0];
+    if (inserted) return mapArtifact(inserted);
+
+    const existing = await findArtifactByStorageKey({
+        objectId: params.objectId,
+        storageKey: params.storageKey,
+        executor: params.executor,
+    });
+    if (!existing) {
+        throw new Error(`Artifact storage conflict could not be resolved for '${params.storageKey}'.`);
+    }
+    return existing;
+}
+
+export async function lockObjectForUpdate(params: {
+    tenantId: string;
+    objectId: string;
+    executor: SqlExecutor;
+}): Promise<boolean> {
+    const rows = await params.executor<Array<{ object_id: string }>>`
+      SELECT object_id
+      FROM objects
+      WHERE tenant_id = ${params.tenantId}
+        AND object_id = ${params.objectId}
+      FOR UPDATE
+    `;
+    return rows.length > 0;
+}
+
 export async function findLatestArtifactByKind(params: {
     tenantId: string;
     objectId: string;
     kind: ArtifactKind;
     variant: string | null;
+    executor?: SqlExecutor;
 }): Promise<ObjectArtifactRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ObjectArtifactRow[]>`
       SELECT art.id, art.object_id, art.kind, art.variant, art.storage_key, art.content_type, art.size_bytes, art.created_at
       FROM object_artifacts art
@@ -642,7 +698,11 @@ export async function listObjects(
     params: ListObjectsParams,
 ): Promise<ListObjectsResult> {
     return await withSchemaClient(async (sql) => {
-        const queryPattern = params.query ? `%${params.query}%` : null;
+        const queryPattern = params.query
+            ? `%${escapeLikePattern(params.query)}%`
+            : null;
+        const likeEscape = "\\";
+        const queryTime = new Date();
 
         const totalRows = await sql<CountRow[]>`
       SELECT COUNT(*)::int AS count
@@ -662,7 +722,67 @@ export async function listObjects(
         AND (${params.toCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at <= ${params.toCreatedAt ?? null}::timestamptz)
         AND (${params.language ?? null}::text IS NULL OR lower(obj.language_code) = lower(${params.language ?? null}::text))
         AND (${params.batchLabel ?? null}::text IS NULL OR ing.batch_label ILIKE ${params.batchLabel ? `%${params.batchLabel}%` : null}::text)
-        AND (${queryPattern ?? null}::text IS NULL OR obj.title ILIKE ${queryPattern ?? null}::text OR obj.object_id ILIKE ${queryPattern ?? null}::text)
+        AND (
+          ${queryPattern ?? null}::text IS NULL
+          OR obj.title ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+          OR obj.object_id ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+          OR (
+            obj.availability_state = 'AVAILABLE'::object_availability_state
+            AND (
+              ${params.role}::text = 'admin'
+              OR obj.access_level = 'public'::object_access_level
+              OR EXISTS (
+                SELECT 1
+                FROM object_access_assignments asg
+                WHERE asg.object_id = obj.object_id
+                  AND asg.tenant_id = obj.tenant_id
+                  AND asg.user_id = ${params.userId}
+                  AND (
+                    (obj.access_level = 'family'::object_access_level AND asg.granted_level IN ('family', 'private'))
+                    OR (obj.access_level = 'private'::object_access_level AND asg.granted_level = 'private')
+                  )
+              )
+            )
+            AND (
+              obj.embargo_kind = 'none'::object_embargo_kind
+              OR (obj.embargo_kind = 'timed'::object_embargo_kind AND (obj.embargo_until IS NULL OR obj.embargo_until <= ${queryTime}))
+              OR (
+                obj.embargo_kind = 'curation_state'::object_embargo_kind
+                AND (obj.embargo_curation_state IS NULL OR obj.curation_state = obj.embargo_curation_state)
+              )
+            )
+            AND (
+              EXISTS (
+                SELECT 1
+                FROM object_artifacts art
+                LEFT JOIN object_artifact_search_documents doc ON doc.artifact_id = art.id
+                LEFT JOIN object_available_files file
+                  ON file.id = doc.available_file_id
+                  AND file.object_id = art.object_id
+                  AND file.tenant_id = obj.tenant_id
+                WHERE art.object_id = obj.object_id
+                  AND (
+                    art.id::text ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                    OR art.kind::text ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                    OR art.variant ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                    OR art.content_type ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                    OR (
+                      art.kind IN ('ocr_text'::artifact_kind, 'transcript'::artifact_kind)
+                      AND doc.text_content ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                    )
+                    OR file.display_name ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                    OR file.archive_file_key ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                  )
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM object_curated_document_pages page
+                WHERE page.object_id = obj.object_id
+                  AND page.curated_text ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+              )
+            )
+          )
+        )
         AND (
           (${params.tag ?? null}::text IS NULL)
           OR EXISTS (
@@ -675,10 +795,7 @@ export async function listObjects(
         )
     `;
 
-        let rows: ObjectRow[];
-
-        if (params.sort === "created_at_desc") {
-            rows = await sql<ObjectRow[]>`
+        const rows = await sql<ObjectRow[]>`
         SELECT
           obj.object_id,
           obj.tenant_id,
@@ -717,7 +834,67 @@ export async function listObjects(
           AND (${params.toCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at <= ${params.toCreatedAt ?? null}::timestamptz)
           AND (${params.language ?? null}::text IS NULL OR lower(obj.language_code) = lower(${params.language ?? null}::text))
           AND (${params.batchLabel ?? null}::text IS NULL OR ing.batch_label ILIKE ${params.batchLabel ? `%${params.batchLabel}%` : null}::text)
-          AND (${queryPattern ?? null}::text IS NULL OR obj.title ILIKE ${queryPattern ?? null}::text OR obj.object_id ILIKE ${queryPattern ?? null}::text)
+          AND (
+            ${queryPattern ?? null}::text IS NULL
+            OR obj.title ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+            OR obj.object_id ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+            OR (
+              obj.availability_state = 'AVAILABLE'::object_availability_state
+              AND (
+                ${params.role}::text = 'admin'
+                OR obj.access_level = 'public'::object_access_level
+                OR EXISTS (
+                  SELECT 1
+                  FROM object_access_assignments asg
+                  WHERE asg.object_id = obj.object_id
+                    AND asg.tenant_id = obj.tenant_id
+                    AND asg.user_id = ${params.userId}
+                    AND (
+                      (obj.access_level = 'family'::object_access_level AND asg.granted_level IN ('family', 'private'))
+                      OR (obj.access_level = 'private'::object_access_level AND asg.granted_level = 'private')
+                    )
+                )
+              )
+              AND (
+                obj.embargo_kind = 'none'::object_embargo_kind
+                OR (obj.embargo_kind = 'timed'::object_embargo_kind AND (obj.embargo_until IS NULL OR obj.embargo_until <= ${queryTime}))
+                OR (
+                  obj.embargo_kind = 'curation_state'::object_embargo_kind
+                  AND (obj.embargo_curation_state IS NULL OR obj.curation_state = obj.embargo_curation_state)
+                )
+              )
+              AND (
+                EXISTS (
+                  SELECT 1
+                  FROM object_artifacts art
+                  LEFT JOIN object_artifact_search_documents doc ON doc.artifact_id = art.id
+                  LEFT JOIN object_available_files file
+                    ON file.id = doc.available_file_id
+                    AND file.object_id = art.object_id
+                    AND file.tenant_id = obj.tenant_id
+                  WHERE art.object_id = obj.object_id
+                    AND (
+                      art.id::text ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                      OR art.kind::text ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                      OR art.variant ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                      OR art.content_type ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                      OR (
+                        art.kind IN ('ocr_text'::artifact_kind, 'transcript'::artifact_kind)
+                        AND doc.text_content ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                      )
+                      OR file.display_name ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                      OR file.archive_file_key ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                    )
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM object_curated_document_pages page
+                  WHERE page.object_id = obj.object_id
+                    AND page.curated_text ILIKE ${queryPattern ?? null}::text ESCAPE ${likeEscape}
+                )
+              )
+            )
+          )
           AND (
             (${params.tag ?? null}::text IS NULL)
             OR EXISTS (
@@ -728,304 +905,41 @@ export async function listObjects(
                 AND tag.name_normalized = lower(${params.tag ?? null}::text)
             )
           )
-          AND (
-            (${params.cursorCreatedAt ?? null}::timestamptz IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
-            OR (obj.created_at, obj.object_id) < (${params.cursorCreatedAt ?? null}::timestamptz, ${params.cursorObjectId ?? null}::text)
-          )
-        ORDER BY obj.created_at DESC, obj.object_id DESC
+          AND CASE ${params.sort}::text
+            WHEN 'created_at_desc' THEN
+              (${params.cursorCreatedAt ?? null}::timestamptz IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
+              OR (obj.created_at, obj.object_id) < (${params.cursorCreatedAt ?? null}::timestamptz, ${params.cursorObjectId ?? null}::text)
+            WHEN 'created_at_asc' THEN
+              (${params.cursorCreatedAt ?? null}::timestamptz IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
+              OR (obj.created_at, obj.object_id) > (${params.cursorCreatedAt ?? null}::timestamptz, ${params.cursorObjectId ?? null}::text)
+            WHEN 'updated_at_desc' THEN
+              (${params.cursorUpdatedAt ?? null}::timestamptz IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
+              OR (obj.updated_at, obj.object_id) < (${params.cursorUpdatedAt ?? null}::timestamptz, ${params.cursorObjectId ?? null}::text)
+            WHEN 'updated_at_asc' THEN
+              (${params.cursorUpdatedAt ?? null}::timestamptz IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
+              OR (obj.updated_at, obj.object_id) > (${params.cursorUpdatedAt ?? null}::timestamptz, ${params.cursorObjectId ?? null}::text)
+            WHEN 'title_asc' THEN
+              (${params.cursorTitle ?? null}::text IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
+              OR (obj.title, obj.object_id) > (${params.cursorTitle ?? null}::text, ${params.cursorObjectId ?? null}::text)
+            ELSE
+              (${params.cursorTitle ?? null}::text IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
+              OR (obj.title, obj.object_id) < (${params.cursorTitle ?? null}::text, ${params.cursorObjectId ?? null}::text)
+          END
+        ORDER BY
+          CASE WHEN ${params.sort}::text = 'created_at_desc' THEN obj.created_at END DESC,
+          CASE WHEN ${params.sort}::text = 'created_at_desc' THEN obj.object_id END DESC,
+          CASE WHEN ${params.sort}::text = 'created_at_asc' THEN obj.created_at END ASC,
+          CASE WHEN ${params.sort}::text = 'created_at_asc' THEN obj.object_id END ASC,
+          CASE WHEN ${params.sort}::text = 'updated_at_desc' THEN obj.updated_at END DESC,
+          CASE WHEN ${params.sort}::text = 'updated_at_desc' THEN obj.object_id END DESC,
+          CASE WHEN ${params.sort}::text = 'updated_at_asc' THEN obj.updated_at END ASC,
+          CASE WHEN ${params.sort}::text = 'updated_at_asc' THEN obj.object_id END ASC,
+          CASE WHEN ${params.sort}::text = 'title_asc' THEN obj.title END ASC,
+          CASE WHEN ${params.sort}::text = 'title_asc' THEN obj.object_id END ASC,
+          CASE WHEN ${params.sort}::text = 'title_desc' THEN obj.title END DESC,
+          CASE WHEN ${params.sort}::text = 'title_desc' THEN obj.object_id END DESC
         LIMIT ${params.limit}
       `;
-        } else if (params.sort === "created_at_asc") {
-            rows = await sql<ObjectRow[]>`
-        SELECT
-          obj.object_id,
-          obj.tenant_id,
-          obj.type,
-          obj.title,
-          obj.language_code,
-          obj.metadata,
-          obj.ingest_manifest,
-          obj.source_ingestion_id,
-          obj.source_ingestion_item_id,
-          ing.batch_label AS source_batch_label,
-          obj.availability_state,
-          obj.access_level,
-          obj.embargo_kind,
-          obj.processing_state,
-          obj.curation_state,
-          obj.embargo_until,
-          obj.embargo_curation_state,
-          obj.rights_note,
-          obj.sensitivity_note,
-          obj.created_at,
-          obj.updated_at,
-          COALESCE((
-            SELECT array_agg(tag.name_normalized ORDER BY tag.name_normalized)
-            FROM object_tags otag
-            INNER JOIN tags tag ON tag.id = otag.tag_id
-            WHERE otag.object_id = obj.object_id
-          ), ARRAY[]::text[]) AS tags
-        FROM objects obj
-        LEFT JOIN ingestions ing ON ing.id = obj.source_ingestion_id
-        WHERE obj.tenant_id = ${params.tenantId}
-          AND (${params.type ?? null}::object_type IS NULL OR obj.type = ${params.type ?? null}::object_type)
-          AND (${params.availabilityState ?? null}::object_availability_state IS NULL OR obj.availability_state = ${params.availabilityState ?? null}::object_availability_state)
-        AND (${params.accessLevel ?? null}::object_access_level IS NULL OR obj.access_level = ${params.accessLevel ?? null}::object_access_level)
-          AND (${params.fromCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at >= ${params.fromCreatedAt ?? null}::timestamptz)
-          AND (${params.toCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at <= ${params.toCreatedAt ?? null}::timestamptz)
-          AND (${params.language ?? null}::text IS NULL OR lower(obj.language_code) = lower(${params.language ?? null}::text))
-          AND (${params.batchLabel ?? null}::text IS NULL OR ing.batch_label ILIKE ${params.batchLabel ? `%${params.batchLabel}%` : null}::text)
-          AND (${queryPattern ?? null}::text IS NULL OR obj.title ILIKE ${queryPattern ?? null}::text OR obj.object_id ILIKE ${queryPattern ?? null}::text)
-          AND (
-            (${params.tag ?? null}::text IS NULL)
-            OR EXISTS (
-              SELECT 1
-              FROM object_tags otag
-              INNER JOIN tags tag ON tag.id = otag.tag_id
-              WHERE otag.object_id = obj.object_id
-                AND tag.name_normalized = lower(${params.tag ?? null}::text)
-            )
-          )
-          AND (
-            (${params.cursorCreatedAt ?? null}::timestamptz IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
-            OR (obj.created_at, obj.object_id) > (${params.cursorCreatedAt ?? null}::timestamptz, ${params.cursorObjectId ?? null}::text)
-          )
-        ORDER BY obj.created_at ASC, obj.object_id ASC
-        LIMIT ${params.limit}
-      `;
-        } else if (params.sort === "updated_at_desc") {
-            rows = await sql<ObjectRow[]>`
-        SELECT
-          obj.object_id,
-          obj.tenant_id,
-          obj.type,
-          obj.title,
-          obj.language_code,
-          obj.metadata,
-          obj.ingest_manifest,
-          obj.source_ingestion_id,
-          obj.source_ingestion_item_id,
-          ing.batch_label AS source_batch_label,
-          obj.availability_state,
-          obj.access_level,
-          obj.embargo_kind,
-          obj.processing_state,
-          obj.curation_state,
-          obj.embargo_until,
-          obj.embargo_curation_state,
-          obj.rights_note,
-          obj.sensitivity_note,
-          obj.created_at,
-          obj.updated_at,
-          COALESCE((
-            SELECT array_agg(tag.name_normalized ORDER BY tag.name_normalized)
-            FROM object_tags otag
-            INNER JOIN tags tag ON tag.id = otag.tag_id
-            WHERE otag.object_id = obj.object_id
-          ), ARRAY[]::text[]) AS tags
-        FROM objects obj
-        LEFT JOIN ingestions ing ON ing.id = obj.source_ingestion_id
-        WHERE obj.tenant_id = ${params.tenantId}
-          AND (${params.type ?? null}::object_type IS NULL OR obj.type = ${params.type ?? null}::object_type)
-          AND (${params.availabilityState ?? null}::object_availability_state IS NULL OR obj.availability_state = ${params.availabilityState ?? null}::object_availability_state)
-        AND (${params.accessLevel ?? null}::object_access_level IS NULL OR obj.access_level = ${params.accessLevel ?? null}::object_access_level)
-          AND (${params.fromCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at >= ${params.fromCreatedAt ?? null}::timestamptz)
-          AND (${params.toCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at <= ${params.toCreatedAt ?? null}::timestamptz)
-          AND (${params.language ?? null}::text IS NULL OR lower(obj.language_code) = lower(${params.language ?? null}::text))
-          AND (${params.batchLabel ?? null}::text IS NULL OR ing.batch_label ILIKE ${params.batchLabel ? `%${params.batchLabel}%` : null}::text)
-          AND (${queryPattern ?? null}::text IS NULL OR obj.title ILIKE ${queryPattern ?? null}::text OR obj.object_id ILIKE ${queryPattern ?? null}::text)
-          AND (
-            (${params.tag ?? null}::text IS NULL)
-            OR EXISTS (
-              SELECT 1
-              FROM object_tags otag
-              INNER JOIN tags tag ON tag.id = otag.tag_id
-              WHERE otag.object_id = obj.object_id
-                AND tag.name_normalized = lower(${params.tag ?? null}::text)
-            )
-          )
-          AND (
-            (${params.cursorUpdatedAt ?? null}::timestamptz IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
-            OR (obj.updated_at, obj.object_id) < (${params.cursorUpdatedAt ?? null}::timestamptz, ${params.cursorObjectId ?? null}::text)
-          )
-        ORDER BY obj.updated_at DESC, obj.object_id DESC
-        LIMIT ${params.limit}
-      `;
-        } else if (params.sort === "updated_at_asc") {
-            rows = await sql<ObjectRow[]>`
-        SELECT
-          obj.object_id,
-          obj.tenant_id,
-          obj.type,
-          obj.title,
-          obj.language_code,
-          obj.metadata,
-          obj.ingest_manifest,
-          obj.source_ingestion_id,
-          obj.source_ingestion_item_id,
-          ing.batch_label AS source_batch_label,
-          obj.availability_state,
-          obj.access_level,
-          obj.embargo_kind,
-          obj.processing_state,
-          obj.curation_state,
-          obj.embargo_until,
-          obj.embargo_curation_state,
-          obj.rights_note,
-          obj.sensitivity_note,
-          obj.created_at,
-          obj.updated_at,
-          COALESCE((
-            SELECT array_agg(tag.name_normalized ORDER BY tag.name_normalized)
-            FROM object_tags otag
-            INNER JOIN tags tag ON tag.id = otag.tag_id
-            WHERE otag.object_id = obj.object_id
-          ), ARRAY[]::text[]) AS tags
-        FROM objects obj
-        LEFT JOIN ingestions ing ON ing.id = obj.source_ingestion_id
-        WHERE obj.tenant_id = ${params.tenantId}
-          AND (${params.type ?? null}::object_type IS NULL OR obj.type = ${params.type ?? null}::object_type)
-          AND (${params.availabilityState ?? null}::object_availability_state IS NULL OR obj.availability_state = ${params.availabilityState ?? null}::object_availability_state)
-        AND (${params.accessLevel ?? null}::object_access_level IS NULL OR obj.access_level = ${params.accessLevel ?? null}::object_access_level)
-          AND (${params.fromCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at >= ${params.fromCreatedAt ?? null}::timestamptz)
-          AND (${params.toCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at <= ${params.toCreatedAt ?? null}::timestamptz)
-          AND (${params.language ?? null}::text IS NULL OR lower(obj.language_code) = lower(${params.language ?? null}::text))
-          AND (${params.batchLabel ?? null}::text IS NULL OR ing.batch_label ILIKE ${params.batchLabel ? `%${params.batchLabel}%` : null}::text)
-          AND (${queryPattern ?? null}::text IS NULL OR obj.title ILIKE ${queryPattern ?? null}::text OR obj.object_id ILIKE ${queryPattern ?? null}::text)
-          AND (
-            (${params.tag ?? null}::text IS NULL)
-            OR EXISTS (
-              SELECT 1
-              FROM object_tags otag
-              INNER JOIN tags tag ON tag.id = otag.tag_id
-              WHERE otag.object_id = obj.object_id
-                AND tag.name_normalized = lower(${params.tag ?? null}::text)
-            )
-          )
-          AND (
-            (${params.cursorUpdatedAt ?? null}::timestamptz IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
-            OR (obj.updated_at, obj.object_id) > (${params.cursorUpdatedAt ?? null}::timestamptz, ${params.cursorObjectId ?? null}::text)
-          )
-        ORDER BY obj.updated_at ASC, obj.object_id ASC
-        LIMIT ${params.limit}
-      `;
-        } else if (params.sort === "title_asc") {
-            rows = await sql<ObjectRow[]>`
-        SELECT
-          obj.object_id,
-          obj.tenant_id,
-          obj.type,
-          obj.title,
-          obj.language_code,
-          obj.metadata,
-          obj.ingest_manifest,
-          obj.source_ingestion_id,
-          obj.source_ingestion_item_id,
-          ing.batch_label AS source_batch_label,
-          obj.availability_state,
-          obj.access_level,
-          obj.embargo_kind,
-          obj.processing_state,
-          obj.curation_state,
-          obj.embargo_until,
-          obj.embargo_curation_state,
-          obj.rights_note,
-          obj.sensitivity_note,
-          obj.created_at,
-          obj.updated_at,
-          COALESCE((
-            SELECT array_agg(tag.name_normalized ORDER BY tag.name_normalized)
-            FROM object_tags otag
-            INNER JOIN tags tag ON tag.id = otag.tag_id
-            WHERE otag.object_id = obj.object_id
-          ), ARRAY[]::text[]) AS tags
-        FROM objects obj
-        LEFT JOIN ingestions ing ON ing.id = obj.source_ingestion_id
-        WHERE obj.tenant_id = ${params.tenantId}
-          AND (${params.type ?? null}::object_type IS NULL OR obj.type = ${params.type ?? null}::object_type)
-          AND (${params.availabilityState ?? null}::object_availability_state IS NULL OR obj.availability_state = ${params.availabilityState ?? null}::object_availability_state)
-        AND (${params.accessLevel ?? null}::object_access_level IS NULL OR obj.access_level = ${params.accessLevel ?? null}::object_access_level)
-          AND (${params.fromCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at >= ${params.fromCreatedAt ?? null}::timestamptz)
-          AND (${params.toCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at <= ${params.toCreatedAt ?? null}::timestamptz)
-          AND (${params.language ?? null}::text IS NULL OR lower(obj.language_code) = lower(${params.language ?? null}::text))
-          AND (${params.batchLabel ?? null}::text IS NULL OR ing.batch_label ILIKE ${params.batchLabel ? `%${params.batchLabel}%` : null}::text)
-          AND (${queryPattern ?? null}::text IS NULL OR obj.title ILIKE ${queryPattern ?? null}::text OR obj.object_id ILIKE ${queryPattern ?? null}::text)
-          AND (
-            (${params.tag ?? null}::text IS NULL)
-            OR EXISTS (
-              SELECT 1
-              FROM object_tags otag
-              INNER JOIN tags tag ON tag.id = otag.tag_id
-              WHERE otag.object_id = obj.object_id
-                AND tag.name_normalized = lower(${params.tag ?? null}::text)
-            )
-          )
-          AND (
-            (${params.cursorTitle ?? null}::text IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
-            OR (obj.title, obj.object_id) > (${params.cursorTitle ?? null}::text, ${params.cursorObjectId ?? null}::text)
-          )
-        ORDER BY obj.title ASC, obj.object_id ASC
-        LIMIT ${params.limit}
-      `;
-        } else {
-            rows = await sql<ObjectRow[]>`
-        SELECT
-          obj.object_id,
-          obj.tenant_id,
-          obj.type,
-          obj.title,
-          obj.language_code,
-          obj.metadata,
-          obj.ingest_manifest,
-          obj.source_ingestion_id,
-          obj.source_ingestion_item_id,
-          ing.batch_label AS source_batch_label,
-          obj.availability_state,
-          obj.access_level,
-          obj.embargo_kind,
-          obj.processing_state,
-          obj.curation_state,
-          obj.embargo_until,
-          obj.embargo_curation_state,
-          obj.rights_note,
-          obj.sensitivity_note,
-          obj.created_at,
-          obj.updated_at,
-          COALESCE((
-            SELECT array_agg(tag.name_normalized ORDER BY tag.name_normalized)
-            FROM object_tags otag
-            INNER JOIN tags tag ON tag.id = otag.tag_id
-            WHERE otag.object_id = obj.object_id
-          ), ARRAY[]::text[]) AS tags
-        FROM objects obj
-        LEFT JOIN ingestions ing ON ing.id = obj.source_ingestion_id
-        WHERE obj.tenant_id = ${params.tenantId}
-          AND (${params.type ?? null}::object_type IS NULL OR obj.type = ${params.type ?? null}::object_type)
-          AND (${params.availabilityState ?? null}::object_availability_state IS NULL OR obj.availability_state = ${params.availabilityState ?? null}::object_availability_state)
-        AND (${params.accessLevel ?? null}::object_access_level IS NULL OR obj.access_level = ${params.accessLevel ?? null}::object_access_level)
-          AND (${params.fromCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at >= ${params.fromCreatedAt ?? null}::timestamptz)
-          AND (${params.toCreatedAt ?? null}::timestamptz IS NULL OR obj.created_at <= ${params.toCreatedAt ?? null}::timestamptz)
-          AND (${params.language ?? null}::text IS NULL OR lower(obj.language_code) = lower(${params.language ?? null}::text))
-          AND (${params.batchLabel ?? null}::text IS NULL OR ing.batch_label ILIKE ${params.batchLabel ? `%${params.batchLabel}%` : null}::text)
-          AND (${queryPattern ?? null}::text IS NULL OR obj.title ILIKE ${queryPattern ?? null}::text OR obj.object_id ILIKE ${queryPattern ?? null}::text)
-          AND (
-            (${params.tag ?? null}::text IS NULL)
-            OR EXISTS (
-              SELECT 1
-              FROM object_tags otag
-              INNER JOIN tags tag ON tag.id = otag.tag_id
-              WHERE otag.object_id = obj.object_id
-                AND tag.name_normalized = lower(${params.tag ?? null}::text)
-            )
-          )
-          AND (
-            (${params.cursorTitle ?? null}::text IS NULL OR ${params.cursorObjectId ?? null}::text IS NULL)
-            OR (obj.title, obj.object_id) < (${params.cursorTitle ?? null}::text, ${params.cursorObjectId ?? null}::text)
-          )
-        ORDER BY obj.title DESC, obj.object_id DESC
-        LIMIT ${params.limit}
-      `;
-        }
 
         return {
             items: rows.map(mapObject),
@@ -1493,8 +1407,9 @@ export async function findArtifactById(params: {
 export async function findArtifactByStorageKey(params: {
     objectId: string;
     storageKey: string;
+    executor?: SqlExecutor;
 }): Promise<ObjectArtifactRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ObjectArtifactRow[]>`
       SELECT id, object_id, kind, variant, storage_key, content_type, size_bytes, created_at
       FROM object_artifacts

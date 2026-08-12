@@ -29,6 +29,9 @@ This document captures the implementation stack for the Osimi backend (VPS contr
 
 - Local disk storage on the VPS (staging)
 - Signed URL flow for uploads and worker downloads
+- Durable immutable publication requires POSIX same-filesystem hard links and successful file/directory `fsync`; unsupported storage fails closed
+- Staging paths are trusted backend-owned storage; workers and unrelated processes must not have direct write or unlink permission below the staging root
+- Verified artifact finalization revalidates the current regular file size and SHA-256 before persistence side effects
 - Storage abstraction designed for future migration to object storage (S3/MinIO)
 
 ## Auth

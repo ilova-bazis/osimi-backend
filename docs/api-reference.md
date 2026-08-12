@@ -86,6 +86,10 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
   - `content-type` must match signed token constraints by media type (parameters are ignored)
   - `content-length` is required and must exactly match signed token constraints
 - Body: raw file bytes; byte length must exactly match signed token constraints
+- Browser CORS:
+  - cross-origin browser uploads require the caller's exact UI origin in `CORS_ALLOWED_ORIGINS`
+  - preflight permits `PUT` with the author-controlled `content-type` header; browsers calculate `content-length` from the file body
+  - signed path token is the upload authorization mechanism; no bearer token or cookie credentials are used
 - 200 response:
   - `status`, `ingestion_id`, `file_id`, `size_bytes`
 - Error behavior:
@@ -204,6 +208,15 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - `error_summary` (JSON object)
 - `created_at` (ISO timestamp string)
 - `updated_at` (ISO timestamp string)
+- `staging_purge` (object, included on ingestion list and detail responses)
+  - `state` (`NOT_SCHEDULED|PENDING|PURGED`)
+  - `started_at` (ISO timestamp string, nullable)
+  - `purged_at` (ISO timestamp string, nullable)
+- `action_capabilities` (object, included on ingestion list and detail responses)
+  - `can_resume`, `can_retry`, `can_cancel`, `can_restore`, `can_delete` (boolean)
+  - values are computed for the authenticated role, current lease, and purge state; they are advisory snapshots and mutations remain authoritative
+  - clients must use these fields for action presentation and must not infer actions from status or file previews
+  - `can_retry` is true only for retained `FAILED` ingestions; cancel is not available for `FAILED`
 
 ### Ingestion File Schema
 
@@ -216,7 +229,7 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - `status` (`PENDING|UPLOADED|VALIDATED|FAILED`)
 - `checksum_sha256` (string, nullable)
 - `preview` (object)
-  - `status` (`pending|ready|failed|unsupported`)
+  - `status` (`pending|ready|failed|unsupported|purged`)
   - `content_type` (string, nullable)
   - `size_bytes` (number, nullable)
   - `width` (number, nullable)
@@ -876,6 +889,10 @@ Object response shapes in this section are authoritative with `src/validation/ob
 - `can_download` (boolean)
 - `access_reason_code`:
   - `OK|FORBIDDEN_POLICY|EMBARGO_ACTIVE|RESTORE_REQUIRED|RESTORE_IN_PROGRESS|TEMP_UNAVAILABLE`
+- `has_access_pdf` (boolean): at least one materialized `object_artifacts.kind = pdf` artifact exists
+- `has_ocr` (boolean): at least one materialized `object_artifacts.kind = ocr_text` artifact exists
+- artifact indicators describe inventory, not requester authorization; use `can_download` and `access_reason_code` to decide whether retrieval is allowed
+- no index/embedding indicator is exposed because index availability has no first-class inventory source
 
 ### Object Detail Schema
 
@@ -1157,7 +1174,20 @@ The `viewer` block is `null` for `GENERIC` object types until a viewer strategy 
       - `title_asc|title_desc`: `{ sort, title, object_id }`
   - `sort` (optional)
     - allowed: `created_at_desc` (default), `created_at_asc`, `updated_at_desc`, `updated_at_asc`, `title_asc`, `title_desc`
-  - `q` (optional text search, minimum guarantee: matches `title`, `object_id`)
+  - `q` (optional text search)
+    - trimmed before use; an empty trimmed value is equivalent to omission
+    - maximum trimmed length is 256 characters; longer values return `400 BAD_REQUEST`
+    - case-insensitive literal substring match; `%`, `_`, and `\` are escaped and have no wildcard meaning
+    - no relevance ranking or match snippets in V1; requested `sort` remains authoritative
+    - always searches tenant-catalog `title` and `object_id`
+    - also searches materialized `object_artifacts` metadata: `id`, `kind`, `variant`, and `content_type`
+    - when authoritative persisted materialization provenance associates an artifact with an `object_available_files` source, also searches its `display_name` and `archive_file_key`; the association is not inferred from `kind`/`variant`, and available-file-only inventory is excluded
+    - searches indexed bodies only for already-materialized, eligible OCR/transcript text artifacts, plus `object_curated_document_pages.curated_text`
+    - does not extract arbitrary PDF, image, audio, or video bytes; an extracted OCR/transcript artifact must first be materialized and indexed
+    - artifact metadata, artifact body, and curated-text matches apply only when the requester currently passes the same effective content-view conditions: endpoint role, access-level/assignment authorization (including admin override), inactive embargo, and object `availability_state = AVAILABLE`
+    - inaccessible artifact-derived terms cannot cause an object to match; access is evaluated at query time even when text is stored in an index
+    - artifact body indexing accepts only successfully materialized, decodable text for OCR/transcript artifact kinds and skips empty, malformed/non-text, unavailable, and over-limit bodies
+    - maximum indexable text-body size is configurable per artifact; recommended conservative default is 10 MiB, with the configuration name deferred to implementation
   - `availability_state` (optional: `AVAILABLE`, `ARCHIVED`, `RESTORE_PENDING`, `RESTORING`, `UNAVAILABLE`)
   - `access_level` (optional: `private`, `family`, `public`)
   - `language` (optional)
@@ -1226,7 +1256,7 @@ Each object item includes `thumbnail_artifact_id`:
 - preferred thumbnail artifact id (`variant = null` preferred, otherwise latest)
 - `null` when no thumbnail artifact currently exists
 - Error behavior:
-  - `400 BAD_REQUEST` for invalid query params (`limit`, `cursor`, `sort`, filters)
+  - `400 BAD_REQUEST` for invalid query params (`limit`, `cursor`, `sort`, `q`, filters)
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
 
@@ -1338,12 +1368,13 @@ Example response:
     - precedence: when `active_only=true`, backend ignores explicit `status` filters and uses `PENDING|PROCESSING`
   - `include_payload` (optional boolean, default `false`; when `true`, each item includes `action_payload`)
 - 200 response:
-  - `requests[]` where each item includes:
-    - `id`, `tenant_id`, `target_type`, `target_id`, `action_type`
-    - `requested_by`, `dedupe_key`, `status`
+   - `requests[]` where each item includes:
+     - `id`, `tenant_id`, `target_type`, `target_id`, `action_type`
+     - `requested_by`, `dedupe_key`, `status`
     - `failure_reason`, `failure_details`
     - `created_at`, `updated_at`, `completed_at`
-    - `action_payload` only when `include_payload=true`
+     - `action_payload` only when `include_payload=true`
+   - `dedupe_key` is `string|null`; `null` means the request has no keyed active-request deduplication identity
   - `next_cursor` (`string|null`)
   - `filtered_count` (number)
 - Error behavior:
@@ -1354,24 +1385,6 @@ Example response:
 ### Object Editing Authorization
 
 The object editing endpoints below apply both their listed role requirement and object access policy. For non-admin users, `public` objects require no assignment, `family` objects require a `family` or `private` assignment, and `private` objects require a `private` assignment. Embargo and artifact availability do not limit editing. In-tenant policy denial returns `403 FORBIDDEN`; missing or cross-tenant objects return `404 NOT_FOUND`.
-
-### PATCH `/api/objects/:object_id`
-
-- Auth: Bearer token
-- Roles: `archiver`, `admin`
-- Body:
-  - `title` (required string, non-empty)
-- Notes:
-  - legacy title-only endpoint retained for backward compatibility
-  - new editing clients SHOULD use `GET /api/objects/:object_id/edit` and `PATCH /api/objects/:object_id/metadata`
-- 200 response:
-  - `object` (Base Object Schema)
-  - includes resolved `thumbnail_artifact_id` (`null` when no thumbnail artifact exists)
-- Error behavior:
-  - `400 BAD_REQUEST` for invalid `:object_id` format or invalid body
-  - `401 UNAUTHORIZED` for missing/invalid/expired session token
-  - `403 FORBIDDEN` when authenticated role is not allowed
-  - `404 NOT_FOUND` when object does not exist in tenant scope
 
 ### GET `/api/objects/:object_id/edit`
 
@@ -1384,6 +1397,7 @@ The object editing endpoints below apply both their listed role requirement and 
   - **auto-acquires an edit lock** for the requesting user (or extends an existing lock held by the same user)
 - 200 response:
   - `object_id`
+  - `revision` (current non-negative edit revision)
   - `media_type` (`document|image|audio|video|other`)
   - `curation_state`
   - `lock`:
@@ -1424,6 +1438,7 @@ The object editing endpoints below apply both their listed role requirement and 
 ```json
 {
   "object_id": "OBJ-20260213-ABC123",
+  "revision": 1,
   "media_type": "document",
   "curation_state": "needs_review",
   "lock": {
@@ -1490,9 +1505,10 @@ The object editing endpoints below apply both their listed role requirement and 
 - Auth: Bearer token
 - Roles: `archiver`, `admin`
 - Purpose:
-  - updates backend-managed first-class object editing metadata and rights notes
+  - replaces the complete editor-managed metadata and rights-note field set
 - Body:
   - `revision` (required non-negative integer from `GET /edit`)
+  - all listed `metadata` and `rights` fields are required; unknown fields are rejected
   - `metadata`:
     - `title` (required non-empty string)
     - `publication_date` (required string; normalized to `""` when `date_precision = none`)
@@ -1503,8 +1519,8 @@ The object editing endpoints below apply both their listed role requirement and 
     - `people[]` (required array of non-empty strings; de-duplicated after trimming)
     - `description` (nullable string)
   - `rights`:
-    - `rights_note` (nullable non-empty string when provided)
-    - `sensitivity_note` (nullable non-empty string when provided)
+    - `rights_note` (nullable string; empty strings normalize to `null`)
+    - `sensitivity_note` (nullable string; empty strings normalize to `null`)
 - Example request:
 
 ```json
@@ -1528,41 +1544,6 @@ The object editing endpoints below apply both their listed role requirement and 
 ```
 - 200 response:
   - `object_id`
-  - `curation_state`
-  - `updated_at`
-- Example success response:
-
-```json
-{
-  "object_id": "OBJ-20260213-ABC123",
-  "curation_state": "needs_review",
-  "updated_at": "2026-04-14T10:38:52.000Z"
-}
-```
-- Error behavior:
-  - `400 BAD_REQUEST` for invalid `:object_id` format
-  - `401 UNAUTHORIZED` for missing/invalid/expired session token
-  - `403 FORBIDDEN` when authenticated role is not allowed
-  - `404 NOT_FOUND` when object does not exist in tenant scope
-  - `423 LOCKED` when another user holds the edit lock
-  - `422 VALIDATION_FAILED` for invalid metadata payload
-- Example `423 LOCKED`:
-
-```json
-{
-  "request_id": "uuid",
-  "error": {
-    "code": "LOCKED",
-    "message": "Object is currently being edited by another user.",
-    "details": {
-      "locked_by": "10000000-0000-0000-0000-000000000002",
-      "locked_until": "2026-04-21T23:00:00.000Z"
-    }
-  }
-}
-```
-- 200 response:
-  - `object_id`
   - `revision`
   - `curation_state`
   - `updated_at`
@@ -1581,8 +1562,24 @@ The object editing endpoints below apply both their listed role requirement and 
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
   - `404 NOT_FOUND` when object does not exist in tenant scope
+  - `423 LOCKED` when another user holds the edit lock
   - `409 REVISION_CONFLICT` with `error.details.latest_revision` when request revision is stale
   - `422 VALIDATION_FAILED` for invalid metadata payload
+- Example `423 LOCKED`:
+
+```json
+{
+  "request_id": "uuid",
+  "error": {
+    "code": "LOCKED",
+    "message": "Object is currently being edited by another user.",
+    "details": {
+      "locked_by": "10000000-0000-0000-0000-000000000002",
+      "locked_until": "2026-04-21T23:00:00.000Z"
+    }
+  }
+}
+```
 - Example `409 REVISION_CONFLICT`:
 
 ```json
@@ -1590,9 +1587,8 @@ The object editing endpoints below apply both their listed role requirement and 
   "request_id": "uuid",
   "error": {
     "code": "REVISION_CONFLICT",
-    "message": "Object edit revision is stale.",
+    "message": "Object metadata revision is stale.",
     "details": {
-      "object_id": "OBJ-20260213-ABC123",
       "latest_revision": 2
     }
   }
@@ -1651,6 +1647,7 @@ The object editing endpoints below apply both their listed role requirement and 
 ```
 - 200 response:
   - `object_id`
+  - `revision`
   - `updated_count` (integer >= 1)
   - `updated_at`
 - Example success response:
@@ -1658,6 +1655,7 @@ The object editing endpoints below apply both their listed role requirement and 
 ```json
 {
   "object_id": "OBJ-20260213-ABC123",
+  "revision": 2,
   "updated_count": 2,
   "updated_at": "2026-04-14T11:00:00.000Z"
 }
@@ -1669,6 +1667,7 @@ The object editing endpoints below apply both their listed role requirement and 
   - `404 NOT_FOUND` when object does not exist in tenant scope
   - `423 LOCKED` when another user holds the edit lock
   - `409 CONFLICT` when object is not a document
+  - `409 REVISION_CONFLICT` with `error.details.latest_revision` when request revision is stale
   - `422 VALIDATION_FAILED` for invalid page payload or invalid page numbers
 - Example `422 VALIDATION_FAILED`:
 
@@ -1715,6 +1714,7 @@ The object editing endpoints below apply both their listed role requirement and 
 ```
 - 200 response:
   - `object_id`
+  - `revision`
   - `curation_state`
   - `request` (`id`, `action_type`, `status`)
   - `submitted_at`
@@ -1724,6 +1724,7 @@ The object editing endpoints below apply both their listed role requirement and 
 ```json
 {
   "object_id": "OBJ-20260213-ABC123",
+  "revision": 3,
   "curation_state": "review_in_progress",
   "request": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -1741,6 +1742,7 @@ The object editing endpoints below apply both their listed role requirement and 
   - `404 NOT_FOUND` when object does not exist in tenant scope
   - `423 LOCKED` when another user holds the edit lock
   - `409 CONFLICT` when object is not a document or when document OCR projection is unavailable
+  - `409 REVISION_CONFLICT` with `error.details.latest_revision` when request revision is stale
   - `422 VALIDATION_FAILED` for invalid payload
 
 ### DELETE `/api/objects/:object_id/edit-lock`
@@ -1779,7 +1781,7 @@ The object editing endpoints below apply both their listed role requirement and 
   - `next_cursor` (`string|null`)
 - Notes:
   - history describes backend edit actions, not archive artifact version history
-  - `revision_before` and `revision_after` may be `null` for edits made after the revision counter was removed from the client API
+  - `revision_before` and `revision_after` are `null` only for legacy history records without revision data
   - `CURATION_SUBMITTED` payload includes `request_id`, `review_note`, `archive_curated_kind`, `archive_target_version`, `archive_idempotency_key`
 - Example response:
 
@@ -1887,6 +1889,7 @@ The object editing endpoints below apply both their listed role requirement and 
   - when an active request already exists: `status: "queued"`, `object_id`, `request`
 - 201 response:
   - when a new queue request is created: `status: "queued"`, `object_id`, `request`
+  - queued `request.available_file_id` is a required, non-null UUID matching the selected available-file record
 - Error behavior:
   - `400 BAD_REQUEST` for invalid path/body
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
@@ -1902,6 +1905,7 @@ The object editing endpoints below apply both their listed role requirement and 
 - 200 response:
   - `object_id`
   - `requests[]` (`id`, `object_id`, `available_file_id`, `requested_by`, `artifact_kind`, `variant`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`)
+  - every `requests[].available_file_id` is a required, non-null UUID
   - request `status` values: `PENDING|PROCESSING|COMPLETED|FAILED|CANCELED`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:object_id` format
@@ -1927,7 +1931,8 @@ The object editing endpoints below apply both their listed role requirement and 
 - 200 response:
   - when an active request already exists: `status: "queued"`, `object_id`, `request`
 - `request` fields:
-  - `id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`
+   - `id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`
+   - `dedupe_key` is `string|null`; current object-resync requests generate a non-null key, but compatibility rows can contain `null`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:object_id` format or invalid JSON/body
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
@@ -1942,8 +1947,9 @@ The object editing endpoints below apply both their listed role requirement and 
 - Roles: `viewer`, `archiver`, `admin`
 - 200 response:
   - `object_id`
-  - `requests[]` for `object_resync` action only, each with:
-    - `id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`
+   - `requests[]` for `object_resync` action only, each with:
+     - `id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`
+     - `dedupe_key` is `string|null`
   - request `status` values: `PENDING|PROCESSING|COMPLETED|FAILED|CANCELED`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid `:object_id` format
@@ -2010,7 +2016,7 @@ Worker-only object endpoints are documented in `## Worker APIs`:
   - accepts a single `Range` header in `bytes=start-end`, `bytes=start-`, or `bytes=-suffixLength` form
   - valid ranges return `206 Partial Content` with `content-range`
   - multiple or malformed ranges are ignored and return the normal full-file `200 OK` response
-  - `If-Range` permits a range only when its strong ETag or HTTP date matches the current artifact; otherwise the response is a full-file `200 OK`
+  - `If-Range` permits a range only when its strong ETag or HTTP date matches the current artifact; otherwise the response is a full-file `200 OK`, including when the supplied range is otherwise unsatisfiable
   - unsatisfiable ranges return `416 Range Not Satisfiable` with `content-range: bytes */total`
 - Browser-viewable MIME families:
   - `application/pdf`, `text/html`, `text/plain`, `image/*`, `audio/*`, `video/*`
@@ -2343,10 +2349,11 @@ Integration guides for archive worker teams:
   - when `action_type` is provided, leasing is filtered to that action type only
 - 200 response:
   - `request: null` when no pending work
-  - otherwise `request` with:
-    - `request_id`, `lease_id`, `lease_token`, `lease_expires_at`
-    - `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`
-    - `requested_by`, `dedupe_key`
+   - otherwise `request` with:
+     - `request_id`, `lease_id`, `lease_token`, `lease_expires_at`
+     - `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`
+     - `requested_by`, `dedupe_key`
+     - `dedupe_key` is `string|null`; workers must support `null`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid body
   - `401 UNAUTHORIZED` for missing/invalid worker auth token
@@ -2392,9 +2399,13 @@ Integration guides for archive worker teams:
 - Behavior:
   - for `artifact_fetch`, `upload_token` is required
   - for non-`artifact_fetch` actions, `upload_token` is ignored when present
+  - artifact uploads may already be finalized by the successful `PUT`; this call remains an idempotent worker acknowledgment
+  - acknowledging a materialized upload does not read staged bytes, rewrite search projection/provenance, or repair a missing projection
+  - finalization always uses the verified upload's exact immutable storage key, never another artifact inferred from kind/variant
 - 200 response:
-  - `status: "completed"`
-  - `request` (`id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`)
+   - `status: "completed"`
+   - `request` (`id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`)
+   - returned `request.dedupe_key` is `string|null`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid path/body
   - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
@@ -2406,12 +2417,14 @@ Integration guides for archive worker teams:
 - Auth: `x-worker-auth-token`
 - Body:
   - `lease_token` (required non-empty string)
-  - `content_type` (required non-empty string)
+  - `content_type` (required valid HTTP media type; the complete declared value is preserved)
   - `size_bytes` (required integer >= 0)
   - `extension` (required non-empty string)
 - Behavior:
   - supported for `artifact_fetch` requests only
   - upload token TTL is 15 minutes
+  - re-presigning invalidates only the prior unverified attempt; verified uploads cannot be replaced
+  - a queued request remains fulfillable when its exact source row becomes inactive; the source checksum is captured immutably for the issued attempt
 - 200 response:
   - `upload_token`
   - `upload_url` (for `PUT` upload)
@@ -2422,6 +2435,9 @@ Integration guides for archive worker teams:
   - `400 BAD_REQUEST` for invalid path/body
   - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
   - `409 CONFLICT` when lease is no longer active or request action is not `artifact_fetch`
+  - `409 CONFLICT` with `details.reason = artifact_source_missing` when the queued tenant/object/source identity no longer exists
+  - `409 CONFLICT` with `details.reason = artifact_source_identity_changed` when the retained source kind or variant no longer matches the queued request
+  - `409 CONFLICT` with `details.reason = artifact_source_checksum_invalid` when historical source metadata does not contain a valid SHA-256 checksum
   - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
 
 ### POST `/api/archive-requests/:id/fail`
@@ -2463,7 +2479,7 @@ Integration guides for archive worker teams:
     - `display_name` (required string, non-empty)
     - `content_type` (optional nullable string, non-empty when present)
     - `size_bytes` (optional nullable number, integer >= 0)
-    - `checksum_sha256` (optional nullable string, non-empty when present)
+    - `checksum_sha256` (optional nullable 64-character hexadecimal SHA-256; normalized to lowercase)
     - `metadata` (object, optional)
     - `is_available` (boolean, optional; defaults `true`)
 - Behavior:
@@ -2532,6 +2548,7 @@ Deprecated compatibility route. New archive workers should use `POST /api/archiv
   - otherwise `request` with:
     - `request_id`, `lease_id`, `lease_token`, `lease_expires_at`
     - `object_id`, `tenant_id`, `available_file_id`, `artifact_kind`, `variant`
+    - `available_file_id` is a required, non-null UUID when `request` is present
     - `available_file` (nullable object from available-files snapshot):
       - `id`, `object_id`, `archive_file_key`, `artifact_kind`, `variant`, `display_name`, `content_type`, `size_bytes`, `checksum_sha256`, `metadata`, `is_available`, `synced_at`
 - Error behavior:
@@ -2577,7 +2594,7 @@ Deprecated compatibility route. New archive workers should use `POST /api/archiv
 - Auth: `x-worker-auth-token`
 - Body:
   - `lease_token` (required non-empty string)
-  - `content_type` (required non-empty string)
+  - `content_type` (required valid HTTP media type; the complete declared value is preserved)
   - `size_bytes` (required integer >= 0)
   - `extension` (required non-empty string)
 - 200 response:
@@ -2598,14 +2615,24 @@ Deprecated compatibility route. New archive workers should use `POST /api/archiv
 
 - Auth: none (signed token in path)
 - Required headers:
-  - `content-type` must match signed token constraints by media type (parameters are ignored)
+  - `content-type` must have the same case-insensitive base media type as the signed value; parameters are ignored and both values must be valid media types
   - `content-length` is required and must exactly match signed token constraints
 - Body: raw file bytes; byte length must exactly match signed token constraints
 - 200 response:
   - `status: "ok"`, `request_id`, `size_bytes` (number)
+- Behavior:
+  - `200` means temporary bytes and their immutable directory entry were synchronized, byte length and checksum were verified while the issuing lease was active, and ownership transferred to the backend
+  - the backend attempts finalization immediately and retries verified attempts in the background; verified requests are never leased to another worker
+  - finalization revalidates the current regular file size and SHA-256 before creating any artifact, projection, provenance, metadata, or completion side effect
+  - identical retries preserve the immutable file and may restore a missing path with the exact accepted bytes; different bytes for the accepted checkpoint return `409 CONFLICT`
+  - bytes that differ from a known source checksum are rejected before immutable publication and create no checkpoint; corrected bytes may retry the same URL while its token and lease remain active
 - Error behavior:
   - `400 BAD_REQUEST` for header/body constraint mismatch
   - `401 UNAUTHORIZED` for invalid/expired signed token
+  - `409 CONFLICT` with `details.reason = expected_checksum_mismatch`, expected/actual SHA-256, and `retry_action = retry_same_upload_url` when bytes differ from the known source checksum
+  - `409 CONFLICT` with `details.reason = accepted_checkpoint_mismatch` and `retry_action = retry_exact_accepted_bytes_only` when bytes differ from an already accepted artifact checkpoint
+  - `409 CONFLICT` with `details.reason = accepted_checkpoint_storage_conflict` and `retry_action = operator_repair_required` when exact accepted bytes encounter different immutable destination content
+  - `409 CONFLICT` without checksum retry guidance when the upload attempt or issuing lease is no longer active
 
 ### PUT `/api/object-download-requests/uploads/:token`
 
@@ -2620,8 +2647,9 @@ Deprecated compatibility route. New archive workers should use `POST /api/archiv
   - `lease_token` (required non-empty string)
   - `upload_token` (required non-empty string)
 - Behavior:
-  - idempotent success when matching artifact already exists
+  - idempotent success for the exact verified upload attempt
   - upload token and lease context must match (`request_id`, `object_id`, `tenant_id`, `artifact_kind`, `variant`)
+  - the successful upload may already have completed the request; workers should still call this endpoint for compatibility
 - 200 response:
   - `status: "completed"`, `request_id`, `object_id`, `artifact`
 - Error behavior:

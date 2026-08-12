@@ -267,6 +267,7 @@ export function createObjectArtifactUploadToken(
 
 export function parseObjectArtifactUploadToken(
   token: string,
+  options: { allowExpired?: boolean } = {},
 ): ObjectArtifactUploadTokenPayload {
   const [encodedPayload, providedSignature, ...rest] = token.split(".");
 
@@ -316,7 +317,7 @@ export function parseObjectArtifactUploadToken(
 
   const expiresAt = new Date(candidate.expires_at);
 
-  if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) {
+  if (Number.isNaN(expiresAt.getTime()) || (!options.allowExpired && expiresAt.getTime() <= Date.now())) {
     throw new UnauthorizedError("Upload token has expired.");
   }
 

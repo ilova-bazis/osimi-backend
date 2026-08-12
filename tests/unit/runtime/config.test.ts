@@ -5,11 +5,13 @@ import { describe, expect, test } from "bun:test";
 import { parseLeaseToken } from "../../../src/auth/worker-lease.ts";
 import {
   DEFAULT_CORS_ALLOWED_ORIGINS,
+  DEFAULT_MAX_ARTIFACT_SEARCH_TEXT_BYTES,
   DEFAULT_MAX_UPLOAD_SIZE_BYTES,
   DEFAULT_READINESS_TIMEOUT_MS,
   DEFAULT_SHUTDOWN_GRACE_PERIOD_MS,
   parseCorsAllowedOrigins,
   resolveCorsAllowedOrigins,
+  resolveMaxArtifactSearchTextBytes,
   resolveMaxUploadSizeBytes,
   resolveReadinessTimeoutMs,
   resolveShutdownGracePeriodMs,
@@ -114,6 +116,23 @@ describe("upload size configuration", () => {
     for (const maxUploadSizeBytes of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
       expect(() => resolveMaxUploadSizeBytes({ maxUploadSizeBytes })).toThrow(
         "Runtime upload size limit",
+      );
+    }
+  });
+});
+
+describe("artifact search text size configuration", () => {
+  test("uses a 10 MiB default and accepts a runtime override", () => {
+    expect(resolveMaxArtifactSearchTextBytes({})).toBe(
+      DEFAULT_MAX_ARTIFACT_SEARCH_TEXT_BYTES,
+    );
+    expect(resolveMaxArtifactSearchTextBytes({ maxArtifactSearchTextBytes: 1234 })).toBe(1234);
+  });
+
+  test("rejects invalid artifact search text limits", () => {
+    for (const maxArtifactSearchTextBytes of [0, -1, 1.5, Number.MAX_VALUE]) {
+      expect(() => resolveMaxArtifactSearchTextBytes({ maxArtifactSearchTextBytes })).toThrow(
+        "MAX_ARTIFACT_SEARCH_TEXT_BYTES",
       );
     }
   });

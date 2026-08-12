@@ -2,14 +2,13 @@
 
 ## Purpose
 
-This document covers the two backend changes blocking closure of:
+This document tracks the remaining backend change blocking closure of:
 
-- `UM-86`: ranged inline-media delivery
 - `UM-91`: ingestion-item people PATCH support
 
-The UI work is ready to adopt both contracts after backend deployment.
+Ranged inline-media delivery is complete in root `UM-4`; the backend and UI proxy now preserve the range contract.
 
-## 1. Ranged Artifact Viewing (`UM-86`)
+## 1. Ranged Artifact Viewing (`UM-86`, Complete)
 
 ### Current State
 
@@ -20,7 +19,7 @@ The UI work is ready to adopt both contracts after backend deployment.
 
 The service streams full files or `Bun.file(...).slice(...)` range responses, honors `If-Range`, and returns strong ETag and Last-Modified validators.
 
-### Required Contract
+### Implemented Contract
 
 Support byte ranges on the existing inline-view endpoint without changing access control or artifact eligibility.
 
@@ -36,7 +35,7 @@ Response behavior:
 | No `Range` | `200 OK`, full stream |
 | Valid single byte range | `206 Partial Content`, selected stream |
 | Unsatisfiable range | `416 Range Not Satisfiable` |
-| `If-Range` does not match the current validator | `200 OK`, full stream |
+| `If-Range` does not match the current validator | `200 OK`, full stream, including an otherwise unsatisfiable range |
 
 Support one range only:
 
@@ -89,9 +88,9 @@ Extend `tests/integration/http/object-routes.test.ts` to cover:
 - stale `If-Range` returns full `200`
 - authorization and non-viewable-artifact behavior remain unchanged
 
-### UI Follow-Up
+### UI Completion
 
-After deployment, the UI will update `src/routes/objects/[objectId]/artifacts/[artifactId]/view/+server.ts` to forward `Range` and `If-Range`, preserve `200`, `206`, and `416`, and relay range and validator headers while retaining authenticated `private, no-store` behavior.
+`src/routes/objects/[objectId]/artifacts/[artifactId]/view/+server.ts` forwards `Range` and `If-Range`, preserves `200`, `206`, and `416`, and relays range and validator headers while retaining authenticated `private, no-store` behavior.
 
 ## 2. Ingestion Item People PATCH (`UM-91`)
 

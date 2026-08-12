@@ -98,7 +98,7 @@ Use only these values:
       "display_name": "Original Bundle",
       "content_type": "application/pdf",
       "size_bytes": 10485760,
-      "checksum_sha256": "b1946ac92492d2347c6235b4d2611184",
+      "checksum_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
       "metadata": {
         "source": "archive-system"
       },
@@ -117,7 +117,7 @@ Use only these values:
 - `display_name`: required non-empty string
 - `content_type`: optional; nullable string; if string, non-empty
 - `size_bytes`: optional; nullable integer >= 0
-- `checksum_sha256`: optional; nullable string; if string, non-empty
+- `checksum_sha256`: optional; nullable 64-character hexadecimal SHA-256; accepted uppercase hexadecimal is normalized to lowercase
 - `metadata`: optional object; defaults to `{}`
 - `is_available`: optional boolean; defaults to `true`
 
@@ -129,6 +129,13 @@ Behavior:
 
 1. provided files are upserted,
 2. previously known keys for the object that are omitted are marked `is_available = false`.
+
+Inactive rows cannot be selected for new download requests. An already queued
+`artifact_fetch` remains fulfillable against its exact retained row: presign
+preserves the row's checksum and provenance identity. If that source is missing
+or its artifact kind/variant changed after queueing, presign rejects the stale
+request before creating an upload attempt. Malformed historical source
+checksums are also rejected before authorization.
 
 Additional backend side effect:
 
@@ -210,7 +217,7 @@ Auto-queue suppression rules:
       "display_name": "Original Bundle",
       "content_type": "application/pdf",
       "size_bytes": 10485760,
-      "checksum_sha256": "b1946ac92492d2347c6235b4d2611184",
+      "checksum_sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
       "metadata": {
         "source": "archive-system"
       },
@@ -419,7 +426,7 @@ Request:
 Field constraints:
 
 - `lease_token`: required non-empty string
-- `content_type`: required non-empty string
+- `content_type`: required valid HTTP media type; the complete declared value is preserved
 - `size_bytes`: required integer >= 0
 - `extension`: required non-empty string
 
@@ -441,6 +448,11 @@ Success:
 Upload token TTL is 15 minutes.
 Each presign creates a unique immutable storage key and invalidates any prior
 artifact upload token for the same request.
+Presign resolves the exact source recorded by the queued request, including an
+inactive retained source, and captures its current checksum immutably for the
+new attempt. A missing source or changed artifact kind/variant returns `409`
+with `artifact_source_missing`, `artifact_source_identity_changed`, or
+`artifact_source_checksum_invalid` and creates no upload attempt.
 
 ### 4.5 Upload bytes
 
@@ -453,15 +465,21 @@ Auth:
 
 Required request headers:
 
-- `content-type`: must equal signed token `content_type` (base media type; parameters are ignored)
+- `content-type`: must have the same case-insensitive base media type as signed token `content_type`; parameters are ignored and both values must be valid media types
 - `content-length`: required and must equal signed token `size_bytes`
 
 Body rules:
 
 - exact byte length must equal signed token `size_bytes`
-- bytes are streamed to a temporary file and atomically promoted without overwriting an existing storage key
+- bytes are streamed to a temporary file, the file is synchronized, and a same-filesystem hard link publishes it without overwriting an existing storage key
+- newly created directory entries and the immutable destination directory entry are synchronized before the upload is acknowledged
+- the staging tree is backend-owned trusted storage; workers cannot directly replace or unlink published paths
 - the configured `MAX_UPLOAD_SIZE_BYTES` limit is enforced while streaming
-- an active token may be retried only with identical bytes; completed requests reject all upload replays
+- before acceptance, bytes that differ from a known source checksum are rejected without publication and corrected bytes may retry the same active URL
+- after acceptance, only identical bytes are idempotent; a verified token may restore a missing path only with the exact accepted size and checksum and rejects different bytes
+- `200` durably transfers the verified immutable upload to backend ownership; finalization may complete synchronously or through background reconciliation
+- finalization rehashes the current regular file and performs no database side effects when it is missing, truncated, changed, or checksum-mismatched
+- verified requests are never returned to the worker queue, so another worker does not upload the same artifact again
 
 Success:
 
@@ -508,9 +526,10 @@ Success:
 
 Completion semantics:
 
-- idempotent when matching artifact already exists,
-- lease is not required to still be active for token authorization, but completion update still conflicts if request is no longer in active leased processing state,
-- upload token must still be valid and consistent with lease context.
+- idempotent for the same persisted lease and exact verified upload attempt,
+- successful `PUT` may already have materialized the artifact and completed the request,
+- pending verified uploads are backend-owned and retried without worker re-upload,
+- artifact, search projection, page metadata, upload state, and request completion commit atomically.
 
 ### 4.7 Fail request
 
@@ -559,14 +578,18 @@ Success:
 - `400 BAD_REQUEST`: invalid JSON, invalid schema, or upload header/body constraint mismatch
 - `401 UNAUTHORIZED`: missing/invalid worker token, invalid/expired signed lease/upload token
 - `404 NOT_FOUND`: object/request/uploaded file not found where applicable
-- `409 CONFLICT`: lease no longer active, stale lease transition, or race state conflict
+- `409 CONFLICT`: `expected_checksum_mismatch` is recoverable only while the attempt is still authorized under an active lease; `accepted_checkpoint_mismatch` permits only exact accepted bytes; other conflicts indicate an inactive lease/attempt, stale transition, or race state conflict
 - `500 CONFIGURATION_ERROR`: worker auth not configured server-side
 - `500 INTERNAL_SERVER_ERROR`: unexpected server error
 
 ### Retry guidance
 
 - On `request: null` from lease: sleep and poll again.
-- On `409 CONFLICT` during heartbeat/release/fail/complete: do not blindly retry same transition forever; re-lease work.
+- On upload `409 CONFLICT` with `details.reason = expected_checksum_mismatch`: correct or re-read bytes and retry the same active upload URL.
+- On `accepted_checkpoint_mismatch`: do not replace, fail, or re-lease backend-owned work; retry only the exact accepted bytes if needed.
+- On `accepted_checkpoint_storage_conflict`: stop upload retries and escalate backend storage repair.
+- On `artifact_source_missing`, `artifact_source_identity_changed`, or `artifact_source_checksum_invalid`: fail or quarantine the stale request; re-leasing does not repair its persisted source identity.
+- On other `409 CONFLICT` responses during upload/heartbeat/release/fail/complete: do not blindly retry the same transition forever; re-lease work.
 - On `401` token-expired errors: obtain fresh lease/presign tokens and restart relevant step.
 - On upload `400` mismatch errors: fix payload/header mismatch before retry.
 - On transient `5xx`: safe to retry with backoff.

@@ -578,6 +578,85 @@ describe("ingestion routes", () => {
     expect(await previewResponse.text()).toBe("thumb");
   });
 
+  test("generates a ready image preview inline on commit", async () => {
+    const app = createTestApp();
+
+    const createResponse = await app.fetch(
+      new Request("http://localhost/api/ingestions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(buildIngestionBody({
+          batch_label: "batch-preview-inline",
+          classification_type: "image",
+          item_kind: "photo",
+        })),
+      }),
+    );
+
+    expect(createResponse.status).toBe(201);
+    const createBody = (await createResponse.json()) as {
+      ingestion: { id: string };
+    };
+
+    const file = await createCommittedFile({
+      app,
+      ingestionId: createBody.ingestion.id,
+      filename: "sample.svg",
+      contentType: "image/svg+xml",
+      payload: `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="60"><rect width="100" height="60" fill="rgb(200,120,40)"/></svg>`,
+    });
+
+    const detailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${createBody.ingestion.id}`, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${authToken}`,
+        },
+      }),
+    );
+
+    expect(detailResponse.status).toBe(200);
+    const detailBody = (await detailResponse.json()) as {
+      files: Array<{
+        id: string;
+        preview: {
+          status: string;
+          content_type: string | null;
+          width: number | null;
+          height: number | null;
+          url: string | null;
+        };
+      }>;
+    };
+
+    const preview = detailBody.files.find((entry) => entry.id === file.fileId)?.preview;
+    expect(preview).toMatchObject({
+      status: "ready",
+      content_type: "image/jpeg",
+      width: 100,
+      height: 60,
+      url: `/api/ingestions/${createBody.ingestion.id}/files/${file.fileId}/preview`,
+    });
+
+    const previewResponse = await app.fetch(
+      new Request(
+        `http://localhost/api/ingestions/${createBody.ingestion.id}/files/${file.fileId}/preview`,
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${authToken}`,
+          },
+        },
+      ),
+    );
+
+    expect(previewResponse.status).toBe(200);
+    expect(previewResponse.headers.get("content-type")).toBe("image/jpeg");
+  });
+
   test("worker can claim, upload, and complete an ingestion preview", async () => {
     const app = createTestApp();
 

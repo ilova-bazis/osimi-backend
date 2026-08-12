@@ -111,6 +111,7 @@ export function createDownloadRequestLeaseToken(
 
 export function parseDownloadRequestLeaseToken(
   token: string,
+  options: { allowExpired?: boolean } = {},
 ): DownloadRequestLeaseTokenPayload {
   const [encodedPayload, signature, ...rest] = token.split(".");
 
@@ -129,7 +130,7 @@ export function parseDownloadRequestLeaseToken(
   const payload = decodePayload(encodedPayload);
   const expiresAt = new Date(payload.exp);
 
-  if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) {
+  if (Number.isNaN(expiresAt.getTime()) || (!options.allowExpired && expiresAt.getTime() <= Date.now())) {
     throw new UnauthorizedError("Download request lease token has expired.");
   }
 
@@ -140,8 +141,11 @@ export async function authorizeWorkerLeaseForDownloadRequest(params: {
   requestId: string;
   leaseToken: string;
   requireActiveLease?: boolean;
+  allowExpired?: boolean;
 }): Promise<AuthorizedWorkerDownloadRequestLease> {
-  const payload = parseDownloadRequestLeaseToken(params.leaseToken);
+  const payload = parseDownloadRequestLeaseToken(params.leaseToken, {
+    allowExpired: params.allowExpired,
+  });
 
   if (payload.request_id !== params.requestId) {
     throw new UnauthorizedError(

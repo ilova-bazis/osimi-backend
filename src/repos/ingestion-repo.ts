@@ -882,6 +882,43 @@ export async function markIngestionFilePreviewUnsupported(params: {
   return row ? mapIngestionFile(row) : undefined;
 }
 
+export async function markIngestionFilePreviewInline(params: {
+  ingestionId: string;
+  fileId: string;
+  storageKey: string;
+  contentType: string;
+  sizeBytes: number;
+  width: number;
+  height: number;
+  executor?: SqlExecutor;
+}): Promise<IngestionFileRecord | undefined> {
+  const rows = await withExecutor(params.executor, async (sql) => {
+    return await sql<IngestionFileRow[]>`
+      UPDATE ingestion_files
+      SET preview_status = 'ready',
+          preview_claimed_by = null,
+          preview_claimed_at = null,
+          preview_storage_key = ${params.storageKey},
+          preview_content_type = ${params.contentType},
+          preview_size_bytes = ${params.sizeBytes},
+          preview_width = ${params.width},
+          preview_height = ${params.height},
+          preview_error = null,
+          preview_generated_at = now(),
+          updated_at = now()
+      WHERE id = ${params.fileId}
+        AND ingestion_id = ${params.ingestionId}
+        AND preview_status = 'pending'
+      RETURNING id, ingestion_id, filename, content_type, size_bytes, storage_key, status, checksum_sha256,
+        preview_status, preview_claimed_by, preview_claimed_at, preview_storage_key, preview_content_type, preview_size_bytes, preview_width,
+        preview_height, preview_error, preview_generated_at, processing_overrides, error, created_at, updated_at
+    `;
+  });
+
+  const row = rows[0];
+  return row ? mapIngestionFile(row) : undefined;
+}
+
 export async function updateIngestionFileProcessingOverrides(params: {
   tenantId: string;
   ingestionId: string;

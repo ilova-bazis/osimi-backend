@@ -1,4 +1,5 @@
-import { withSchemaClient } from "../db/client.ts";
+import { withExecutor, withSchemaClient } from "../db/client.ts";
+import type { SqlExecutor } from "../db/client.ts";
 import {
     toNullableSafeNumberFromDbInt,
     type DbInt,
@@ -117,6 +118,32 @@ export async function findAvailableFileById(params: {
       LIMIT 1
     `;
     });
+
+    const row = rows[0];
+    return row ? mapObjectAvailableFile(row) : undefined;
+}
+
+export async function findObjectAvailableFileById(params: {
+    tenantId: string;
+    objectId: string;
+    availableFileId: string;
+    executor?: SqlExecutor;
+}): Promise<ObjectAvailableFileRecord | undefined> {
+    const rows = await withExecutor(params.executor, (sql) =>
+        sql<ObjectAvailableFileRow[]>`
+            SELECT file.id, file.object_id, file.tenant_id, file.archive_file_key,
+                   file.artifact_kind, file.variant, file.display_name, file.content_type,
+                   file.size_bytes, file.checksum_sha256, file.metadata, file.is_available,
+                   file.synced_at
+            FROM object_available_files file
+            INNER JOIN objects obj ON obj.object_id = file.object_id
+            WHERE obj.tenant_id = ${params.tenantId}
+              AND file.tenant_id = ${params.tenantId}
+              AND file.object_id = ${params.objectId}
+              AND file.id = ${params.availableFileId}
+            LIMIT 1
+        `,
+    );
 
     const row = rows[0];
     return row ? mapObjectAvailableFile(row) : undefined;

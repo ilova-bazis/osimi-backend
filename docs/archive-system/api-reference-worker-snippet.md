@@ -18,6 +18,7 @@
     - `request_id`, `lease_id`, `lease_token`, `lease_expires_at`
     - `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`
     - `requested_by`, `dedupe_key`
+    - `dedupe_key` is `string|null`; workers must support `null`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid body
   - `401 UNAUTHORIZED` for missing/invalid worker auth token
@@ -63,9 +64,13 @@
 - Behavior:
   - for `artifact_fetch`, `upload_token` is required
   - for non-`artifact_fetch` actions, `upload_token` is ignored when present
+  - a successful artifact `PUT` transfers verified bytes to backend ownership and may finalize the request before this call
+  - completion is idempotent for the same lease and exact upload attempt
+  - acknowledging a materialized upload does not inspect staged bytes or mutate or repair its search projection
 - 200 response:
   - `status: "completed"`
   - `request` (`id`, `tenant_id`, `target_type`, `target_id`, `action_type`, `action_payload`, `requested_by`, `dedupe_key`, `status`, `failure_reason`, `failure_details`, `created_at`, `updated_at`, `completed_at`)
+  - returned `request.dedupe_key` is `string|null`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid path/body
   - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
@@ -77,12 +82,13 @@
 - Auth: `x-worker-auth-token`
 - Body:
   - `lease_token` (required non-empty string)
-  - `content_type` (required non-empty string)
+  - `content_type` (required valid HTTP media type; the complete declared value is preserved)
   - `size_bytes` (required integer >= 0)
   - `extension` (required non-empty string)
 - Behavior:
   - supported for `artifact_fetch` requests only
   - upload token TTL is 15 minutes
+  - a replacement presign invalidates the earlier attempt only before verification
 - 200 response:
   - `upload_token`
   - `upload_url` (for `PUT` upload)
@@ -150,7 +156,7 @@ Behavior notes:
     - `display_name` (required string, non-empty)
     - `content_type` (optional nullable string, non-empty when present)
     - `size_bytes` (optional nullable number, integer >= 0)
-    - `checksum_sha256` (optional nullable string, non-empty when present)
+    - `checksum_sha256` (optional nullable 64-character hexadecimal SHA-256; normalized to lowercase)
     - `metadata` (object, optional)
     - `is_available` (boolean, optional; defaults `true`)
 - Behavior:
@@ -212,6 +218,7 @@ Deprecated compatibility route. New archive workers should use `POST /api/archiv
   - otherwise `request` with:
     - `request_id`, `lease_id`, `lease_token`, `lease_expires_at`
     - `object_id`, `tenant_id`, `available_file_id`, `artifact_kind`, `variant`
+    - `available_file_id` is a required, non-null UUID when `request` is present
     - `available_file` (nullable object from available-files snapshot):
       - `id`, `object_id`, `archive_file_key`, `artifact_kind`, `variant`, `display_name`, `content_type`, `size_bytes`, `checksum_sha256`, `metadata`, `is_available`, `synced_at`
 - Error behavior:
@@ -257,7 +264,7 @@ Deprecated compatibility route. New archive workers should use `POST /api/archiv
 - Auth: `x-worker-auth-token`
 - Body:
   - `lease_token` (required non-empty string)
-  - `content_type` (required non-empty string)
+  - `content_type` (required valid HTTP media type; the complete declared value is preserved)
   - `size_bytes` (required integer >= 0)
   - `extension` (required non-empty string)
 - 200 response:
@@ -268,24 +275,34 @@ Deprecated compatibility route. New archive workers should use `POST /api/archiv
   - `headers` (`content-type`, `content-length` where `content-length` is a JSON number)
 - Behavior:
   - upload token TTL is 15 minutes
+  - an exact source that became inactive after queueing remains fulfillable and retains its known checksum
+  - the expected source checksum captured by an issued upload attempt does not change with later source updates
 - Error behavior:
   - `400 BAD_REQUEST` for invalid path/body
   - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
-  - `409 CONFLICT` when lease is no longer active
+  - `409 CONFLICT` when lease is no longer active, or with `details.reason = artifact_source_missing|artifact_source_identity_changed|artifact_source_checksum_invalid` when the queued source cannot be authorized; fail or quarantine these stale requests instead of re-leasing them
   - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
 
 ### PUT `/api/archive-requests/uploads/:token`
 
 - Auth: none (signed token in path)
 - Required headers:
-  - `content-type` must match signed token constraints by media type (parameters are ignored)
+  - `content-type` must have the same case-insensitive base media type as the signed value; parameters are ignored and both values must be valid media types
   - `content-length` is required and must exactly match signed token constraints
 - Body: raw file bytes; byte length must exactly match signed token constraints
 - 200 response:
   - `status: "ok"`, `request_id`, `size_bytes` (number)
+- Behavior:
+  - a source-checksum mismatch publishes no immutable bytes and leaves the attempt authorized
+  - on `details.reason = expected_checksum_mismatch`, correct or re-read the source and retry the same upload URL while its token and lease remain active
+  - once bytes are accepted, only exact retries are idempotent
 - Error behavior:
   - `400 BAD_REQUEST` for header/body constraint mismatch
   - `401 UNAUTHORIZED` for invalid/expired signed token
+  - `409 CONFLICT` with `details.reason = expected_checksum_mismatch`, expected/actual SHA-256, and `retry_action = retry_same_upload_url` for a recoverable source-checksum rejection
+  - `409 CONFLICT` with `details.reason = accepted_checkpoint_mismatch` permits only the exact accepted bytes, not corrected replacement content
+  - `409 CONFLICT` with `details.reason = accepted_checkpoint_storage_conflict` requires backend storage repair rather than another upload retry
+  - other `409 CONFLICT` responses indicate an inactive attempt or lease and do not authorize same-URL correction
 
 ### PUT `/api/object-download-requests/uploads/:token`
 

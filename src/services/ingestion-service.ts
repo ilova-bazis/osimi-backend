@@ -1,4 +1,7 @@
 import { rm } from "node:fs/promises";
+import { dirname } from "node:path";
+
+import sharp from "sharp";
 
 import type { SqlExecutor } from "../db/client.ts";
 import {
@@ -19,6 +22,7 @@ import {
   listIngestionFiles,
   listIngestions,
   markIngestionFilePreviewFailed,
+  markIngestionFilePreviewInline,
   markIngestionFilePreviewPending,
   markIngestionFilePreviewReady,
   markIngestionFilePreviewUnsupported,
@@ -129,6 +133,88 @@ const INGESTION_PREVIEW_OUTPUT_CONTENT_TYPES = new Set([
   "image/gif",
   "image/avif",
 ]);
+const MAX_INLINE_PREVIEW_SOURCE_BYTES = 20 * 1024 * 1024;
+const INLINE_PREVIEW_UPLOAD_TOKEN_ID = "inline";
+
+function scalePreviewDimensions(
+  sourceWidth: number,
+  sourceHeight: number,
+): { width: number; height: number } {
+  if (
+    sourceWidth <= MAX_INGESTION_PREVIEW_DIMENSION_PIXELS &&
+    sourceHeight <= MAX_INGESTION_PREVIEW_DIMENSION_PIXELS
+  ) {
+    return { width: sourceWidth, height: sourceHeight };
+  }
+  const ratio = Math.min(
+    MAX_INGESTION_PREVIEW_DIMENSION_PIXELS / sourceWidth,
+    MAX_INGESTION_PREVIEW_DIMENSION_PIXELS / sourceHeight,
+  );
+  return {
+    width: Math.round(sourceWidth * ratio),
+    height: Math.round(sourceHeight * ratio),
+  };
+}
+
+async function generateImagePreviewInline(params: {
+  tenantId: string;
+  ingestionId: string;
+  fileId: string;
+  storageKey: string;
+}): Promise<{
+  storageKey: string;
+  contentType: string;
+  sizeBytes: number;
+  width: number;
+  height: number;
+} | null> {
+  try {
+    const sourcePath = resolveStagingPath(params.storageKey);
+    const sourceFile = Bun.file(sourcePath);
+    if ((await sourceFile.size) > MAX_INLINE_PREVIEW_SOURCE_BYTES) {
+      return null;
+    }
+
+    const buffer = await sourceFile.arrayBuffer();
+    const metadata = await sharp(buffer).metadata();
+    if (!metadata.width || !metadata.height) {
+      return null;
+    }
+
+    const output = scalePreviewDimensions(metadata.width, metadata.height);
+    const outputStorageKey = buildIngestionPreviewStorageKey({
+      tenantId: params.tenantId,
+      ingestionId: params.ingestionId,
+      fileId: params.fileId,
+      uploadTokenId: INLINE_PREVIEW_UPLOAD_TOKEN_ID,
+      extension: "jpg",
+    });
+    const outputPath = resolveStagingPath(outputStorageKey);
+
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(dirname(outputPath), { recursive: true });
+
+    const resized = await sharp(buffer)
+      .resize(output.width, output.height, {
+        fit: "inside",
+        withoutEnlargement: true,
+      })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+
+    await Bun.write(outputPath, resized);
+
+    return {
+      storageKey: outputStorageKey,
+      contentType: "image/jpeg",
+      sizeBytes: resized.length,
+      width: output.width,
+      height: output.height,
+    };
+  } catch {
+    return null;
+  }
+}
 
 interface CursorPayload {
   created_at: string;
@@ -1023,6 +1109,35 @@ export async function commitUploadedFile(params: {
         ingestionId: params.ingestionId,
         executor: params.executor,
       });
+
+  if (
+    previewUpdated?.previewStatus === "pending" &&
+    updated.contentType?.startsWith("image/")
+  ) {
+    const generated = await generateImagePreviewInline({
+      tenantId: params.auth.tenantId,
+      ingestionId: params.ingestionId,
+      fileId,
+      storageKey: updated.storageKey,
+    });
+    if (generated) {
+      const ready = await markIngestionFilePreviewInline({
+        ingestionId: params.ingestionId,
+        fileId,
+        storageKey: generated.storageKey,
+        contentType: generated.contentType,
+        sizeBytes: generated.sizeBytes,
+        width: generated.width,
+        height: generated.height,
+        executor: params.executor,
+      });
+      if (ready) {
+        return {
+          file: serializeFile(ready),
+        };
+      }
+    }
+  }
 
   return {
     file: serializeFile(previewUpdated ?? updated),

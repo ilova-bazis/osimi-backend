@@ -4,6 +4,7 @@ import {
     ValidationError,
 } from "../http/errors.ts";
 import { encodeCursor } from "../http/pagination.ts";
+import { withSchemaClient } from "../db/client.ts";
 import {
     buildAccessDecision,
     type AccessReasonCode,
@@ -23,6 +24,7 @@ import {
 } from "../repos/object-access-repo.ts";
 import {
     findAvailableFileById,
+    findObjectAvailableFileById,
     listAvailableFilesByObjectId,
     replaceObjectAvailableFiles,
     type ObjectAvailableFileRecord,
@@ -33,21 +35,26 @@ import {
     extendArchiveRequestLease,
     failArchiveRequest,
     findActiveArchiveRequestByDedupeKey,
+    findActiveArchiveRequestLeaseByToken,
     findArchiveRequestById,
-    findArchiveArtifactUpload,
     leaseNextPendingArchiveRequest,
     listArchiveRequests,
     listArchiveRequestsByTarget,
     releaseArchiveRequestLease,
-    prepareArchiveArtifactUpload,
-    recordArchiveArtifactUpload,
     sweepExpiredArchiveRequestLeases,
+    findArchiveRequestByIdForUpdate,
+    transferArchiveRequestUploadToBackend,
     type ArchiveRequestRecord,
     type ArchiveRequestTargetType,
 } from "../repos/archive-request-repo.ts";
 import {
+    createAuthorizedArchiveArtifactUploadAttempt,
+    findArchiveArtifactUploadAttemptById,
+    findArchiveArtifactUploadAttemptByIdForUpdate,
+    verifyArchiveArtifactUploadAttempt,
+} from "../repos/archive-artifact-upload-attempt-repo.ts";
+import {
     findLatestArtifactByKind,
-    findArtifactByStorageKey,
     findArtifactById,
     findPreferredThumbnailArtifactIdByObjectId,
     findObjectById,
@@ -55,7 +62,6 @@ import {
     listObjectArtifactSummariesByObjectIds,
     listArtifactsByObjectId,
     listObjects,
-    createObjectArtifact,
     type ArtifactKind,
     type ObjectListSort,
     updateObjectAccessPolicy,
@@ -69,8 +75,14 @@ import {
     createObjectArtifactUploadToken,
     parseObjectArtifactUploadToken,
 } from "../storage/staging.ts";
-import { parseContentLength, streamUploadToImmutablePath } from "../storage/upload.ts";
+import {
+    parseContentLength,
+    stageImmutableUpload,
+    streamUploadToImmutablePath,
+} from "../storage/upload.ts";
 import { resolveMaxUploadSizeBytes } from "../runtime/config.ts";
+import { parseMediaType } from "../http/media-type.ts";
+import { finalizeVerifiedArchiveArtifactUpload } from "./archive-artifact-finalization-service.ts";
 import {
     authorizeWorkerLeaseForArchiveRequest,
     type AuthorizedWorkerArchiveRequestLease,
@@ -1794,32 +1806,6 @@ function workerUploadTtlSeconds(): number {
     return DEFAULT_WORKER_UPLOAD_TTL_SECONDS;
 }
 
-function isObjectArtifactStorageConflict(error: unknown): boolean {
-    if (!error || typeof error !== "object") {
-        return false;
-    }
-
-    const maybeError = error as {
-        code?: unknown;
-        errno?: unknown;
-        constraint?: unknown;
-        message?: unknown;
-    };
-
-    if (maybeError.code !== "23505" && maybeError.errno !== "23505") {
-        return false;
-    }
-
-    if (maybeError.constraint === "object_artifacts_storage_key_key") {
-        return true;
-    }
-
-    return (
-        typeof maybeError.message === "string" &&
-        maybeError.message.includes("object_artifacts_storage_key_key")
-    );
-}
-
 async function resolveAvailableFileForArtifactFetch(params: {
     tenantId: string;
     objectId: string;
@@ -2026,18 +2012,66 @@ async function buildArtifactUploadPresignResponse(params: {
             params.body.extension ||
             extensionFromContentType(params.body.content_type),
     });
-    const prepared = await prepareArchiveArtifactUpload({
-        requestId: params.lease.requestId,
-        leaseId: params.lease.leaseId,
-        leaseTokenId: params.lease.leaseTokenId,
-        uploadTokenId,
-        storageKey,
-        contentType: params.body.content_type,
-        sizeBytes: params.body.size_bytes,
-    });
+    const prepared = await withSchemaClient(async (sql) => sql.begin(async (transaction) => {
+        const request = await findArchiveRequestByIdForUpdate({
+            requestId: params.lease.requestId,
+            executor: transaction,
+        });
+        if (!request) return undefined;
+        const payload = parseArtifactFetchActionPayload(request);
+        const availableFile = await findObjectAvailableFileById({
+            tenantId: request.tenantId,
+            objectId: request.targetId,
+            availableFileId: payload.available_file_id,
+            executor: transaction,
+        });
+        if (!availableFile) {
+            return { outcome: "artifact_source_missing" as const };
+        }
+        if (
+            availableFile.artifactKind !== payload.artifact_kind ||
+            availableFile.variant !== payload.variant
+        ) {
+            return { outcome: "artifact_source_identity_changed" as const };
+        }
+        const expectedSha256 = availableFile.checksumSha256?.toLowerCase() ?? null;
+        if (expectedSha256 !== null && !/^[0-9a-f]{64}$/.test(expectedSha256)) {
+            return { outcome: "artifact_source_checksum_invalid" as const };
+        }
+        const attempt = await createAuthorizedArchiveArtifactUploadAttempt(transaction, {
+            requestId: params.lease.requestId,
+            leaseId: params.lease.leaseId,
+            leaseTokenId: params.lease.leaseTokenId,
+            uploadTokenId,
+            storageKey,
+            contentType: params.body.content_type,
+            sizeBytes: params.body.size_bytes,
+            expectedSha256,
+            expiresAt: new Date(expiresAt),
+        });
+        return attempt ? { outcome: "authorized" as const } : undefined;
+    }));
 
     if (!prepared) {
         throw new ConflictError("Lease is no longer active.");
+    }
+    if (prepared.outcome === "artifact_source_missing") {
+        throw new ConflictError(
+            "Artifact source is no longer available for this request.",
+            { reason: prepared.outcome },
+        );
+    }
+    if (prepared.outcome === "artifact_source_identity_changed") {
+        throw new ConflictError(
+            "Artifact source identity changed after this request was queued.",
+            { reason: prepared.outcome },
+        );
+    }
+    if (prepared.outcome === "artifact_source_checksum_invalid") {
+        throw new ConflictError(
+            "Artifact source checksum is invalid for this request.",
+            { reason: prepared.outcome },
+        );
     }
 
     const uploadToken = createObjectArtifactUploadToken({
@@ -2069,14 +2103,20 @@ export async function authorizeArtifactFetchArchiveRequestLease(params: {
     requestId: string;
     leaseToken: string;
     requireActiveLease?: boolean;
-}): Promise<AuthorizedWorkerDownloadRequestLease> {
+    allowExpired?: boolean;
+}): Promise<ArtifactFetchCompletionLease> {
     const authorizedLease = await authorizeWorkerLeaseForArchiveRequest({
         requestId: params.requestId,
         leaseToken: params.leaseToken,
         requireActiveLease: params.requireActiveLease,
+        allowExpired: params.allowExpired,
     });
 
     return await resolveArtifactFetchLeaseContext(authorizedLease);
+}
+
+interface ArtifactFetchCompletionLease extends AuthorizedWorkerDownloadRequestLease {
+    availableFileId: string;
 }
 
 export async function presignArchiveRequestArtifactUpload(params: {
@@ -2096,7 +2136,7 @@ export async function presignArchiveRequestArtifactUpload(params: {
 
 async function resolveArtifactFetchLeaseContext(
     authorizedLease: AuthorizedWorkerArchiveRequestLease,
-): Promise<AuthorizedWorkerDownloadRequestLease> {
+): Promise<ArtifactFetchCompletionLease> {
     if (authorizedLease.actionType !== "artifact_fetch") {
         throw new ConflictError(
             `Archive request '${authorizedLease.requestId}' is not an artifact_fetch request.`,
@@ -2119,6 +2159,17 @@ async function resolveArtifactFetchLeaseContext(
         );
     }
 
+    if (
+        request.tenantId !== authorizedLease.tenantId ||
+        request.targetType !== authorizedLease.targetType ||
+        request.targetId !== authorizedLease.targetId ||
+        request.actionType !== authorizedLease.actionType
+    ) {
+        throw new ConflictError(
+            `Archive request '${authorizedLease.requestId}' does not match its lease context.`,
+        );
+    }
+
     const payload = parseArtifactFetchActionPayload(request);
 
     return {
@@ -2129,7 +2180,37 @@ async function resolveArtifactFetchLeaseContext(
         tenantId: authorizedLease.tenantId,
         artifactKind: payload.artifact_kind,
         variant: payload.variant,
+        availableFileId: payload.available_file_id,
         workerId: authorizedLease.workerId,
+    };
+}
+
+async function resolveLegacyArtifactFetchLeaseContext(
+    authorizedLease: AuthorizedWorkerDownloadRequestLease,
+): Promise<ArtifactFetchCompletionLease> {
+    const request = await findArchiveRequestById({ requestId: authorizedLease.requestId });
+    if (!request) {
+        throw new NotFoundError(
+            `Download request '${authorizedLease.requestId}' was not found.`,
+        );
+    }
+    if (
+        request.actionType !== "artifact_fetch" ||
+        request.targetType !== "object" ||
+        request.tenantId !== authorizedLease.tenantId ||
+        request.targetId !== authorizedLease.objectId
+    ) {
+        throw new ConflictError(
+            `Download request '${authorizedLease.requestId}' does not match its lease context.`,
+        );
+    }
+
+    const payload = parseArtifactFetchActionPayload(request);
+    return {
+        ...authorizedLease,
+        artifactKind: payload.artifact_kind,
+        variant: payload.variant,
+        availableFileId: payload.available_file_id,
     };
 }
 
@@ -2145,12 +2226,17 @@ export async function uploadObjectArtifactBySignedToken(params: {
             max_upload_size_bytes: maxUploadSizeBytes,
         });
     }
-    const requestContentType = params.request.headers
-        .get("content-type")
-        ?.split(";")[0]
-        ?.trim();
+    const signedContentType = parseMediaType(token.content_type);
+    const requestContentType = params.request.headers.get("content-type");
+    const parsedRequestContentType = requestContentType
+        ? parseMediaType(requestContentType)
+        : undefined;
 
-    if (requestContentType !== token.content_type) {
+    if (
+        !signedContentType ||
+        !parsedRequestContentType ||
+        parsedRequestContentType.essence !== signedContentType.essence
+    ) {
         throw new ValidationError(
             "Upload content type does not match signed URL constraints.",
         );
@@ -2170,167 +2256,204 @@ export async function uploadObjectArtifactBySignedToken(params: {
         );
     }
 
-    const stagedUpload = await findArchiveArtifactUpload({ requestId: token.request_id });
-
+    const attempt = await findArchiveArtifactUploadAttemptById({
+        uploadTokenId: token.upload_token_id,
+    });
     if (
-        !stagedUpload ||
-        stagedUpload.status !== "PROCESSING" ||
-        stagedUpload.actionType !== "artifact_fetch" ||
-        stagedUpload.tenantId !== token.tenant_id ||
-        stagedUpload.targetId !== token.object_id ||
-        stagedUpload.uploadTokenId !== token.upload_token_id ||
-        stagedUpload.storageKey !== token.storage_key ||
-        stagedUpload.contentType !== token.content_type ||
-        stagedUpload.sizeBytes !== token.size_bytes
+        !attempt || attempt.requestId !== token.request_id ||
+        attempt.invalidatedAt !== null || attempt.storageKey !== token.storage_key ||
+        attempt.contentType !== token.content_type || attempt.sizeBytes !== token.size_bytes
     ) {
         throw new ConflictError("Upload token is no longer active.");
     }
 
-    const destinationPath = resolveStagingPath(token.storage_key);
-    const inspection = await streamUploadToImmutablePath({
+    if (attempt.state === "AUTHORIZED") {
+        const activeLease = await findActiveArchiveRequestLeaseByToken({
+            requestId: attempt.requestId,
+            leaseId: attempt.authorizedLeaseId,
+            leaseTokenId: attempt.authorizedLeaseTokenId,
+        });
+        if (!activeLease) {
+            const refreshed = await findArchiveArtifactUploadAttemptById({
+                uploadTokenId: token.upload_token_id,
+            });
+            if (
+                refreshed === attempt ||
+                (refreshed?.state !== "VERIFIED" && refreshed?.state !== "MATERIALIZED")
+            ) {
+                throw new ConflictError("Upload token is no longer active.");
+            }
+        }
+    }
+
+    const staged = await stageImmutableUpload({
         body: params.request.body,
-        destinationPath,
+        destinationPath: resolveStagingPath(token.storage_key),
         expectedSizeBytes: token.size_bytes,
         maxSizeBytes: maxUploadSizeBytes,
     });
-    const recorded = await recordArchiveArtifactUpload({
-        requestId: token.request_id,
-        uploadTokenId: token.upload_token_id,
-        storageKey: token.storage_key,
-        checksumSha256: inspection.checksumSha256,
-    });
-
-    if (!recorded) {
-        throw new ConflictError("Upload token is no longer active.");
-    }
-
-    return {
-        status: "ok",
-        request_id: token.request_id,
-        size_bytes: token.size_bytes,
-    };
-}
-
-async function resolveArtifactForCompletion(params: {
-    lease: AuthorizedWorkerDownloadRequestLease;
-    uploadToken: string;
-}): Promise<ObjectArtifactRecord> {
-    const upload = parseObjectArtifactUploadToken(params.uploadToken);
-
-    if (
-        upload.request_id !== params.lease.requestId ||
-        upload.object_id !== params.lease.objectId ||
-        upload.tenant_id !== params.lease.tenantId ||
-        upload.artifact_kind !== params.lease.artifactKind ||
-        upload.variant !== params.lease.variant
-    ) {
-        throw new ValidationError(
-            "Upload token does not match artifact fetch lease context.",
-        );
-    }
-
-    const stagedUpload = await findArchiveArtifactUpload({
-        requestId: params.lease.requestId,
-    });
-
-    if (
-        !stagedUpload ||
-        stagedUpload.status !== "PROCESSING" ||
-        stagedUpload.uploadTokenId !== upload.upload_token_id ||
-        stagedUpload.storageKey !== upload.storage_key ||
-        stagedUpload.contentType !== upload.content_type ||
-        stagedUpload.sizeBytes !== upload.size_bytes ||
-        !stagedUpload.checksumSha256
-    ) {
-        throw new ConflictError("Upload token is no longer active.");
-    }
-
-    const existing = await findLatestArtifactByKind({
-        tenantId: params.lease.tenantId,
-        objectId: params.lease.objectId,
-        kind: params.lease.artifactKind,
-        variant: params.lease.variant,
-    });
-
-    if (existing) {
-        return existing;
-    }
-
-    const file = Bun.file(resolveStagingPath(upload.storage_key));
-    if (!(await file.exists())) {
-        throw new NotFoundError("Uploaded artifact file was not found.");
-    }
-
     try {
-        return await createObjectArtifact({
-            objectId: params.lease.objectId,
-            kind: params.lease.artifactKind,
-            variant: params.lease.variant,
-            storageKey: upload.storage_key,
-            contentType: upload.content_type,
-            sizeBytes: upload.size_bytes,
-        });
-    } catch (error) {
-        if (!isObjectArtifactStorageConflict(error)) {
-            throw error;
+        const recorded = await withSchemaClient(async (sql) => sql.begin(async (transaction) => {
+            const request = await findArchiveRequestByIdForUpdate({
+                requestId: token.request_id,
+                executor: transaction,
+            });
+            const lockedAttempt = await findArchiveArtifactUploadAttemptByIdForUpdate({
+                uploadTokenId: token.upload_token_id,
+                executor: transaction,
+            });
+            if (
+                !request || !lockedAttempt ||
+                lockedAttempt.requestId !== token.request_id ||
+                lockedAttempt.invalidatedAt !== null ||
+                lockedAttempt.storageKey !== token.storage_key ||
+                lockedAttempt.contentType !== token.content_type ||
+                lockedAttempt.sizeBytes !== token.size_bytes
+            ) return undefined;
+
+            if (lockedAttempt.state === "VERIFIED" || lockedAttempt.state === "MATERIALIZED") {
+                if (!lockedAttempt.computedSha256) return undefined;
+                if (
+                    lockedAttempt.sizeBytes !== staged.inspection.sizeBytes ||
+                    lockedAttempt.computedSha256 !== staged.inspection.checksumSha256
+                ) {
+                    return {
+                        acceptedCheckpointMismatch: {
+                            expected: lockedAttempt.computedSha256,
+                            actual: staged.inspection.checksumSha256,
+                        },
+                    } as const;
+                }
+                try {
+                    await staged.publish({
+                        sizeBytes: lockedAttempt.sizeBytes,
+                        checksumSha256: lockedAttempt.computedSha256,
+                    });
+                } catch (error) {
+                    if (error instanceof ConflictError) {
+                        return { acceptedCheckpointStorageConflict: true } as const;
+                    }
+                    throw error;
+                }
+                return { attempt: lockedAttempt };
+            }
+
+            if (
+                request.status !== "PROCESSING" ||
+                request.leaseId !== lockedAttempt.authorizedLeaseId ||
+                request.leaseTokenId !== lockedAttempt.authorizedLeaseTokenId ||
+                request.releasedAt !== null || !request.leaseExpiresAt ||
+                request.leaseExpiresAt.getTime() <= Date.now()
+            ) return undefined;
+
+            if (
+                lockedAttempt.expectedSha256 !== null &&
+                lockedAttempt.expectedSha256 !== staged.inspection.checksumSha256
+            ) {
+                return {
+                    expectedChecksumMismatch: {
+                        expected: lockedAttempt.expectedSha256,
+                        actual: staged.inspection.checksumSha256,
+                    },
+                } as const;
+            }
+
+            try {
+                await staged.publish({
+                    sizeBytes: lockedAttempt.sizeBytes,
+                    checksumSha256: lockedAttempt.expectedSha256 ?? staged.inspection.checksumSha256,
+                });
+            } catch (error) {
+                if (error instanceof ConflictError) return { contentConflict: true } as const;
+                throw error;
+            }
+            const verified = await verifyArchiveArtifactUploadAttempt({
+                uploadTokenId: token.upload_token_id,
+                requestId: token.request_id,
+                leaseId: lockedAttempt.authorizedLeaseId,
+                leaseTokenId: lockedAttempt.authorizedLeaseTokenId,
+                computedSizeBytes: staged.inspection.sizeBytes,
+                computedSha256: staged.inspection.checksumSha256,
+                executor: transaction,
+            });
+            if (!verified) return undefined;
+            const transferred = await transferArchiveRequestUploadToBackend({
+                requestId: token.request_id,
+                leaseId: lockedAttempt.authorizedLeaseId,
+                leaseTokenId: lockedAttempt.authorizedLeaseTokenId,
+                executor: transaction,
+            });
+            return transferred ? { attempt: verified } : undefined;
+        }));
+
+        if (!recorded) {
+            throw new ConflictError("Upload token is no longer active.");
+        }
+        if (
+            "expectedChecksumMismatch" in recorded &&
+            recorded.expectedChecksumMismatch
+        ) {
+            throw new ConflictError(
+                "Uploaded artifact checksum does not match the expected source checksum.",
+                {
+                    reason: "expected_checksum_mismatch",
+                    expected_checksum_sha256: recorded.expectedChecksumMismatch.expected,
+                    actual_checksum_sha256: recorded.expectedChecksumMismatch.actual,
+                    retry_action: "retry_same_upload_url",
+                },
+            );
+        }
+        if (
+            "acceptedCheckpointMismatch" in recorded &&
+            recorded.acceptedCheckpointMismatch
+        ) {
+            throw new ConflictError(
+                "Upload body does not match the accepted artifact checkpoint.",
+                {
+                    reason: "accepted_checkpoint_mismatch",
+                    expected_checksum_sha256: recorded.acceptedCheckpointMismatch.expected,
+                    actual_checksum_sha256: recorded.acceptedCheckpointMismatch.actual,
+                    retry_action: "retry_exact_accepted_bytes_only",
+                },
+            );
+        }
+        if ("acceptedCheckpointStorageConflict" in recorded) {
+            throw new ConflictError(
+                "Immutable artifact storage does not match the accepted checkpoint.",
+                {
+                    reason: "accepted_checkpoint_storage_conflict",
+                    retry_action: "operator_repair_required",
+                },
+            );
+        }
+        if ("contentConflict" in recorded) {
+            throw new ConflictError("Upload body does not match the accepted artifact checkpoint.");
         }
 
-        const byStorageKey = await findArtifactByStorageKey({
-            objectId: params.lease.objectId,
-            storageKey: upload.storage_key,
-        });
-
-        if (!byStorageKey) {
-            throw error;
+        if (recorded.attempt.state === "VERIFIED") {
+            try {
+                await finalizeVerifiedArchiveArtifactUpload({ uploadTokenId: token.upload_token_id });
+            } catch (error) {
+                console.error(
+                    `artifact_upload_finalization_deferred request_id=${token.request_id} upload_token_id=${token.upload_token_id} error=${error instanceof Error ? error.message : "unexpected"}`,
+                );
+            }
         }
 
-        return byStorageKey;
+        return {
+            status: "ok",
+            request_id: token.request_id,
+            size_bytes: staged.inspection.sizeBytes,
+        };
+    } finally {
+        try {
+            await staged.cleanup();
+        } catch (error) {
+            console.error(
+                `artifact_upload_cleanup_failed request_id=${token.request_id} upload_token_id=${token.upload_token_id} temporary_path=${staged.temporaryPath} error=${error instanceof Error ? error.message : "unexpected"}`,
+            );
+        }
     }
-}
-
-async function applyArtifactCompletionSideEffects(params: {
-    lease: AuthorizedWorkerDownloadRequestLease;
-    artifact: ObjectArtifactRecord;
-}): Promise<void> {
-    if (
-        params.artifact.kind !== "ocr_text" ||
-        !isPageOcrVariant(params.artifact.variant)
-    ) {
-        return;
-    }
-
-    const pageNumber = extractPageNumberFromVariant(params.artifact.variant);
-    const objectRecord = await findObjectById({
-        tenantId: params.lease.tenantId,
-        objectId: params.lease.objectId,
-    });
-
-    if (!objectRecord) {
-        return;
-    }
-
-    const currentPages = getMetadataPages(objectRecord.metadata) ?? [];
-    const existingPage = currentPages.find(
-        (page) => page.page_number === pageNumber,
-    );
-
-    if (existingPage) {
-        existingPage.ocr_text_artifact_id = params.artifact.id;
-    } else {
-        currentPages.push({
-            page_number: pageNumber,
-            label: String(pageNumber),
-            image_artifact_id: null,
-            ocr_text_artifact_id: params.artifact.id,
-        });
-        currentPages.sort((left, right) => left.page_number - right.page_number);
-    }
-
-    await updateObjectMetadataPages({
-        tenantId: params.lease.tenantId,
-        objectId: params.lease.objectId,
-        pages: currentPages,
-    });
 }
 
 export async function finalizeArtifactFetchArchiveRequest(params: {
@@ -2340,26 +2463,63 @@ export async function finalizeArtifactFetchArchiveRequest(params: {
 }): Promise<{
     lease: AuthorizedWorkerDownloadRequestLease;
     artifact: ObjectArtifactRecord;
+    request: ArchiveRequestRecord;
 }> {
     const authorizedLease = await authorizeArtifactFetchArchiveRequestLease({
         requestId: params.requestId,
         leaseToken: params.leaseToken,
         requireActiveLease: false,
+        allowExpired: true,
     });
-
-    const artifact = await resolveArtifactForCompletion({
-        lease: authorizedLease,
-        uploadToken: params.uploadToken,
+    const upload = parseObjectArtifactUploadToken(params.uploadToken, { allowExpired: true });
+    if (
+        upload.request_id !== authorizedLease.requestId ||
+        upload.object_id !== authorizedLease.objectId ||
+        upload.tenant_id !== authorizedLease.tenantId ||
+        upload.artifact_kind !== authorizedLease.artifactKind ||
+        upload.variant !== authorizedLease.variant
+    ) {
+        throw new ValidationError("Upload token does not match artifact fetch lease context.");
+    }
+    const attempt = await findArchiveArtifactUploadAttemptById({
+        uploadTokenId: upload.upload_token_id,
     });
-
-    await applyArtifactCompletionSideEffects({
-        lease: authorizedLease,
-        artifact,
+    if (
+        !attempt || attempt.requestId !== authorizedLease.requestId ||
+        attempt.authorizedLeaseId !== authorizedLease.leaseId ||
+        attempt.authorizedLeaseTokenId !== authorizedLease.leaseTokenId ||
+        attempt.storageKey !== upload.storage_key
+    ) {
+        throw new ConflictError("Upload token does not belong to this lease.");
+    }
+    const outcome = attempt.state === "VERIFIED"
+        ? await finalizeVerifiedArchiveArtifactUpload({
+            uploadTokenId: attempt.uploadTokenId,
+            ignoreRetrySchedule: true,
+        })
+        : { outcome: "pending" as const };
+    const finalizedAttempt = await findArchiveArtifactUploadAttemptById({
+        uploadTokenId: attempt.uploadTokenId,
     });
-
+    if (!finalizedAttempt || finalizedAttempt.state !== "MATERIALIZED" || !finalizedAttempt.artifactId) {
+        if (outcome.outcome === "pending") {
+            throw new ConflictError("Uploaded artifact has not been verified or finalization is already in progress.");
+        }
+        throw new ConflictError("Uploaded artifact could not be materialized.");
+    }
+    const artifact = await findArtifactById({
+        tenantId: authorizedLease.tenantId,
+        objectId: authorizedLease.objectId,
+        artifactId: finalizedAttempt.artifactId,
+    });
+    const request = await findArchiveRequestById({ requestId: authorizedLease.requestId });
+    if (!artifact || !request || request.status !== "COMPLETED") {
+        throw new ConflictError("Uploaded artifact completion is inconsistent.");
+    }
     return {
         lease: authorizedLease,
         artifact,
+        request,
     };
 }
 
@@ -2367,41 +2527,45 @@ export async function completeObjectDownloadRequestByWorker(params: {
     requestId: string;
     body: WorkerCompleteObjectDownloadRequestBody;
 }): Promise<WorkerCompleteObjectDownloadRequestResponse> {
-    const authorizedLease = await authorizeWorkerLeaseForDownloadRequest({
+    const tokenLease = await authorizeWorkerLeaseForDownloadRequest({
         requestId: params.requestId,
         leaseToken: params.body.lease_token,
         requireActiveLease: false,
+        allowExpired: true,
     });
+    const authorizedLease = await resolveLegacyArtifactFetchLeaseContext(tokenLease);
 
-    const artifact = await resolveArtifactForCompletion({
-        lease: authorizedLease,
-        uploadToken: params.body.upload_token,
-    });
-
-    await applyArtifactCompletionSideEffects({
-        lease: authorizedLease,
-        artifact,
-    });
-
-    const request = await findArchiveRequestById({ requestId: params.requestId });
-
-    if (!request) {
-        throw new NotFoundError(
-            `Download request '${params.requestId}' was not found.`,
-        );
-    }
-
-    if (request.status !== "COMPLETED") {
-        const completed = await completeArchiveRequest({
-            requestId: authorizedLease.requestId,
-            leaseId: authorizedLease.leaseId,
-            leaseTokenId: authorizedLease.leaseTokenId,
+    const upload = parseObjectArtifactUploadToken(params.body.upload_token, { allowExpired: true });
+    if (
+        upload.request_id !== authorizedLease.requestId ||
+        upload.object_id !== authorizedLease.objectId ||
+        upload.tenant_id !== authorizedLease.tenantId ||
+        upload.artifact_kind !== authorizedLease.artifactKind ||
+        upload.variant !== authorizedLease.variant
+    ) throw new ValidationError("Upload token does not match artifact fetch lease context.");
+    const attempt = await findArchiveArtifactUploadAttemptById({ uploadTokenId: upload.upload_token_id });
+    if (
+        !attempt || attempt.requestId !== authorizedLease.requestId ||
+        attempt.authorizedLeaseId !== authorizedLease.leaseId ||
+        attempt.authorizedLeaseTokenId !== authorizedLease.leaseTokenId ||
+        attempt.storageKey !== upload.storage_key
+    ) throw new ConflictError("Upload token does not belong to this lease.");
+    if (attempt.state === "VERIFIED") {
+        await finalizeVerifiedArchiveArtifactUpload({
+            uploadTokenId: attempt.uploadTokenId,
+            ignoreRetrySchedule: true,
         });
-
-        if (!completed) {
-            throw new ConflictError("Lease is no longer active.");
-        }
     }
+    const materialized = await findArchiveArtifactUploadAttemptById({ uploadTokenId: attempt.uploadTokenId });
+    if (!materialized?.artifactId || materialized.state !== "MATERIALIZED") {
+        throw new ConflictError("Uploaded artifact has not been materialized.");
+    }
+    const artifact = await findArtifactById({
+        tenantId: authorizedLease.tenantId,
+        objectId: authorizedLease.objectId,
+        artifactId: materialized.artifactId,
+    });
+    if (!artifact) throw new ConflictError("Materialized artifact was not found.");
 
     return {
         status: "completed",
@@ -2453,6 +2617,8 @@ export async function listObjectsForTenant(params: {
     const cursorPayload = pagination.cursor;
     const result = await listObjects({
         tenantId: params.auth.tenantId,
+        userId: params.auth.userId,
+        role: params.auth.role,
         limit: pagination.limit + 1,
         sort,
         cursorCreatedAt: cursorPayload?.created_at,

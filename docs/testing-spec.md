@@ -40,6 +40,10 @@ This document defines the required tests for the Osimi backend control plane (VP
 - Targeted lease reacquire: `POST /api/ingestions/:id/lease` leases only the requested queued ingestion
 - Targeted lease conflict: requesting `POST /api/ingestions/:id/lease` for an actively leased ingestion returns conflict (no takeover)
 - Signed URL constraints: method/TTL/content-type/content-length enforced
+- Ingestion list/detail expose role-, lease-, and purge-aware action capabilities; clients cannot infer actions from status or previews
+- Retained failed ingestions can retry only; purge-pending and purged failed/canceled ingestions expose no mutable capabilities and reject retry/restore/delete
+- Configured CORS origins receive direct-upload `OPTIONS` and `PUT` headers; unapproved origins receive no CORS grant
+- CORS origin configuration rejects malformed values and browser-visible relative upload URLs resolve through the public API base
 - Upload commit checksum validation (SHA-256)
 - Ingestion create/update rejects incompatible `classification_type` and `item_kind` combinations
 - File commit rejects media kinds incompatible with ingestion `item_kind`
@@ -66,6 +70,24 @@ This document defines the required tests for the Osimi backend control plane (VP
 - Staging retention removes temporary preview derivatives alongside original staged files
 - Purge intent rejects retry, restore, mutable staging actions, and new preview work
 - Object editing enforces public/family/private assignment policy with an admin override across every edit operation
+- Object search trims `q`, treats an empty trimmed query as omitted, rejects more than 256 trimmed characters, and matches literal case-insensitive substrings with `%`, `_`, and `\` escaped
+- Object search retains tenant-catalog `title` and `object_id` matches and preserves the requested sort without ranking or snippets
+- Object search matches materialized artifact `id`, `kind`, `variant`, and `content_type`, and available-file `display_name` and `archive_file_key` only through authoritative persisted materialization provenance, never inferred `kind`/`variant`; unmaterialized available-file inventory does not match
+- Artifact metadata, indexed OCR/transcript bodies, and curated document page text contribute matches only while the requester passes role/access assignment authorization, the embargo is inactive, and availability is `AVAILABLE`; access or embargo changes take effect without stale-index disclosure
+- Object search matches indexed, eligible materialized OCR/transcript text and `object_curated_document_pages.curated_text`, but never extracts arbitrary PDF/image/audio/video bytes during a request
+- Artifact indexing skips empty, malformed/non-text, unavailable, and over-limit bodies and enforces the configured per-artifact text-size limit (10 MiB recommended default)
+- Artifact presign attempts are lease-bound; release, failure, expiry, and re-presign invalidate unfinished attempts, and a released/reassigned lease cannot verify or finalize its former upload
+- Stale or mismatched artifact-upload leases are rejected before the request body is read or staged, proven by focused coverage asserting an untouched body and no staging residue while valid and concurrent uploads remain correct
+- A verified artifact upload transfers ownership to the backend, is never leased for re-upload, and is finalized synchronously or by a fenced multi-instance background claim
+- Artifact upload durability tests prove temporary-file sync precedes immutable publication, directory sync precedes `VERIFIED`, and sync failures leave worker ownership active
+- Exact `VERIFIED` and `MATERIALIZED` retries are idempotent and may restore a missing path, while different bytes cannot replace the accepted size/SHA-256 checkpoint
+- A known source-checksum mismatch returns deterministic retry guidance, publishes and indexes no rejected bytes, leaves the attempt `AUTHORIZED`, and accepts corrected bytes through the same active URL
+- Artifact presign preserves the checksum of an exact source that became inactive after queueing, rejects missing, kind/variant-changed, or malformed-checksum sources before authorization without invalidating a prior attempt, and keeps the captured expected checksum immutable across later source updates
+- Artifact presign and PUT share valid media-type parsing: parameterized declared values are preserved through materialization and indexing, case-insensitive base-type matches succeed, and malformed or different base types fail before staging
+- Concurrent rejected and corrected uploads use isolated temporary files; cleanup cannot remove or replace the corrected winner, and exactly one checkpoint/artifact/projection completes
+- Finalization rejects missing, non-regular, truncated, changed, oversized, and checksum-mismatched verified storage without artifact, search, metadata, attempt-materialization, or request-completion side effects
+- Artifact finalization uses the verified attempt's exact storage key and atomically commits artifact, search projection/provenance, page metadata, attempt state, and request completion; injected intermediate failure leaves no partial projection and remains retryable
+- Generic and legacy completion acknowledgments for a materialized artifact are read-only: retries do not inspect staged bytes, rewrite projection timestamps/text/provenance, or recreate a missing projection
 - Stuck attention for `UPLOADING` and `PROCESSING`
 - Tenant scoping on all endpoints
 

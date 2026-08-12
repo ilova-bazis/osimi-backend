@@ -1,0 +1,153 @@
+{
+  "contract_version": 1,
+  "get_edit": {
+    "object_id": "OBJ-20260804-CONTRACT",
+    "revision": 4,
+    "media_type": "document",
+    "curation_state": "needs_review",
+    "lock": {
+      "locked": true,
+      "locked_by": "10000000-0000-4000-8000-000000000001",
+      "locked_until": "2026-08-04T12:00:00.000Z"
+    },
+    "draft": null,
+    "metadata": {
+      "title": "Contract object",
+      "publication_date": "1987-06-14",
+      "date_precision": "day",
+      "date_approximate": false,
+      "language": "tg",
+      "tags": ["oral history"],
+      "people": ["Zarina T."],
+      "description": null
+    },
+    "rights": {
+      "access_level": "family",
+      "rights_note": null,
+      "sensitivity_note": null
+    },
+    "capabilities": {
+      "can_edit_metadata": true,
+      "can_curate_text": true,
+      "can_submit_review": true
+    },
+    "curation_payload": {
+      "kind": "document",
+      "machine_ocr_artifact_id": "60000000-0000-4000-8000-000000000001",
+      "page_count": 1,
+      "pages": [
+        {
+          "page_number": 1,
+          "label": "1",
+          "machine_text": "Machine OCR text",
+          "curated_text": null,
+          "status": "machine"
+        }
+      ]
+    }
+  },
+  "save_metadata": {
+    "request": {
+      "revision": 4,
+      "metadata": {
+        "title": "Contract object",
+        "publication_date": "1987-06-14",
+        "date_precision": "day",
+        "date_approximate": false,
+        "language": "tg",
+        "tags": ["oral history"],
+        "people": ["Zarina T."],
+        "description": null
+      },
+      "rights": {
+        "rights_note": null,
+        "sensitivity_note": null
+      }
+    },
+    "response": {
+      "object_id": "OBJ-20260804-CONTRACT",
+      "revision": 5,
+      "curation_state": "needs_review",
+      "updated_at": "2026-08-04T12:01:00.000Z"
+    }
+  },
+  "save_document_curation": {
+    "request": {
+      "revision": 5,
+      "pages": [
+        {
+          "page_number": 1,
+          "curated_text": "Corrected OCR text"
+        }
+      ]
+    },
+    "response": {
+      "object_id": "OBJ-20260804-CONTRACT",
+      "revision": 6,
+      "updated_count": 1,
+      "updated_at": "2026-08-04T12:02:00.000Z"
+    }
+  },
+  "submit_curation": {
+    "request": {
+      "revision": 6,
+      "review_note": "Ready for archive apply."
+    },
+    "response": {
+      "object_id": "OBJ-20260804-CONTRACT",
+      "revision": 7,
+      "curation_state": "review_in_progress",
+      "request": {
+        "id": "70000000-0000-4000-8000-000000000001",
+        "action_type": "curation_apply",
+        "status": "PENDING"
+      },
+      "submitted_at": "2026-08-04T12:03:00.000Z",
+      "submitted_by": "10000000-0000-4000-8000-000000000001"
+    }
+  },
+  "release_lock": {
+    "response": {
+      "object_id": "OBJ-20260804-CONTRACT",
+      "released": true
+    }
+  },
+  "errors": {
+    "revision_conflict": {
+      "status": 409,
+      "body": {
+        "request_id": "80000000-0000-4000-8000-000000000001",
+        "error": {
+          "code": "REVISION_CONFLICT",
+          "message": "Object metadata revision is stale.",
+          "details": { "latest_revision": 7 }
+        }
+      }
+    },
+    "validation_failed": {
+      "status": 422,
+      "body": {
+        "request_id": "80000000-0000-4000-8000-000000000002",
+        "error": {
+          "code": "VALIDATION_FAILED",
+          "message": "Validation failed.",
+          "details": [{ "path": "metadata.title", "code": "TOO_SMALL" }]
+        }
+      }
+    },
+    "locked": {
+      "status": 423,
+      "body": {
+        "request_id": "80000000-0000-4000-8000-000000000003",
+        "error": {
+          "code": "LOCKED",
+          "message": "Object is currently being edited by another user.",
+          "details": {
+            "locked_by": "10000000-0000-4000-8000-000000000002",
+            "locked_until": "2026-08-04T13:00:00.000Z"
+          }
+        }
+      }
+    }
+  }
+}

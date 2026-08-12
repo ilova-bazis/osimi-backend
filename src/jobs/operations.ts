@@ -7,6 +7,8 @@ import {
   listStuckIngestions,
 } from "../repos/ingestion-repo.ts";
 import { buildIngestionStagingDirectory, resolveStagingPath } from "../storage/staging.ts";
+import { claimVerifiedArchiveArtifactUploadAttemptBatch } from "../repos/archive-artifact-upload-attempt-repo.ts";
+import { finalizeClaimedArchiveArtifactUpload } from "../services/archive-artifact-finalization-service.ts";
 
 export interface StagingRetentionConfig {
   completedRetentionDays: number;
@@ -36,6 +38,33 @@ export interface StuckAttentionResult {
     updated_at: string;
     created_by: string;
   }>;
+}
+
+export interface ArtifactFinalizationResult {
+  claimed: number;
+  completed: number;
+  failed: number;
+}
+
+export async function runArtifactFinalizationSweep(config: {
+  batchSize?: number;
+  claimTimeoutSeconds?: number;
+} = {}): Promise<ArtifactFinalizationResult> {
+  const attempts = await claimVerifiedArchiveArtifactUploadAttemptBatch({
+    batchSize: config.batchSize ?? 25,
+    claimTimeoutSeconds: config.claimTimeoutSeconds ?? 300,
+  });
+  let completed = 0;
+  let failed = 0;
+  for (const attempt of attempts) {
+    try {
+      await finalizeClaimedArchiveArtifactUpload(attempt);
+      completed += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { claimed: attempts.length, completed, failed };
 }
 
 export async function runStagingRetentionSweep(config: StagingRetentionConfig): Promise<StagingRetentionResult> {

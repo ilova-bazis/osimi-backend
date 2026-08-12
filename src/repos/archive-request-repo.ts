@@ -1,12 +1,7 @@
-import { withSchemaClient } from "../db/client.ts";
+import { withExecutor, withSchemaClient, type SqlExecutor } from "../db/client.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
 
-export interface ArchiveRequestSqlExecutor {
-    <T = unknown>(
-        strings: TemplateStringsArray,
-        ...values: unknown[]
-    ): Promise<T>;
-}
+export type ArchiveRequestSqlExecutor = SqlExecutor;
 
 export type ArchiveRequestStatus =
     | "PENDING"
@@ -198,8 +193,9 @@ export async function createArchiveRequest(
 
 export async function findArchiveRequestById(params: {
     requestId: string;
+    executor?: SqlExecutor;
 }): Promise<ArchiveRequestRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ArchiveRequestRow[]>`
       SELECT id, tenant_id, target_type, target_id, action_type, action_payload,
              requested_by, dedupe_key, status, failure_reason, failure_details,
@@ -211,6 +207,23 @@ export async function findArchiveRequestById(params: {
     `;
     });
 
+    const row = rows[0];
+    return row ? mapArchiveRequest(row) : undefined;
+}
+
+export async function findArchiveRequestByIdForUpdate(params: {
+    requestId: string;
+    executor: SqlExecutor;
+}): Promise<ArchiveRequestRecord | undefined> {
+    const rows = await params.executor<ArchiveRequestRow[]>`
+      SELECT id, tenant_id, target_type, target_id, action_type, action_payload,
+             requested_by, dedupe_key, status, failure_reason, failure_details,
+             lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
+             created_at, updated_at, completed_at
+      FROM archive_requests
+      WHERE id = ${params.requestId}
+      FOR UPDATE
+    `;
     const row = rows[0];
     return row ? mapArchiveRequest(row) : undefined;
 }
@@ -427,8 +440,8 @@ export async function releaseArchiveRequestLease(params: {
     leaseId: string;
     leaseTokenId: string;
 }): Promise<ArchiveRequestRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
-        return await sql<ArchiveRequestRow[]>`
+    return await withSchemaClient(async (sql) => sql.begin(async (transaction) => {
+        const rows = await transaction<ArchiveRequestRow[]>`
       UPDATE archive_requests req
       SET status = 'PENDING',
           released_at = now(),
@@ -444,18 +457,26 @@ export async function releaseArchiveRequestLease(params: {
                 lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
                 created_at, updated_at, completed_at
     `;
-    });
-
-    const row = rows[0];
-    return row ? mapArchiveRequest(row) : undefined;
+        const row = rows[0];
+        if (!row) return undefined;
+        await transaction`
+          UPDATE archive_artifact_upload_attempts
+          SET invalidated_at = now(), updated_at = now()
+          WHERE request_id = ${params.requestId}
+            AND state = 'AUTHORIZED'
+            AND invalidated_at IS NULL
+        `;
+        return mapArchiveRequest(row);
+    }));
 }
 
 export async function completeArchiveRequest(params: {
     requestId: string;
     leaseId: string;
     leaseTokenId: string;
+    executor?: SqlExecutor;
 }): Promise<ArchiveRequestRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
+    const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ArchiveRequestRow[]>`
       UPDATE archive_requests req
       SET status = 'COMPLETED',
@@ -469,6 +490,8 @@ export async function completeArchiveRequest(params: {
         AND req.status = 'PROCESSING'
         AND req.lease_id = ${params.leaseId}
         AND req.lease_token_id = ${params.leaseTokenId}
+        AND req.released_at IS NULL
+        AND req.lease_expires_at > now()
       RETURNING id, tenant_id, target_type, target_id, action_type, action_payload,
                 requested_by, dedupe_key, status, failure_reason, failure_details,
                 lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
@@ -476,6 +499,58 @@ export async function completeArchiveRequest(params: {
     `;
     });
 
+    const row = rows[0];
+    return row ? mapArchiveRequest(row) : undefined;
+}
+
+export async function transferArchiveRequestUploadToBackend(params: {
+    requestId: string;
+    leaseId: string;
+    leaseTokenId: string;
+    executor: SqlExecutor;
+}): Promise<ArchiveRequestRecord | undefined> {
+    const rows = await params.executor<ArchiveRequestRow[]>`
+      UPDATE archive_requests req
+      SET released_at = now(),
+          lease_expires_at = NULL,
+          updated_at = now()
+      WHERE req.id = ${params.requestId}
+        AND req.action_type = 'artifact_fetch'
+        AND req.status = 'PROCESSING'
+        AND req.lease_id = ${params.leaseId}
+        AND req.lease_token_id = ${params.leaseTokenId}
+        AND req.released_at IS NULL
+        AND req.lease_expires_at > now()
+      RETURNING id, tenant_id, target_type, target_id, action_type, action_payload,
+                requested_by, dedupe_key, status, failure_reason, failure_details,
+                lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
+                created_at, updated_at, completed_at
+    `;
+    const row = rows[0];
+    return row ? mapArchiveRequest(row) : undefined;
+}
+
+export async function completeVerifiedArtifactRequest(params: {
+    requestId: string;
+    executor: SqlExecutor;
+}): Promise<ArchiveRequestRecord | undefined> {
+    const rows = await params.executor<ArchiveRequestRow[]>`
+      UPDATE archive_requests req
+      SET status = 'COMPLETED',
+          completed_at = COALESCE(req.completed_at, now()),
+          released_at = COALESCE(req.released_at, now()),
+          lease_expires_at = NULL,
+          failure_reason = NULL,
+          failure_details = NULL,
+          updated_at = now()
+      WHERE req.id = ${params.requestId}
+        AND req.action_type = 'artifact_fetch'
+        AND req.status = 'PROCESSING'
+      RETURNING id, tenant_id, target_type, target_id, action_type, action_payload,
+                requested_by, dedupe_key, status, failure_reason, failure_details,
+                lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
+                created_at, updated_at, completed_at
+    `;
     const row = rows[0];
     return row ? mapArchiveRequest(row) : undefined;
 }
@@ -587,8 +662,8 @@ export async function failArchiveRequest(params: {
     failureReason: string;
     failureDetails: JsonObject;
 }): Promise<ArchiveRequestRecord | undefined> {
-    const rows = await withSchemaClient(async (sql) => {
-        return await sql<ArchiveRequestRow[]>`
+    return await withSchemaClient(async (sql) => sql.begin(async (transaction) => {
+        const rows = await transaction<ArchiveRequestRow[]>`
       UPDATE archive_requests req
       SET status = 'FAILED',
           failure_reason = ${params.failureReason},
@@ -600,15 +675,24 @@ export async function failArchiveRequest(params: {
         AND req.status = 'PROCESSING'
         AND req.lease_id = ${params.leaseId}
         AND req.lease_token_id = ${params.leaseTokenId}
+        AND req.released_at IS NULL
+        AND req.lease_expires_at > now()
       RETURNING id, tenant_id, target_type, target_id, action_type, action_payload,
                 requested_by, dedupe_key, status, failure_reason, failure_details,
                 lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
                 created_at, updated_at, completed_at
     `;
-    });
-
-    const row = rows[0];
-    return row ? mapArchiveRequest(row) : undefined;
+        const row = rows[0];
+        if (!row) return undefined;
+        await transaction`
+          UPDATE archive_artifact_upload_attempts
+          SET invalidated_at = now(), updated_at = now()
+          WHERE request_id = ${params.requestId}
+            AND state = 'AUTHORIZED'
+            AND invalidated_at IS NULL
+        `;
+        return mapArchiveRequest(row);
+    }));
 }
 
 export async function findActiveArchiveRequestLeaseByToken(params: {
@@ -638,23 +722,32 @@ export async function findActiveArchiveRequestLeaseByToken(params: {
 }
 
 export async function sweepExpiredArchiveRequestLeases(): Promise<number> {
-    const rows = await withSchemaClient(async (sql) => {
-        return await sql<Array<{ count: number }>>`
-      WITH requeued AS (
-        UPDATE archive_requests req
-        SET status = 'PENDING',
-            released_at = now(),
-            lease_expires_at = NULL,
-            updated_at = now()
-        WHERE req.status = 'PROCESSING'
-          AND req.released_at IS NULL
-          AND req.lease_expires_at <= now()
-        RETURNING req.id
-      )
-      SELECT COUNT(*)::int AS count
-      FROM requeued
-    `;
-    });
-
-    return Number(rows[0]?.count ?? 0);
+    return await withSchemaClient(async (sql) => sql.begin(async (transaction) => {
+        const candidates = await transaction<Array<{ id: string }>>`
+          SELECT req.id
+          FROM archive_requests req
+          WHERE req.status = 'PROCESSING'
+            AND req.released_at IS NULL
+            AND req.lease_expires_at <= now()
+          FOR UPDATE SKIP LOCKED
+        `;
+        if (candidates.length === 0) return 0;
+        const ids = candidates.map((candidate) => candidate.id);
+        await transaction`
+          UPDATE archive_artifact_upload_attempts
+          SET invalidated_at = now(), updated_at = now()
+          WHERE request_id IN ${sql(ids)}
+            AND state = 'AUTHORIZED'
+            AND invalidated_at IS NULL
+        `;
+        const rows = await transaction<Array<{ id: string }>>`
+          UPDATE archive_requests
+          SET status = 'PENDING', released_at = now(), lease_expires_at = NULL, updated_at = now()
+          WHERE id IN ${sql(ids)}
+            AND status = 'PROCESSING'
+            AND released_at IS NULL
+          RETURNING id
+        `;
+        return rows.length;
+    }));
 }

@@ -4,6 +4,7 @@ import { ConfigurationError } from "../http/errors.ts";
 
 const MINIMUM_SIGNING_SECRET_LENGTH = 32;
 export const DEFAULT_MAX_UPLOAD_SIZE_BYTES = 2 * 1024 * 1024 * 1024;
+export const DEFAULT_MAX_ARTIFACT_SEARCH_TEXT_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_READINESS_TIMEOUT_MS = 1_000;
 export const DEFAULT_SHUTDOWN_GRACE_PERIOD_MS = 60_000;
 export const DEFAULT_CORS_ALLOWED_ORIGINS = [
@@ -19,6 +20,7 @@ export interface RuntimeConfig {
   uploadSigningSecret?: string;
   leaseSigningSecret?: string;
   maxUploadSizeBytes?: number;
+  maxArtifactSearchTextBytes?: number;
   readinessTimeoutMs?: number;
   shutdownGracePeriodMs?: number;
   corsAllowedOrigins?: readonly string[];
@@ -96,6 +98,17 @@ export function resolveMaxUploadSizeBytes(config: RuntimeConfig = getRuntimeConf
   );
 }
 
+export function resolveMaxArtifactSearchTextBytes(
+  config: RuntimeConfig = getRuntimeConfig(),
+): number {
+  return resolvePositiveInteger({
+    runtimeValue: config.maxArtifactSearchTextBytes,
+    environmentValue: process.env.MAX_ARTIFACT_SEARCH_TEXT_BYTES,
+    defaultValue: DEFAULT_MAX_ARTIFACT_SEARCH_TEXT_BYTES,
+    source: "MAX_ARTIFACT_SEARCH_TEXT_BYTES",
+  });
+}
+
 function normalizeCorsOrigin(value: string, source: string): string {
   const trimmedValue = value.trim();
 
@@ -159,6 +172,7 @@ export function resolveCorsAllowedOrigins(
 export function validateRuntimeConfiguration(config: RuntimeConfig = getRuntimeConfig()): void {
   validateSigningConfiguration(config);
   resolveMaxUploadSizeBytes(config);
+  resolveMaxArtifactSearchTextBytes(config);
   resolveCorsAllowedOrigins(config);
 }
 

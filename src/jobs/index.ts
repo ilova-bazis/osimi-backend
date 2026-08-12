@@ -1,4 +1,8 @@
-import { runStagingRetentionSweep, runStuckAttentionCheck } from "./operations.ts";
+import {
+  runArtifactFinalizationSweep,
+  runStagingRetentionSweep,
+  runStuckAttentionCheck,
+} from "./operations.ts";
 
 const DEFAULT_COMPLETED_RETENTION_DAYS = 7;
 const DEFAULT_FAILED_CANCELED_RETENTION_DAYS = 14;
@@ -7,6 +11,9 @@ const DEFAULT_RETENTION_INTERVAL_SECONDS = 300;
 const DEFAULT_STUCK_INTERVAL_SECONDS = 120;
 const DEFAULT_RETENTION_BATCH_SIZE = 25;
 const DEFAULT_RETENTION_CLAIM_TIMEOUT_SECONDS = 900;
+const DEFAULT_ARTIFACT_FINALIZATION_INTERVAL_SECONDS = 30;
+const DEFAULT_ARTIFACT_FINALIZATION_BATCH_SIZE = 25;
+const DEFAULT_ARTIFACT_FINALIZATION_CLAIM_TIMEOUT_SECONDS = 300;
 
 export interface JobRuntime {
   stop: () => Promise<void>;
@@ -117,6 +124,21 @@ export function startBackgroundJobs(): JobRuntime {
     DEFAULT_STUCK_INTERVAL_SECONDS,
     "STUCK_ATTENTION_INTERVAL_SECONDS",
   );
+  const artifactFinalizationIntervalSeconds = parseIntegerEnv(
+    process.env.ARTIFACT_FINALIZATION_INTERVAL_SECONDS,
+    DEFAULT_ARTIFACT_FINALIZATION_INTERVAL_SECONDS,
+    "ARTIFACT_FINALIZATION_INTERVAL_SECONDS",
+  );
+  const artifactFinalizationBatchSize = parseIntegerEnv(
+    process.env.ARTIFACT_FINALIZATION_BATCH_SIZE,
+    DEFAULT_ARTIFACT_FINALIZATION_BATCH_SIZE,
+    "ARTIFACT_FINALIZATION_BATCH_SIZE",
+  );
+  const artifactFinalizationClaimTimeoutSeconds = parseIntegerEnv(
+    process.env.ARTIFACT_FINALIZATION_CLAIM_TIMEOUT_SECONDS,
+    DEFAULT_ARTIFACT_FINALIZATION_CLAIM_TIMEOUT_SECONDS,
+    "ARTIFACT_FINALIZATION_CLAIM_TIMEOUT_SECONDS",
+  );
 
   const runRetention = async (): Promise<void> => {
     try {
@@ -160,9 +182,28 @@ export function startBackgroundJobs(): JobRuntime {
     }
   };
 
+  const runArtifactFinalization = async (): Promise<void> => {
+    try {
+      const result = await runArtifactFinalizationSweep({
+        batchSize: artifactFinalizationBatchSize,
+        claimTimeoutSeconds: artifactFinalizationClaimTimeoutSeconds,
+      });
+      logJobEvent(result.failed > 0 ? "WARN" : "INFO", "jobs.artifact_finalization", {
+        claimed: result.claimed,
+        completed: result.completed,
+        failed: result.failed,
+      });
+    } catch (error) {
+      logJobEvent("ERROR", "jobs.artifact_finalization.failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
   const activeJobs = new Set<Promise<void>>();
   let stopping = false;
   let retentionRunning = false;
+  let artifactFinalizationRunning = false;
   let stopPromise: Promise<void> | undefined;
 
   const track = (job: () => Promise<void>): void => {
@@ -187,8 +228,22 @@ export function startBackgroundJobs(): JobRuntime {
     }
   };
 
+  const runArtifactFinalizationSingleFlight = async (): Promise<void> => {
+    if (artifactFinalizationRunning) {
+      logJobEvent("INFO", "jobs.artifact_finalization.skipped", { reason: "already_running" });
+      return;
+    }
+    artifactFinalizationRunning = true;
+    try {
+      await runArtifactFinalization();
+    } finally {
+      artifactFinalizationRunning = false;
+    }
+  };
+
   track(runRetentionSingleFlight);
   track(runStuckAttention);
+  track(runArtifactFinalizationSingleFlight);
 
   const retentionTimer = setInterval(() => {
     track(runRetentionSingleFlight);
@@ -197,10 +252,14 @@ export function startBackgroundJobs(): JobRuntime {
   const stuckTimer = setInterval(() => {
     track(runStuckAttention);
   }, stuckIntervalSeconds * 1000);
+  const artifactFinalizationTimer = setInterval(() => {
+    track(runArtifactFinalizationSingleFlight);
+  }, artifactFinalizationIntervalSeconds * 1000);
 
   logJobEvent("INFO", "jobs.started", {
     retention_interval_seconds: retentionIntervalSeconds,
     stuck_interval_seconds: stuckIntervalSeconds,
+    artifact_finalization_interval_seconds: artifactFinalizationIntervalSeconds,
     completed_retention_days: completedRetentionDays,
     failed_canceled_retention_days: failedCanceledRetentionDays,
     batch_size: retentionBatchSize,
@@ -216,6 +275,7 @@ export function startBackgroundJobs(): JobRuntime {
       stopping = true;
       clearInterval(retentionTimer);
       clearInterval(stuckTimer);
+      clearInterval(artifactFinalizationTimer);
 
       logJobEvent("INFO", "jobs.stopped", {});
       stopPromise = Promise.all([...activeJobs]).then(() => undefined);

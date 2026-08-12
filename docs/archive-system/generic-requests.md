@@ -37,7 +37,7 @@ Each request includes:
 
 - identity: `id`, `tenant_id`
 - routing: `target_type`, `target_id`, `action_type`, `action_payload`
-- requester metadata: `requested_by`, `dedupe_key`
+- requester metadata: `requested_by`, `dedupe_key` (`string|null`; `null` has no keyed active-request deduplication identity)
 - status: `PENDING|PROCESSING|COMPLETED|FAILED|CANCELED`
 - failure: `failure_reason`, `failure_details`
 - timestamps: `created_at`, `updated_at`, `completed_at`
@@ -390,8 +390,12 @@ General handling:
   - missing/invalid worker auth token, invalid/expired lease token
   - fix credentials/token handling; do not blind retry
 - `409 CONFLICT`:
-  - lease no longer active (expired/released/stolen by timeout recovery)
-  - stop work for that lease context; reacquire with `/lease`
+  - when `error.details.reason` is `expected_checksum_mismatch`, the body was rejected before publication; correct or re-read the source bytes and retry the same upload URL while its token and lease remain active
+  - do not blindly resend the same rejected bytes, and do not call `/fail` solely for this recoverable mismatch
+  - when `error.details.reason` is `accepted_checkpoint_mismatch`, backend ownership has already transferred; never replace the checkpoint, do not call `/fail` or re-lease, and resend only the exact accepted bytes if acknowledgment requires it
+  - when `error.details.reason` is `accepted_checkpoint_storage_conflict`, stop upload retries and escalate backend storage repair
+  - when `error.details.reason` is `artifact_source_missing`, `artifact_source_identity_changed`, or `artifact_source_checksum_invalid`, fail the stale request; re-leasing cannot repair its persisted source identity
+  - for other conflicts, the lease or upload attempt may no longer be active; stop work for that lease context and reacquire with `/lease`
 - `500 CONFIGURATION_ERROR`:
   - backend worker auth not configured
   - operational fix required
@@ -441,10 +445,40 @@ loop:
     else:
       POST /api/archive-requests/:id/fail { lease_token: token, failure: unsupported_action }
   catch err:
-    POST /api/archive-requests/:id/fail { lease_token: token, failure: mapped_error }
+    if err.details.reason == "expected_checksum_mismatch":
+      correct or re-read source bytes and retry the same active upload URL
+      if correction cannot continue while the lease is active: release the lease
+    else if err.details.reason == "accepted_checkpoint_mismatch":
+      do not fail or re-lease backend-owned work; retry only exact accepted bytes if needed
+    else if err.details.reason == "accepted_checkpoint_storage_conflict":
+      stop upload retries and alert backend storage operations
+    else if err.details.reason in ["artifact_source_missing", "artifact_source_identity_changed", "artifact_source_checksum_invalid"]:
+      POST /api/archive-requests/:id/fail { lease_token: token, failure: stale_source_error }
+    else if err.status == 409:
+      stop the stale lease context and return to leasing; do not call /fail
+    else:
+      POST /api/archive-requests/:id/fail { lease_token: token, failure: mapped_error }
   finally:
     stop heartbeat timer
 ```
+
+An available-file source becoming inactive after queueing does not cancel the
+request. Presign still binds to that exact retained source and its known
+checksum. A missing source or changed artifact kind/variant returns a `409`
+source-identity reason before any upload authorization; malformed historical
+source checksums are rejected the same way. The worker must fail or quarantine
+that stale request rather than re-lease it or upload unverified replacement
+bytes.
+
+For `artifact_fetch`, a successful `PUT` is the durable handoff boundary. The
+backend owns the synchronized and checksum-verified immutable bytes from that
+point, may complete the request synchronously, and retries finalization in the
+background. Finalization revalidates the current file against the accepted size
+and SHA-256 before committing side effects. The worker still calls `/complete`
+as an idempotent acknowledgment. Once the upload is materialized, that
+acknowledgment does not read staged bytes or mutate or repair the search
+projection. Verified work is not reassigned or uploaded again if the worker
+exits after `PUT`.
 
 ## 11) Implementation checklist for archive team
 
@@ -454,7 +488,7 @@ loop:
 - Branch handler by `action_type`.
 - For `object_resync` and `curation_apply`, use `target_id` as canonical object id.
 - Use `/complete` on success, `/fail` on business failure, `/lease/release` on graceful abandonment.
-- Treat `409` as lease loss and stop current lease context.
+- Treat `409` as lease loss unless structured details identify a checksum case: `expected_checksum_mismatch` permits corrected bytes on the same active URL, `accepted_checkpoint_mismatch` permits only exact accepted bytes without fail/re-lease, and `accepted_checkpoint_storage_conflict` requires backend storage repair.
 - Retry transient network/server failures with jittered backoff.
 
 ## 12) Relationship to other worker guides

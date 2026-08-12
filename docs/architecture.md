@@ -73,7 +73,8 @@ sequenceDiagram
   User->>UI: Create ingestion + upload files
   UI->>VPS: Create ingestion
   UI->>VPS: Presign upload URLs
-  UI->>Staging: Upload files (signed URLs)
+  UI->>VPS: PUT files using signed upload URLs
+  VPS->>Staging: Stream and atomically promote uploads
   UI->>VPS: Commit upload + checksums
   User->>UI: Submit ingestion
   UI->>VPS: Submit ingestion
@@ -88,3 +89,9 @@ sequenceDiagram
   Worker->>VPS: Send aggregate INGESTION_COMPLETED after item outcomes
   VPS-->>UI: Updated status/activity
 ```
+
+Browser uploads can use a same-origin reverse proxy or a separately deployed
+public VPS API. In the separate-origin topology, the API must allow the exact
+UI origin through `CORS_ALLOWED_ORIGINS`, and the UI's `PUBLIC_API_BASE` must
+refer to that browser-reachable API origin. Server-side UI requests may use a
+separate private API address.

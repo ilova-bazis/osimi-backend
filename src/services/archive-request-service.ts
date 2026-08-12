@@ -2,6 +2,7 @@ import { ConflictError, ValidationError } from "../http/errors.ts";
 import {
   authorizeWorkerLeaseForArchiveRequest,
   createArchiveRequestLeaseToken,
+  parseArchiveRequestLeaseToken,
 } from "../auth/worker-archive-request.ts";
 import {
   finalizeArtifactFetchArchiveRequest,
@@ -11,6 +12,7 @@ import {
   completeArchiveRequest,
   extendArchiveRequestLease,
   failArchiveRequest,
+  findArchiveRequestById,
   leaseNextPendingArchiveRequest,
   releaseArchiveRequestLease,
   sweepExpiredArchiveRequestLeases,
@@ -243,9 +245,14 @@ export async function completeArchiveRequestByWorker(params: {
   requestId: string;
   body: WorkerCompleteArchiveRequestBody;
 }): Promise<WorkerCompleteArchiveRequestResponse> {
+  const tokenPayload = parseArchiveRequestLeaseToken(params.body.lease_token, {
+    allowExpired: true,
+  });
   const authorizedLease = await authorizeWorkerLeaseForArchiveRequest({
     requestId: params.requestId,
     leaseToken: params.body.lease_token,
+    requireActiveLease: false,
+    allowExpired: tokenPayload.action_type === "artifact_fetch",
   });
 
   if (authorizedLease.actionType === "artifact_fetch") {
@@ -255,18 +262,25 @@ export async function completeArchiveRequestByWorker(params: {
       );
     }
 
-    await finalizeArtifactFetchArchiveRequest({
+    const finalized = await finalizeArtifactFetchArchiveRequest({
       requestId: params.requestId,
       leaseToken: params.body.lease_token,
       uploadToken: params.body.upload_token,
     });
+    return {
+      status: "completed",
+      request: serializeArchiveRequest(finalized.request),
+    };
   }
 
-  const completed = await completeArchiveRequest({
-    requestId: authorizedLease.requestId,
-    leaseId: authorizedLease.leaseId,
-    leaseTokenId: authorizedLease.leaseTokenId,
-  });
+  const current = await findArchiveRequestById({ requestId: authorizedLease.requestId });
+  const completed = current?.status === "COMPLETED"
+    ? current
+    : await completeArchiveRequest({
+        requestId: authorizedLease.requestId,
+        leaseId: authorizedLease.leaseId,
+        leaseTokenId: authorizedLease.leaseTokenId,
+      });
 
   if (!completed) {
     throw new ConflictError("Lease is no longer active.");

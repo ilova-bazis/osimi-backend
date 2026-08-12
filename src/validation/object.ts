@@ -1,6 +1,8 @@
 import { decodeCursor } from "../http/pagination.ts";
 import { z } from "zod";
 
+import { parseMediaType } from "../http/media-type.ts";
+
 import type { JsonObject } from "./ingestion.ts";
 import { jsonObjectSchema } from "./ingestion.ts";
 import {
@@ -338,7 +340,15 @@ export const objectListQuerySchema = z.strictObject({
     limit: z.coerce.number().int().min(1).max(200).default(50),
     cursor: z.string().trim().min(1).optional(),
     sort: objectListSortSchema.default("created_at_desc"),
-    q: z.string().trim().min(1).optional(),
+    q: z
+        .string()
+        .trim()
+        .max(256)
+        .refine((value) => !value.includes("\0"), {
+            message: "Search query must not contain NUL characters.",
+        })
+        .transform((value) => value || undefined)
+        .optional(),
     availability_state: availabilityStateSchema.optional(),
     access_level: accessLevelSchema.optional(),
     language: z.string().trim().min(1).optional(),
@@ -570,7 +580,10 @@ export const workerLeaseArchiveRequestBodySchema = z.strictObject({
 
 export const workerPresignObjectArtifactUploadBodySchema = z.strictObject({
     lease_token: z.string().trim().min(1),
-    content_type: z.string().trim().min(1),
+    content_type: z.string().trim().min(1).refine(
+        (value) => parseMediaType(value) !== undefined,
+        "Expected a valid HTTP media type.",
+    ),
     size_bytes: z.number().int().min(0),
     extension: z.string().trim().min(1),
 });
@@ -630,7 +643,13 @@ const replaceObjectAvailableFilesItemSchema = z
         display_name: z.string().trim().min(1),
         content_type: z.string().trim().min(1).nullable().optional(),
         size_bytes: z.number().int().min(0).nullable().optional(),
-        checksum_sha256: z.string().trim().min(1).nullable().optional(),
+        checksum_sha256: z
+            .string()
+            .trim()
+            .regex(/^[0-9A-Fa-f]{64}$/, "Expected a 64-character SHA-256 checksum.")
+            .transform((value) => value.toLowerCase())
+            .nullable()
+            .optional(),
         metadata: jsonObjectSchema.optional(),
         is_available: z.boolean().optional(),
     })

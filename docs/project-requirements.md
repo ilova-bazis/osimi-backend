@@ -72,7 +72,7 @@ All endpoints must be tenant-aware.
 ### Object Editing Authorization
 
 - Object editing first requires the endpoint's role gate: mutations and edit-lock operations require `archiver` or `admin`; edit history permits `viewer`, `archiver`, or `admin`.
-- After the role gate, object access assignments govern title changes, edit-detail access, metadata, curation, curation submission, edit history, and edit-lock release.
+- After the role gate, object access assignments govern edit-detail access, metadata, curation, curation submission, edit history, and edit-lock release.
 - `public` objects require no assignment; `family` objects require a `family` or `private` assignment; `private` objects require a `private` assignment.
 - `admin` bypasses object assignment checks. Embargo and artifact availability do not limit editing authorization.
 - An in-tenant object denied by this policy returns `403 FORBIDDEN`; missing or cross-tenant objects return `404 NOT_FOUND`.
@@ -592,6 +592,23 @@ Committed ingestion files may expose temporary upload previews from VPS staging 
 - `PUT /api/objects/:object_id/access-assignments` (admin)
 - `DELETE /api/objects/:object_id/access-assignments/:user_id` (admin)
 
+#### Object Search (`GET /api/objects?q=...`)
+
+- V1 search uses case-insensitive literal substring matching and does not return ranking or snippets.
+- `q` is trimmed before use. An empty trimmed value is equivalent to omitting `q`; a trimmed value longer than 256 characters is rejected with `400 BAD_REQUEST`.
+- `%`, `_`, and `\` in `q` are literal characters, not SQL pattern syntax, and must be escaped before pattern matching.
+- Tenant-catalog matching continues to include object `title` and `object_id` for every object otherwise visible in the tenant-scoped list.
+- Content search includes only text already materialized in the backend: eligible OCR/transcript artifact bodies and `object_curated_document_pages.curated_text`. The API does not extract text from arbitrary PDF, image, audio, or video bytes; those files become content-searchable only after a separate OCR/transcript text artifact is materialized and indexed.
+- Artifact-derived matching includes materialized `object_artifacts` metadata (`id`, `kind`, `variant`, `content_type`) and, when authoritative persisted materialization provenance associates the artifact with an `object_available_files` source, that source's `display_name` and `archive_file_key`. The association must not be inferred from `kind`/`variant`; available-file inventory that has not been materialized is not searchable.
+- Artifact-derived metadata, indexed artifact bodies, and curated page text may contribute a match only when the requester currently satisfies all effective content-view conditions: endpoint role, access-level/assignment authorization (including the admin override), no active embargo, and object `availability_state = AVAILABLE`. This decision is evaluated when the search runs so stale index terms cannot disclose a match after access changes.
+- Indexing accepts only successfully materialized, decodable text bodies for OCR/transcript artifact kinds; binary media is never passed through an extractor by this API. Empty, malformed/non-text, unavailable, or over-limit artifact bodies are not indexed.
+- The maximum indexable text-body size is deployment-configurable and enforced per artifact before indexing. Use a conservative default of 10 MiB; the implementation phase will choose and document the configuration name.
+- A fully received artifact upload becomes a durable backend-owned checkpoint only after its temporary file bytes and immutable directory entry are synchronized and its active lease, byte length, immutable storage key, and computed checksum are verified together. Verified uploads are never returned to the worker queue. The backend retries finalization without transferring the bytes again, and revalidates the current regular file size and SHA-256 before committing finalization side effects. An AUTHORIZED attempt whose persisted archive-request lease is obviously expired, released, or mismatched is rejected before the request body is staged; the transactional lease check remains authoritative for concurrent races, and VERIFIED/MATERIALIZED retries stay exempt from active-lease requirements.
+- Artifact bytes that differ from a known source checksum are rejected before immutable publication and create no checkpoint. The attempt remains worker-owned and authorized, and corrected bytes may retry the same signed URL while its token and lease remain active.
+- Marking an available-file source inactive prevents new selection but does not invalidate an already queued `artifact_fetch`. Presign resolves that request's exact tenant/object/source identity, preserves its known checksum even while inactive, and rejects a missing, kind/variant-changed, or malformed-checksum source before creating an upload attempt. Available-file SHA-256 values are validated and normalized to lowercase when synchronized; the captured expected checksum is immutable for its attempt.
+- Artifact presign accepts a valid HTTP media type and preserves that complete declared value in its header, token, attempt, and materialized artifact. Upload authorization compares the signed and received base media type case-insensitively and ignores parameters; missing, malformed, or different base types are rejected before staging.
+- Artifact finalization binds to the verified upload's exact storage key. Artifact creation, search provenance/text, per-page metadata, upload-attempt materialization, and archive-request completion commit in one database transaction.
+
 ---
 
 ### Event Ingestion (Worker → VPS)
@@ -637,6 +654,10 @@ Backend must expose a storage interface supporting:
 - A retry using the active URL may repeat only identical bytes; a conflicting body is rejected
 - Re-presign is allowed before commit, creates a new key and token, and invalidates the prior URL
 - Upload URLs cannot be used after the file or artifact is committed
+- Once staging purge begins, its public state is `PENDING`; affected ingestion actions are unavailable and clients must use backend action capabilities rather than file preview state
+- Completed staging purge has public state `PURGED`; ingestion metadata remains readable but staging-dependent actions remain unavailable
+- Direct browser upload endpoints allow only deployment-configured exact UI origins; wildcard and credentialed CORS are not supported
+- Missing CORS configuration preserves local development origins; production deployments must configure exact UI origins or use a same-origin proxy
 - Worker download URLs are issued only with a valid lease
 - Worker download URLs are `GET` only, valid for 5 minutes, and refreshable on heartbeat
 - URL issuance must be audited (who, what, when, TTL)
