@@ -37,10 +37,24 @@ coordinate the worker/client rollout.
 
 - `MAX_UPLOAD_SIZE_BYTES`: maximum signed upload size and streamed request body
   size. Defaults to `2147483648` (2 GiB) and must be a positive safe integer.
+- `MAX_ARTIFACT_SEARCH_TEXT_BYTES`: maximum materialized OCR/transcript text
+  body read for indexing. Defaults to `10485760` (10 MiB) and must be a
+  positive safe integer. Larger artifacts remain materialized but are skipped
+  by text indexing.
 
 Every presign receives a unique immutable staging key. Re-presigning a pending
 file or artifact invalidates the earlier URL; uploads stream to a temporary
-file and are atomically promoted without replacing an existing object.
+file, synchronize its bytes, publish it without replacing an existing object,
+and synchronize the containing directory entry. Artifact uploads are durably
+checkpointed only after the active lease, exact size, and checksum are verified.
+At that point ownership transfers to the backend: artifact creation, search
+projection, page metadata, and request completion are finalized atomically and
+retried by a background reconciler without asking another worker to re-upload.
+Finalization revalidates the stored regular file against the checkpoint. These
+guarantees require POSIX-compatible same-filesystem hard links plus file and
+directory `fsync`; unsupported storage fails closed rather than acknowledging a
+non-durable checkpoint. The backend service identity must be the only writer
+with permission to create, replace, or unlink paths below the staging root.
 
 ## CORS and UI Deployment
 
@@ -129,6 +143,19 @@ the listener rejects new connections while active requests and jobs drain.
 drains and exits `0`; a deadline expiry or second signal force-closes resources
 and exits `1`.
 
+After deploying the artifact search-document migration, index existing
+materialized OCR/transcript text from the configured `STAGING_ROOT`:
+
+```bash
+DATABASE_URL=postgres://... bun run backfill-artifact-search-text --batch-size 100
+```
+
+The operation scans all tenants, is safe to rerun, and does not rewrite rows
+whose text is already indexed. Missing, unsupported, malformed, empty, and
+over-limit artifacts remain retryable on a later run. It exits nonzero if any
+artifact failed unexpectedly; review the content-free failure identifiers and
+rerun after correcting the cause.
+
 ## Auth Endpoints
 
 - `POST /api/auth/login`
@@ -163,3 +190,6 @@ Optional environment variables:
 - `STUCK_ATTENTION_INTERVAL_SECONDS` (default: `120`)
 - `STAGING_RETENTION_BATCH_SIZE` (default: `25`)
 - `STAGING_RETENTION_CLAIM_TIMEOUT_SECONDS` (default: `900`)
+- `ARTIFACT_FINALIZATION_INTERVAL_SECONDS` (default: `30`)
+- `ARTIFACT_FINALIZATION_BATCH_SIZE` (default: `25`)
+- `ARTIFACT_FINALIZATION_CLAIM_TIMEOUT_SECONDS` (default: `300`)
