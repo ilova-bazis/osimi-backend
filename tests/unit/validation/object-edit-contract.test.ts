@@ -42,5 +42,9 @@ describe("object edit contract fixtures", () => {
     expect(fixture.errors.revision_conflict).toMatchObject({ status: 409, body: { error: { code: "REVISION_CONFLICT" } } });
     expect(fixture.errors.validation_failed).toMatchObject({ status: 422, body: { error: { code: "VALIDATION_FAILED" } } });
     expect(fixture.errors.locked).toMatchObject({ status: 423, body: { error: { code: "LOCKED" } } });
+    expect(fixture.errors.publication_already_active).toMatchObject({
+      status: 409,
+      body: { error: { code: "PUBLICATION_ALREADY_ACTIVE" } },
+    });
   });
 });

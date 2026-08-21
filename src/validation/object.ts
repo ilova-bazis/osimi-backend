@@ -280,6 +280,20 @@ export const submitObjectCurationResponseSchema = z.object({
     submitted_by: z.string(),
 }).strict();
 
+export const objectCurationPublicationResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    request: z.object({
+        id: z.uuid(),
+        status: z.enum(["PENDING", "PROCESSING", "COMPLETED", "FAILED", "CANCELED"]),
+        failure_reason: z.string().nullable(),
+        publication_revision: z.number().int().min(1).nullable(),
+        target_version: z.string().nullable(),
+        created_at: z.string(),
+        updated_at: z.string(),
+        completed_at: z.string().nullable(),
+    }).nullable(),
+}).strict();
+
 export const releaseObjectEditLockResponseSchema = z.object({
     object_id: objectIdParamSchema,
     released: z.boolean(),
@@ -1275,6 +1289,9 @@ export type PutDocumentCurationResponse = z.infer<
 >;
 export type SubmitObjectCurationResponse = z.infer<
     typeof submitObjectCurationResponseSchema
+>;
+export type ObjectCurationPublicationResponse = z.infer<
+    typeof objectCurationPublicationResponseSchema
 >;
 export type CreateObjectDownloadRequestResponse = z.infer<
     typeof createObjectDownloadRequestResponseSchema

@@ -1,4 +1,5 @@
 import { rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 
 import { encodeCursor } from "../http/pagination.ts";
 import {
@@ -6,6 +7,7 @@ import {
   ForbiddenError,
   LockedError,
   NotFoundError,
+  PublicationAlreadyActiveError,
   RevisionConflictError,
   UnprocessableEntityError,
 } from "../http/errors.ts";
@@ -23,15 +25,20 @@ import {
   updateObjectEditMetadata,
   type ObjectEditRecord,
 } from "../repos/object-edit-repo.ts";
+import { findCurrentCurationApplyByObject } from "../repos/archive-request-repo.ts";
 import {
-  buildObjectArtifactStorageKey,
-  createDownloadToken,
+  findCurationPublicationByIdentity,
+  findCurationPublicationByRequestId,
+} from "../repos/curation-publication-repo.ts";
+import {
+  buildCurationPublicationSourceStorageKey,
   resolveStagingPath,
 } from "../storage/staging.ts";
 import type {
   ObjectEditHistoryQuery,
   ObjectEditHistoryResponse,
   ObjectEditResponse,
+  ObjectCurationPublicationResponse,
   PatchObjectMetadataBody,
   PatchObjectMetadataResponse,
   PutDocumentCurationBody,
@@ -379,6 +386,40 @@ export async function putDocumentCurationForTenant(params: {
   };
 }
 
+export async function getObjectCurationPublicationForTenant(params: {
+  auth: AuthenticatedContext;
+  objectId: string;
+}): Promise<ObjectCurationPublicationResponse> {
+  await requireObjectEditAccess({
+    auth: params.auth,
+    objectId: params.objectId,
+  });
+
+  const request = await findCurrentCurationApplyByObject({
+    tenantId: params.auth.tenantId,
+    objectId: params.objectId,
+  });
+  const publication = request
+    ? await findCurationPublicationByRequestId({ requestId: request.id })
+    : undefined;
+
+  return {
+    object_id: params.objectId,
+    request: request
+      ? {
+          id: request.id,
+          status: request.status,
+          failure_reason: request.failureReason,
+          publication_revision: publication?.publicationRevision ?? null,
+          target_version: publication?.targetVersion ?? null,
+          created_at: request.createdAt.toISOString(),
+          updated_at: request.updatedAt.toISOString(),
+          completed_at: request.completedAt?.toISOString() ?? null,
+        }
+      : null,
+  };
+}
+
 export async function submitObjectCurationForTenant(params: {
   auth: AuthenticatedContext;
   objectId: string;
@@ -408,6 +449,67 @@ export async function submitObjectCurationForTenant(params: {
     );
   }
 
+  const publicationRevision = params.body.revision + 1;
+  const stableIdempotencyKey = `${params.objectId}:ocr_curated:vpsrev-${publicationRevision}`;
+  const exactPublication = await findCurationPublicationByIdentity({
+    tenantId: params.auth.tenantId,
+    objectId: params.objectId,
+    curatedKind: "ocr_curated",
+    publicationRevision,
+  });
+  if (
+    exactPublication?.requestStatus &&
+    exactPublication.requestedBy &&
+    exactPublication.requestCreatedAt
+  ) {
+    return {
+      object_id: params.objectId,
+      revision: publicationRevision,
+      curation_state: record.curationState,
+      request: {
+        id: exactPublication.requestId,
+        action_type: "curation_apply",
+        status: exactPublication.requestStatus,
+      },
+      submitted_at: exactPublication.requestCreatedAt.toISOString(),
+      submitted_by: exactPublication.requestedBy,
+    };
+  }
+
+  const currentPublication = await findCurrentCurationApplyByObject({
+    tenantId: params.auth.tenantId,
+    objectId: params.objectId,
+  });
+  const legacyExactRetry = currentPublication?.dedupeKey?.endsWith(
+    `:vpsrev-${publicationRevision}`,
+  ) ?? false;
+  if (currentPublication && legacyExactRetry) {
+    return {
+      object_id: params.objectId,
+      revision: publicationRevision,
+      curation_state: record.curationState,
+      request: {
+        id: currentPublication.id,
+        action_type: "curation_apply",
+        status: currentPublication.status,
+      },
+      submitted_at: currentPublication.createdAt.toISOString(),
+      submitted_by: currentPublication.requestedBy,
+    };
+  }
+  if (
+    currentPublication?.status === "PENDING" ||
+    currentPublication?.status === "PROCESSING"
+  ) {
+    throw new PublicationAlreadyActiveError(
+      "A curation publication is already active for this object.",
+      {
+        existing_request_id: currentPublication.id,
+        existing_request_status: currentPublication.status,
+      },
+    );
+  }
+
   const documentPayload = await buildDocumentCurationPayload(record);
   if (documentPayload.pages.length === 0) {
     throw new ConflictError("Document page projection is unavailable for OCR submission.", {
@@ -419,98 +521,125 @@ export async function submitObjectCurationForTenant(params: {
   const submittedText = await buildSubmittedDocumentText(record);
   const requestId = crypto.randomUUID();
   const utcDay = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-  const nextRevision = record.revision + 1;
   const targetVersion = utcDay;
-  const idempotencyKey = `${params.objectId}:ocr_curated:${utcDay}:vpsrev-${nextRevision}`;
-  const storageKey = buildObjectArtifactStorageKey({
+  const storageKey = buildCurationPublicationSourceStorageKey({
     tenantId: params.auth.tenantId,
     objectId: params.objectId,
     requestId,
-    artifactKind: "ocr_text_curated_submit",
-    variant: targetVersion,
     extension: "txt",
   });
   const filePath = resolveStagingPath(storageKey);
-  await Bun.write(filePath, submittedText);
-  const file = Bun.file(filePath);
-  const sizeBytes = file.size;
-  const downloadToken = createDownloadToken({
-    ingestion_id: params.objectId,
-    file_id: requestId,
-    tenant_id: params.auth.tenantId,
-    storage_key: storageKey,
-    content_type: "text/plain; charset=utf-8",
-    size_bytes: sizeBytes,
-    expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-  });
+  let keepStagedPublication = false;
+  let sourceWritten = false;
 
-  const result = await submitDocumentCuration({
-    tenantId: params.auth.tenantId,
-    objectId: params.objectId,
-    actorUserId: params.auth.userId,
-    actorRole: params.auth.role,
-    revision: params.body.revision,
-    requestId,
-    idempotencyKey,
-    actionPayload: {
-      object_id: params.objectId,
-      curated_kind: "ocr_curated",
-      target_version: targetVersion,
-      source_ref: {
-        type: "signed_download_url",
-        url: `/api/worker/downloads/${downloadToken}`,
+  try {
+    await Bun.write(filePath, submittedText);
+    sourceWritten = true;
+    const file = Bun.file(filePath);
+    const sizeBytes = file.size;
+    const checksumSha256 = createHash("sha256").update(submittedText).digest("hex");
+    const result = await submitDocumentCuration({
+      tenantId: params.auth.tenantId,
+      objectId: params.objectId,
+      actorUserId: params.auth.userId,
+      actorRole: params.auth.role,
+      revision: params.body.revision,
+      requestId,
+      idempotencyKey: stableIdempotencyKey,
+      publicationRevision,
+      targetVersion,
+      source: {
+        storageKey,
+        contentType: "text/plain; charset=utf-8",
+        sizeBytes,
+        checksumSha256,
       },
-      content_type: "text/plain",
-      idempotency_key: idempotencyKey,
-    },
-    reviewNote: params.body.review_note,
-  });
-
-  if (result.status === "not_found") {
-    throw new NotFoundError(`Object '${params.objectId}' was not found.`);
-  }
-
-  if (result.status === "unauthorized") {
-    await rm(filePath, { force: true });
-    throw new ForbiddenError("You are not authorized to edit this object.");
-  }
-
-  if (result.status === "locked") {
-    await rm(filePath, { force: true });
-    throw new LockedError("Object is currently being edited by another user.", {
-      locked_by: result.lockedBy,
-      locked_until: result.lockedUntil.toISOString(),
-    });
-  }
-
-  if (result.status === "invalid_media_type") {
-    throw new ConflictError(
-      "Submit is only supported for document OCR curation in the current implementation.",
-      {
-        code: "INVALID_MEDIA_TYPE_FOR_DOCUMENT_CURATION",
+      actionPayload: {
         object_id: params.objectId,
+        curated_kind: "ocr_curated",
+        publication_revision: publicationRevision,
+        target_version: targetVersion,
+        source_ref: {
+          type: "request_source",
+          url: `/api/archive-requests/${requestId}/source`,
+        },
+        content_type: "text/plain; charset=utf-8",
+        size_bytes: sizeBytes,
+        checksum_sha256: checksumSha256,
+        idempotency_key: stableIdempotencyKey,
       },
-    );
-  }
-
-  if (result.status === "revision_conflict") {
-    throw new RevisionConflictError("Document curation revision is stale.", {
-      latest_revision: result.latestRevision,
+      reviewNote: params.body.review_note,
     });
-  }
 
-  return {
-    object_id: result.record.objectId,
-    revision: result.record.revision,
-    curation_state: result.record.curationState,
-    request: {
-      id: result.request.id,
-      action_type: result.request.actionType,
-      status: result.request.status,
-    },
-    submitted_at: (result.record.editUpdatedAt ?? result.record.updatedAt).toISOString(),
-    submitted_by: params.auth.userId,
-  };
+    if (result.status === "not_found") {
+      throw new NotFoundError(`Object '${params.objectId}' was not found.`);
+    }
+
+    if (result.status === "unauthorized") {
+      throw new ForbiddenError("You are not authorized to edit this object.");
+    }
+
+    if (result.status === "locked") {
+      throw new LockedError("Object is currently being edited by another user.", {
+        locked_by: result.lockedBy,
+        locked_until: result.lockedUntil.toISOString(),
+      });
+    }
+
+    if (result.status === "invalid_media_type") {
+      throw new ConflictError(
+        "Submit is only supported for document OCR curation in the current implementation.",
+        {
+          code: "INVALID_MEDIA_TYPE_FOR_DOCUMENT_CURATION",
+          object_id: params.objectId,
+        },
+      );
+    }
+
+    if (result.status === "publication_active") {
+      throw new PublicationAlreadyActiveError(
+        "A curation publication is already active for this object.",
+        {
+          existing_request_id: result.request.id,
+          existing_request_status: result.request.status,
+        },
+      );
+    }
+
+    if (result.status === "revision_conflict") {
+      throw new RevisionConflictError("Document curation revision is stale.", {
+        latest_revision: result.latestRevision,
+      });
+    }
+
+    keepStagedPublication = result.status === "submitted";
+
+    return {
+      object_id: result.record.objectId,
+      revision: result.record.revision,
+      curation_state: result.record.curationState,
+      request: {
+        id: result.request.id,
+        action_type: result.request.actionType,
+        status: result.request.status,
+      },
+      submitted_at: result.request.createdAt.toISOString(),
+      submitted_by: result.request.requestedBy,
+    };
+  } finally {
+    if (!keepStagedPublication && sourceWritten) {
+      try {
+        await rm(filePath, { force: true });
+      } catch (cleanupError) {
+        console.error("curation_publication_source_cleanup_failed", {
+          object_id: params.objectId,
+          request_id: requestId,
+          storage_key: storageKey,
+          error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        });
+      }
+    }
+  }
 }
 
 export async function releaseObjectEditLockForTenant(params: {

@@ -1,4 +1,5 @@
 import { rm, stat } from "node:fs/promises";
+import { dirname } from "node:path";
 
 import {
   claimStagingPurgeBatch,
@@ -9,6 +10,13 @@ import {
 import { buildIngestionStagingDirectory, resolveStagingPath } from "../storage/staging.ts";
 import { claimVerifiedArchiveArtifactUploadAttemptBatch } from "../repos/archive-artifact-upload-attempt-repo.ts";
 import { finalizeClaimedArchiveArtifactUpload } from "../services/archive-artifact-finalization-service.ts";
+import {
+  claimCurationPublicationCleanupBatch,
+  completeCurationPublicationCleanup,
+  curationPublicationStorageKeyExists,
+  failCurationPublicationCleanup,
+} from "../repos/curation-publication-repo.ts";
+import { stagingRootPath } from "../storage/staging.ts";
 
 export interface StagingRetentionConfig {
   completedRetentionDays: number;
@@ -44,6 +52,61 @@ export interface ArtifactFinalizationResult {
   claimed: number;
   completed: number;
   failed: number;
+}
+
+export interface CurationPublicationSourceCleanupResult extends StagingRetentionResult {
+  orphaned: number;
+}
+
+export async function runCurationPublicationSourceCleanup(config: {
+  batchSize?: number;
+  claimTimeoutSeconds?: number;
+  orphanMinAgeSeconds?: number;
+} = {}): Promise<CurationPublicationSourceCleanupResult> {
+  const claims = await claimCurationPublicationCleanupBatch({
+    batchSize: config.batchSize ?? 25,
+    claimTimeoutSeconds: config.claimTimeoutSeconds ?? 900,
+  });
+  let purged = 0;
+  let missing = 0;
+  let failed = 0;
+  let orphaned = 0;
+
+  for (const claim of claims) {
+    const path = resolveStagingPath(claim.storageKey);
+    const existed = await stat(path).then(() => true).catch(() => false);
+    try {
+      await rm(path, { force: true });
+      if (await completeCurationPublicationCleanup(claim)) {
+        purged += 1;
+        if (!existed) missing += 1;
+      }
+    } catch (error) {
+      failed += 1;
+      await failCurationPublicationCleanup({
+        claim,
+        message: error instanceof Error ? error.message : "filesystem_error",
+      });
+    }
+  }
+
+  const orphanCutoff = Date.now() - (config.orphanMinAgeSeconds ?? 86_400) * 1_000;
+  const sourceGlob = new Bun.Glob("tenants/*/archive-request-sources/*/*/source.*");
+  for await (const storageKey of sourceGlob.scan({ cwd: stagingRootPath(), onlyFiles: true })) {
+    try {
+      const path = resolveStagingPath(storageKey);
+      const file = await stat(path);
+      if (file.mtimeMs > orphanCutoff || await curationPublicationStorageKeyExists(storageKey)) {
+        continue;
+      }
+      await rm(dirname(path), { recursive: true, force: true });
+      orphaned += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+
+  return { claimed: claims.length, purged, missing, failed, orphaned };
 }
 
 export async function runArtifactFinalizationSweep(config: {

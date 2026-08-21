@@ -123,6 +123,11 @@ export interface FindActiveArchiveRequestByDedupeKeyParams {
     dedupeKey: string;
 }
 
+export interface FindActiveCurationApplyByObjectParams {
+    tenantId: string;
+    objectId: string;
+}
+
 function mapArchiveRequest(row: ArchiveRequestRow): ArchiveRequestRecord {
     return {
         id: row.id,
@@ -181,6 +186,37 @@ export async function createArchiveRequestWithExecutor(
     `;
 
     return mapArchiveRequest(rows[0]!);
+}
+
+export async function tryCreateCurationApplyArchiveRequestWithExecutor(
+    executor: ArchiveRequestSqlExecutor,
+    params: CreateArchiveRequestParams & { actionType: "curation_apply" },
+): Promise<ArchiveRequestRecord | undefined> {
+    const rows = await executor<ArchiveRequestRow[]>`
+      INSERT INTO archive_requests (
+        id, tenant_id, target_type, target_id, action_type, action_payload,
+        requested_by, dedupe_key, status
+      )
+      VALUES (
+        ${params.requestId ?? crypto.randomUUID()},
+        ${params.tenantId},
+        ${params.targetType}::archive_request_target_type,
+        ${params.targetId},
+        ${params.actionType}::archive_request_action_type,
+        ${params.actionPayload},
+        ${params.requestedBy},
+        ${params.dedupeKey ?? null},
+        'PENDING'
+      )
+      ON CONFLICT DO NOTHING
+      RETURNING id, tenant_id, target_type, target_id, action_type, action_payload,
+                requested_by, dedupe_key, status, failure_reason, failure_details,
+                lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
+                created_at, updated_at, completed_at
+    `;
+
+    const row = rows[0];
+    return row ? mapArchiveRequest(row) : undefined;
 }
 
 export async function createArchiveRequest(
@@ -258,6 +294,56 @@ export async function findActiveArchiveRequestByDedupeKey(
             sql,
             params,
         );
+    });
+}
+
+export async function findActiveCurationApplyByObjectWithExecutor(
+    executor: ArchiveRequestSqlExecutor,
+    params: FindActiveCurationApplyByObjectParams,
+): Promise<ArchiveRequestRecord | undefined> {
+    const rows = await executor<ArchiveRequestRow[]>`
+      SELECT id, tenant_id, target_type, target_id, action_type, action_payload,
+             requested_by, dedupe_key, status, failure_reason, failure_details,
+             lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
+             created_at, updated_at, completed_at
+      FROM archive_requests req
+      WHERE req.tenant_id = ${params.tenantId}
+        AND req.target_type = 'object'
+        AND req.target_id = ${params.objectId}
+        AND req.action_type = 'curation_apply'
+        AND req.status IN ('PENDING', 'PROCESSING')
+      ORDER BY req.created_at DESC, req.id DESC
+      LIMIT 1
+    `;
+
+    const row = rows[0];
+    return row ? mapArchiveRequest(row) : undefined;
+}
+
+export async function findCurrentCurationApplyByObject(params: {
+    tenantId: string;
+    objectId: string;
+}): Promise<ArchiveRequestRecord | undefined> {
+    return await withSchemaClient(async (sql) => {
+        const rows = await sql<ArchiveRequestRow[]>`
+          SELECT id, tenant_id, target_type, target_id, action_type, action_payload,
+                 requested_by, dedupe_key, status, failure_reason, failure_details,
+                 lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
+                 created_at, updated_at, completed_at
+          FROM archive_requests req
+          WHERE req.tenant_id = ${params.tenantId}
+            AND req.target_type = 'object'
+            AND req.target_id = ${params.objectId}
+            AND req.action_type = 'curation_apply'
+          ORDER BY
+            (req.status IN ('PENDING', 'PROCESSING')) DESC,
+            req.created_at DESC,
+            req.id DESC
+          LIMIT 1
+        `;
+
+        const row = rows[0];
+        return row ? mapArchiveRequest(row) : undefined;
     });
 }
 
@@ -478,24 +564,36 @@ export async function completeArchiveRequest(params: {
 }): Promise<ArchiveRequestRecord | undefined> {
     const rows = await withExecutor(params.executor, async (sql) => {
         return await sql<ArchiveRequestRow[]>`
-      UPDATE archive_requests req
-      SET status = 'COMPLETED',
-          completed_at = COALESCE(req.completed_at, now()),
-          released_at = now(),
-          lease_expires_at = NULL,
-          failure_reason = NULL,
-          failure_details = NULL,
-          updated_at = now()
-      WHERE req.id = ${params.requestId}
-        AND req.status = 'PROCESSING'
-        AND req.lease_id = ${params.leaseId}
-        AND req.lease_token_id = ${params.leaseTokenId}
-        AND req.released_at IS NULL
-        AND req.lease_expires_at > now()
-      RETURNING id, tenant_id, target_type, target_id, action_type, action_payload,
-                requested_by, dedupe_key, status, failure_reason, failure_details,
-                lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
-                created_at, updated_at, completed_at
+      WITH completed AS (
+        UPDATE archive_requests req
+        SET status = 'COMPLETED',
+            completed_at = COALESCE(req.completed_at, now()),
+            released_at = now(),
+            lease_expires_at = NULL,
+            failure_reason = NULL,
+            failure_details = NULL,
+            updated_at = now()
+        WHERE req.id = ${params.requestId}
+          AND req.status = 'PROCESSING'
+          AND req.lease_id = ${params.leaseId}
+          AND req.lease_token_id = ${params.leaseTokenId}
+          AND req.released_at IS NULL
+          AND req.lease_expires_at > now()
+        RETURNING id, tenant_id, target_type, target_id, action_type, action_payload,
+                  requested_by, dedupe_key, status, failure_reason, failure_details,
+                  lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
+                  created_at, updated_at, completed_at
+      ), cleanup AS (
+        UPDATE curation_publications publication
+        SET cleanup_eligible_at = COALESCE(
+              publication.cleanup_eligible_at,
+              now() + interval '24 hours'
+            )
+        FROM completed
+        WHERE publication.request_id = completed.id
+        RETURNING publication.request_id
+      )
+      SELECT * FROM completed
     `;
     });
 
@@ -684,6 +782,14 @@ export async function failArchiveRequest(params: {
     `;
         const row = rows[0];
         if (!row) return undefined;
+        await transaction`
+          UPDATE curation_publications
+          SET cleanup_eligible_at = COALESCE(
+                cleanup_eligible_at,
+                now() + interval '7 days'
+              )
+          WHERE request_id = ${row.id}
+        `;
         await transaction`
           UPDATE archive_artifact_upload_attempts
           SET invalidated_at = now(), updated_at = now()

@@ -1,4 +1,6 @@
-import { ConflictError, ValidationError } from "../http/errors.ts";
+import { createHash } from "node:crypto";
+
+import { ConflictError, NotFoundError, ValidationError } from "../http/errors.ts";
 import {
   authorizeWorkerLeaseForArchiveRequest,
   createArchiveRequestLeaseToken,
@@ -20,6 +22,8 @@ import {
   type ArchiveRequestRecord,
   type ArchiveRequestTargetType,
 } from "../repos/archive-request-repo.ts";
+import { findCurationPublicationByRequestId } from "../repos/curation-publication-repo.ts";
+import { resolveStagingPath } from "../storage/staging.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
 import type {
   WorkerCompleteArchiveRequestBody,
@@ -172,6 +176,57 @@ export async function leaseNextArchiveRequest(params: {
       dedupe_key: lease.request.dedupeKey,
     },
   };
+}
+
+export async function downloadCurationPublicationSource(params: {
+  requestId: string;
+  leaseToken: string;
+  workerId?: string;
+}): Promise<Response> {
+  const authorizedLease = await authorizeWorkerLeaseForArchiveRequest({
+    requestId: params.requestId,
+    leaseToken: params.leaseToken,
+  });
+  if (authorizedLease.actionType !== "curation_apply") {
+    throw new ConflictError("Archive request does not expose a curation source.");
+  }
+  if (
+    params.workerId &&
+    authorizedLease.workerId &&
+    params.workerId !== authorizedLease.workerId
+  ) {
+    throw new ConflictError("Lease belongs to a different worker.");
+  }
+
+  const publication = await findCurationPublicationByRequestId({
+    requestId: params.requestId,
+  });
+  if (!publication || publication.purgedAt) {
+    throw new NotFoundError("Curation publication source was not found.");
+  }
+
+  const file = Bun.file(resolveStagingPath(publication.storageKey));
+  if (!(await file.exists())) {
+    throw new NotFoundError("Curation publication source was not found.");
+  }
+  if (file.size !== publication.sizeBytes) {
+    throw new ConflictError("Curation publication source size does not match its checkpoint.");
+  }
+  const bytes = await file.arrayBuffer();
+  const checksum = createHash("sha256").update(new Uint8Array(bytes)).digest("hex");
+  if (checksum !== publication.checksumSha256) {
+    throw new ConflictError("Curation publication source checksum does not match its checkpoint.");
+  }
+
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      "content-type": publication.contentType,
+      "content-length": String(publication.sizeBytes),
+      "x-content-sha256": publication.checksumSha256,
+      "cache-control": "no-store",
+    },
+  });
 }
 
 export async function heartbeatArchiveRequestLease(params: {

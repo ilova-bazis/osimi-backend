@@ -322,14 +322,17 @@ Queue request shape:
 ```json
 {
   "object_id": "OBJ-20260417-000001",
-  "curated_kind": "transcript_curated",
+  "curated_kind": "ocr_curated",
+  "publication_revision": 7,
   "target_version": "20260417",
   "source_ref": {
-    "type": "signed_download_url",
-    "url": "https://..."
+    "type": "request_source",
+    "url": "/api/archive-requests/11111111-1111-4111-8111-111111111111/source"
   },
-  "content_type": "text/plain",
-  "idempotency_key": "OBJ-20260417-000001:transcript_curated:20260417"
+  "content_type": "text/plain; charset=utf-8",
+  "size_bytes": 1234,
+  "checksum_sha256": "<64 lowercase hex characters>",
+  "idempotency_key": "OBJ-20260417-000001:ocr_curated:vpsrev-7"
 }
 ```
 
@@ -341,8 +344,10 @@ Supported `curated_kind` values in v1:
 Rules:
 
 - `target_version` is a UTC day string in `YYYYMMDD`
-- all edits for the same object/kind/day replace the same file version
-- worker downloads the full replacement file from `source_ref.url`
+- `target_version` remains the initial UTC submission day used for archive file naming
+- publication identity and exact retry are `(object_id, curated_kind, publication_revision)`, not the day
+- worker downloads the full replacement file from `source_ref.url` using `x-worker-auth-token`, its optional matching `x-worker-id`, and the active lease token in `x-archive-request-lease-token`
+- worker verifies `size_bytes` and `checksum_sha256` before writing archive output
 - worker writes the target curated file atomically
 - worker updates `meta/object_text_manifest.json`
 - worker enqueues `object_text_manifest_snapshot`
@@ -437,7 +442,8 @@ loop:
       PUT /api/internal/objects/:object_id/available-files
       POST /api/archive-requests/:id/complete { lease_token: token }
     else if request.action_type == "curation_apply":
-      download curated replacement file
+      GET request.action_payload.source_ref.url with worker auth and x-archive-request-lease-token
+      verify size_bytes and checksum_sha256
       write curated target version
       update meta/object_text_manifest.json
       enqueue object_text_manifest_snapshot

@@ -148,6 +148,20 @@
           }
         }
       }
+    },
+    "publication_already_active": {
+      "status": 409,
+      "body": {
+        "request_id": "80000000-0000-4000-8000-000000000004",
+        "error": {
+          "code": "PUBLICATION_ALREADY_ACTIVE",
+          "message": "A curation publication is already active for this object.",
+          "details": {
+            "existing_request_id": "70000000-0000-4000-8000-000000000001",
+            "existing_request_status": "PROCESSING"
+          }
+        }
+      }
     }
   }
 }

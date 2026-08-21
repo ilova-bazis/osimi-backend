@@ -7,6 +7,7 @@ export type ErrorCode =
   | "NOT_FOUND"
   | "METHOD_NOT_ALLOWED"
   | "CONFLICT"
+  | "PUBLICATION_ALREADY_ACTIVE"
   | "REVISION_CONFLICT"
   | "LOCKED"
   | "VALIDATION_FAILED"
@@ -71,6 +72,12 @@ export class MethodNotAllowedError extends AppError {
 export class ConflictError extends AppError {
   constructor(message: string, details?: unknown) {
     super(409, "CONFLICT", message, { details });
+  }
+}
+
+export class PublicationAlreadyActiveError extends AppError {
+  constructor(message: string, details: unknown) {
+    super(409, "PUBLICATION_ALREADY_ACTIVE", message, { details });
   }
 }
 

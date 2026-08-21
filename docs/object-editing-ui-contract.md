@@ -312,12 +312,16 @@ Publish the current saved OCR curation state through an asynchronous archive-sid
 - `curation_apply` action payload uses archive-compatible format:
   - `curated_kind: "ocr_curated"`
   - `target_version: "YYYYMMDD"` (UTC day of submit)
-  - `source_ref: { type: "signed_download_url", url: "/api/worker/downloads/..." }`
-  - `content_type: "text/plain"`
-  - `idempotency_key: "<object_id>:ocr_curated:<YYYYMMDD>:vpsrev-<revision_after>"`
-- `source_ref.url` is a relative VPS path; archive worker resolves against its configured VPS base URL
-- VPS deduplicates active `curation_apply` requests by `idempotency_key`
-- same `idempotency_key` = retry/deduped submit; different key on same day = new submit for same archive day-file
+  - `publication_revision: <revision_after>`
+  - `source_ref: { type: "request_source", url: "/api/archive-requests/<request_id>/source" }`
+  - `content_type`, `size_bytes`, and `checksum_sha256`
+  - `idempotency_key: "<object_id>:ocr_curated:vpsrev-<revision_after>"`
+- `source_ref.url` requires worker authentication and the active request lease token in `x-archive-request-lease-token`
+- VPS permits at most one active (`PENDING|PROCESSING`) `curation_apply` request per tenant and object
+- the idempotency key is revision-qualified using the submitted revision plus one
+- the same `publication_revision` is an exact retry in any request status: backend returns the original request and does not increment revision again; `submitted_at` and `submitted_by` identify the original request rather than the retry attempt
+- a different publication while one is active returns `409 PUBLICATION_ALREADY_ACTIVE`; backend does not silently deduplicate it, increment revision, create history, or retain its staged bytes
+- after the existing request becomes `COMPLETED|FAILED|CANCELED`, the next publication is permitted, including on the same UTC day
 
 ### Success Response
 
@@ -347,11 +351,17 @@ Same shape as other revision-guarded write endpoints.
 - On success, UI should treat the returned revision as the new current editor revision
 - UI should describe the operation as queued archive publication, not human review
 - UI may surface the initial request status from the returned `request`
-- For subsequent status, UI should query the latest `curation_apply` archive request for the object and render `PENDING|PROCESSING|COMPLETED|FAILED|CANCELED`
+- For subsequent status, UI should query `GET /api/objects/:object_id/curation-publication`; it returns an active request first, otherwise the latest request
+- UI should render known statuses and show unknown raw statuses without treating them as active or disabling a new publication
+- If the submit transport result is ambiguous, UI should retain the submitted revision and reconcile status before allowing a semantically different retry
 - UI should not assume archive apply completed synchronously
 - On `409 REVISION_CONFLICT`
   - UI should refetch `GET /edit`
   - UI should prompt user to review the latest backend state before resubmitting with the new revision
+- On `409 PUBLICATION_ALREADY_ACTIVE`
+  - `error.details.existing_request_id` and `existing_request_status` identify the blocking publication
+  - UI should surface that request instead of treating the newer content as published
+  - UI may retry the newer publication after the existing request becomes terminal
 - On `409 CONFLICT` with `code: INVALID_MEDIA_TYPE_FOR_DOCUMENT_CURATION`
   - Object is not a document type; UI should not allow submit for this object
 - On `409 CONFLICT` with `code: PROJECTION_UNAVAILABLE`

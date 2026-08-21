@@ -1701,9 +1701,12 @@ The object editing endpoints below apply both their listed role requirement and 
 - Rules:
   - currently supported for document OCR curation only
   - backend assembles the current OCR document text and enqueues `curation_apply`
-  - `dedupe_key` on the archive request uses `idempotency_key` format: `<object_id>:<curated_kind>:<YYYYMMDD>:vpsrev-<revision_after>`
-  - same `idempotency_key` = retry of same submit; different key on same day = new submit writing to same archive day-file
-  - `source_ref.url` is a relative VPS path; archive worker resolves it against its configured VPS base URL
+  - `dedupe_key` on the archive request uses stable `idempotency_key` format: `<object_id>:<curated_kind>:vpsrev-<revision_after>`
+  - the revision-qualified `idempotency_key` is derived from the request revision plus one
+  - the same publication revision is an exact retry in any status and returns the original request without another revision increment; `submitted_at` and `submitted_by` remain the original archive request's creation time and requester
+  - at most one `PENDING|PROCESSING` `curation_apply` request exists per tenant and object; a different publication is rejected rather than deduplicated while that request is active
+  - after the request reaches `COMPLETED|FAILED|CANCELED`, a newer publication may create a new request, including another write to the same archive day-file
+  - the payload includes `publication_revision`, `target_version`, `size_bytes`, `checksum_sha256`, and a relative `request_source` URL; the worker resolves it against its VPS base URL and supplies its active lease token
 - Example request:
 
 ```json
@@ -1743,7 +1746,32 @@ The object editing endpoints below apply both their listed role requirement and 
   - `423 LOCKED` when another user holds the edit lock
   - `409 CONFLICT` when object is not a document or when document OCR projection is unavailable
   - `409 REVISION_CONFLICT` with `error.details.latest_revision` when request revision is stale
+  - `409 PUBLICATION_ALREADY_ACTIVE` when a different `curation_apply` request is already `PENDING|PROCESSING`; `error.details` includes `existing_request_id` and `existing_request_status`
   - `422 VALIDATION_FAILED` for invalid payload
+
+- Example active-publication response:
+
+```json
+{
+  "request_id": "uuid",
+  "error": {
+    "code": "PUBLICATION_ALREADY_ACTIVE",
+    "message": "A curation publication is already active for this object.",
+    "details": {
+      "existing_request_id": "11111111-1111-4111-8111-111111111111",
+      "existing_request_status": "PROCESSING"
+    }
+  }
+}
+```
+
+### GET `/api/objects/:object_id/curation-publication`
+
+- Auth: Bearer token
+- Roles: `archiver`, `admin`
+- Returns the active (`PENDING|PROCESSING`) publication for the tenant/object when present; otherwise returns the latest publication, or `request: null`
+- Response request includes raw `status`, `publication_revision`, `target_version`, failure reason, and lifecycle timestamps
+- Clients must preserve unknown raw statuses and must not infer that an unknown status is active
 
 ### DELETE `/api/objects/:object_id/edit-lock`
 
@@ -2374,6 +2402,21 @@ Integration guides for archive worker teams:
   - `401 UNAUTHORIZED` for missing/invalid worker auth token or invalid/expired lease token
   - `409 CONFLICT` when lease is no longer active
   - `500 CONFIGURATION_ERROR` when worker auth token is not configured server-side
+
+### GET `/api/archive-requests/:id/source`
+
+- Auth: `x-worker-auth-token`
+- Headers:
+  - `x-archive-request-lease-token` (required active lease token for this request)
+  - `x-worker-id` (must match the worker identity embedded in the lease when both are present)
+- Available only for `curation_apply` requests with an unpurged retained source
+- Verifies the stored regular file length and SHA-256 checkpoint before returning bytes
+- 200 response headers include `content-type`, `content-length`, `x-content-sha256`, and `cache-control: no-store`
+- Error behavior:
+  - `400 BAD_REQUEST` when the lease header is missing
+  - `401 UNAUTHORIZED` for missing/invalid worker auth or lease token
+  - `404 NOT_FOUND` when the source record or file is absent/purged
+  - `409 CONFLICT` for the wrong action, mismatched worker, inactive lease, size mismatch, or checksum mismatch
 
 ### POST `/api/archive-requests/:id/lease/release`
 

@@ -68,8 +68,12 @@ This document defines the required tests for the Osimi backend control plane (VP
 - Staging retention rules by ingestion state
 - Staging retention uses bounded exclusive purge claims, converges after missing paths or a crash, and treats `COMPLETED_WITH_ERRORS` as completed retention
 - Staging retention removes temporary preview derivatives alongside original staged files
+- Curation publication source cleanup retains completed/canceled sources for 24 hours and failed sources for 7 days, converges when files are missing, preserves active sources, and removes only old untracked source files
 - Purge intent rejects retry, restore, mutable staging actions, and new preview work
 - Object editing enforces public/family/private assignment policy with an admin override across every edit operation
+- Curation publication migration fencing waits for in-flight archive-request writers, fails closed on multiple processing rows, and creates the one-active-request invariant without a writer race
+- Exact curation publication retries replay the original request in active and terminal states; concurrent exact submits create one request and one retained source
+- Curation source download requires worker auth, the matching worker identity when present, and the active request lease; bytes, size, and SHA-256 match the persisted checkpoint
 - Object search trims `q`, treats an empty trimmed query as omitted, rejects more than 256 trimmed characters, and matches literal case-insensitive substrings with `%`, `_`, and `\` escaped
 - Object search retains tenant-catalog `title` and `object_id` matches and preserves the requested sort without ranking or snippets
 - Object search matches materialized artifact `id`, `kind`, `variant`, and `content_type`, and available-file `display_name` and `archive_file_key` only through authoritative persisted materialization provenance, never inferred `kind`/`variant`; unmaterialized available-file inventory does not match

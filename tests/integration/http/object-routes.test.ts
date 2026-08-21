@@ -45,6 +45,13 @@ describe("object routes", () => {
         });
     }
 
+    async function countStagedCurationPublications(objectId: string): Promise<number> {
+        const glob = new Bun.Glob(
+            `tenants/${tenantOneId}/archive-request-sources/${objectId}/*/source.txt`,
+        );
+        return (await Array.fromAsync(glob.scan({ cwd: stagingRoot, onlyFiles: true }))).length;
+    }
+
     async function resetObjectEditState(params: {
         objectId: string;
         metadata: Record<string, unknown>;
@@ -1937,6 +1944,51 @@ describe("object routes", () => {
         expect(submitBody.submitted_by).toBe(
             "10000000-0000-0000-0000-000000000001",
         );
+        expect(await countStagedCurationPublications(tenantOneObjectId)).toBe(1);
+
+        const unlockSql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await unlockSql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await unlockSql`
+                UPDATE object_edits
+                SET locked_by = NULL, locked_until = NULL
+                WHERE object_id = ${tenantOneObjectId}
+            `;
+        } finally {
+            await unlockSql.close();
+        }
+
+        const exactRetryResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/submit`,
+                {
+                    method: "POST",
+                    headers: {
+                        authorization: `Bearer ${adminToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 1,
+                        review_note: "Ready for archive apply.",
+                    }),
+                },
+            ),
+        );
+        expect(exactRetryResponse.status).toBe(200);
+        const exactRetryBody = (await exactRetryResponse.json()) as {
+            revision: number;
+            request: { id: string; status: string };
+            submitted_at: string;
+            submitted_by: string;
+        };
+        expect(exactRetryBody.revision).toBe(2);
+        expect(exactRetryBody.request).toEqual(submitBody.request);
+        expect(exactRetryBody.submitted_at).toBe(submitBody.submitted_at);
+        expect(exactRetryBody.submitted_by).toBe(submitBody.submitted_by);
+        expect(exactRetryBody.submitted_by).not.toBe(
+            "10000000-0000-0000-0000-000000000003",
+        );
+        expect(await countStagedCurationPublications(tenantOneObjectId)).toBe(1);
 
         const historyResponse = await app.fetch(
             new Request(
@@ -1967,6 +2019,51 @@ describe("object routes", () => {
             "Ready for archive apply.",
         );
 
+        const newerSaveResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/document`,
+                {
+                    method: "PUT",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 2,
+                        pages: [{ page_number: 1, curated_text: "newer curated text" }],
+                    }),
+                },
+            ),
+        );
+        expect(newerSaveResponse.status).toBe(200);
+
+        const blockedResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/submit`,
+                {
+                    method: "POST",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({ revision: 3, review_note: null }),
+                },
+            ),
+        );
+        expect(blockedResponse.status).toBe(409);
+        const blockedBody = (await blockedResponse.json()) as {
+            error: {
+                code: string;
+                details: { existing_request_id: string; existing_request_status: string };
+            };
+        };
+        expect(blockedBody.error.code).toBe("PUBLICATION_ALREADY_ACTIVE");
+        expect(blockedBody.error.details).toEqual({
+            existing_request_id: submitBody.request.id,
+            existing_request_status: "PENDING",
+        });
+        expect(await countStagedCurationPublications(tenantOneObjectId)).toBe(1);
+
         const verifySql = createSqlClient(TEST_DATABASE_URL!);
         try {
             await verifySql`SET search_path TO ${sqlIdentifier(schema)}, public`;
@@ -1978,9 +2075,10 @@ describe("object routes", () => {
                     requested_by: string;
                     dedupe_key: string | null;
                     status: "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED" | "CANCELED";
+                    created_at: Date;
                 }>
             >`
-                SELECT id, target_id, action_type, requested_by, dedupe_key, status
+                SELECT id, target_id, action_type, requested_by, dedupe_key, status, created_at
                 FROM archive_requests
                 WHERE id = ${submitBody.request.id}
                 LIMIT 1
@@ -1992,9 +2090,129 @@ describe("object routes", () => {
             expect(archiveRows[0]?.requested_by).toBe(submitBody.submitted_by);
             expect(archiveRows[0]?.dedupe_key).toContain(`${tenantOneObjectId}:ocr_curated:`);
             expect(archiveRows[0]?.status).toBe("PENDING");
+            expect(archiveRows[0]?.created_at.toISOString()).toBe(submitBody.submitted_at);
+
+            const revisionRows = await verifySql<Array<{ revision: number }>>`
+                SELECT revision FROM object_edits WHERE object_id = ${tenantOneObjectId}
+            `;
+            expect(revisionRows[0]?.revision).toBe(3);
+
+            const submissionEventRows = await verifySql<Array<{ count: number }>>`
+                SELECT COUNT(*)::int AS count
+                FROM object_edit_events
+                WHERE object_id = ${tenantOneObjectId}
+                  AND type = 'CURATION_SUBMITTED'
+            `;
+            expect(submissionEventRows[0]?.count).toBe(1);
+
         } finally {
             await verifySql.close();
         }
+
+        const leaseResponse = await app.fetch(
+            new Request("http://localhost/api/archive-requests/lease", {
+                method: "POST",
+                headers: {
+                    "x-worker-auth-token": "worker-secret",
+                    "x-worker-id": "worker-curation",
+                    "content-type": "application/json",
+                },
+                body: JSON.stringify({ action_type: "curation_apply" }),
+            }),
+        );
+        expect(leaseResponse.status).toBe(200);
+        const leaseBody = (await leaseResponse.json()) as {
+            request: { request_id: string; lease_token: string } | null;
+        };
+        expect(leaseBody.request?.request_id).toBe(submitBody.request.id);
+        const leaseToken = leaseBody.request?.lease_token ?? "";
+
+        const wrongWorkerSourceResponse = await app.fetch(
+            new Request(`http://localhost/api/archive-requests/${submitBody.request.id}/source`, {
+                headers: {
+                    "x-worker-auth-token": "worker-secret",
+                    "x-worker-id": "worker-other",
+                    "x-archive-request-lease-token": leaseToken,
+                },
+            }),
+        );
+        expect(wrongWorkerSourceResponse.status).toBe(409);
+
+        const sourceResponse = await app.fetch(
+            new Request(`http://localhost/api/archive-requests/${submitBody.request.id}/source`, {
+                headers: {
+                    "x-worker-auth-token": "worker-secret",
+                    "x-worker-id": "worker-curation",
+                    "x-archive-request-lease-token": leaseToken,
+                },
+            }),
+        );
+        expect(sourceResponse.status).toBe(200);
+        expect(sourceResponse.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+        expect(sourceResponse.headers.get("x-content-sha256")).toMatch(/^[0-9a-f]{64}$/);
+        expect(await sourceResponse.text()).toContain("curated submit page 1");
+
+        const completeResponse = await app.fetch(
+            new Request(`http://localhost/api/archive-requests/${submitBody.request.id}/complete`, {
+                method: "POST",
+                headers: {
+                    "x-worker-auth-token": "worker-secret",
+                    "content-type": "application/json",
+                },
+                body: JSON.stringify({ lease_token: leaseToken }),
+            }),
+        );
+        expect(completeResponse.status).toBe(200);
+
+        const terminalRetryResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/submit`,
+                {
+                    method: "POST",
+                    headers: {
+                        authorization: `Bearer ${adminToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        revision: 1,
+                        review_note: "Ready for archive apply.",
+                    }),
+                },
+            ),
+        );
+        expect(terminalRetryResponse.status).toBe(200);
+        const terminalRetryBody = (await terminalRetryResponse.json()) as {
+            revision: number;
+            request: { id: string; status: string };
+        };
+        expect(terminalRetryBody.revision).toBe(2);
+        expect(terminalRetryBody.request).toEqual({
+            ...submitBody.request,
+            status: "COMPLETED",
+        });
+
+        const nextSubmitResponse = await app.fetch(
+            new Request(
+                `http://localhost/api/objects/${tenantOneObjectId}/curation/submit`,
+                {
+                    method: "POST",
+                    headers: {
+                        authorization: `Bearer ${operatorToken}`,
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify({ revision: 3, review_note: null }),
+                },
+            ),
+        );
+        expect(nextSubmitResponse.status).toBe(200);
+        const nextSubmitBody = (await nextSubmitResponse.json()) as {
+            revision: number;
+            request: { id: string; status: string };
+        };
+        expect(nextSubmitBody.revision).toBe(4);
+        expect(nextSubmitBody.request.id).not.toBe(submitBody.request.id);
+        expect(nextSubmitBody.request.status).toBe("PENDING");
+        expect(await countStagedCurationPublications(tenantOneObjectId)).toBe(2);
 
         const cleanupSql = createSqlClient(TEST_DATABASE_URL!);
         try {
@@ -2025,6 +2243,106 @@ describe("object routes", () => {
             await cleanupSql`
                 DELETE FROM object_artifacts WHERE object_id = ${tenantOneObjectId}
                     AND storage_key LIKE '%ocr-submit-page%'
+            `;
+        } finally {
+            await cleanupSql.close();
+        }
+    });
+
+    test("concurrent exact publication attempts create one active request", async () => {
+        const app = createTestApp();
+        const artifactId = "60000000-0000-4000-8000-000000000884";
+        const storageKey = `tenants/${tenantOneId}/objects/${tenantOneObjectIdTwo}/artifacts/ocr-concurrent-page-1.txt`;
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`
+                INSERT INTO object_artifacts (id, object_id, kind, variant, storage_key, content_type, size_bytes)
+                VALUES (${artifactId}, ${tenantOneObjectIdTwo}, 'ocr_text', 'page-1', ${storageKey}, 'text/plain', 17)
+            `;
+            await sql`
+                UPDATE objects
+                SET metadata = ${{ page_count: 1, pages: [{
+                    page_number: 1,
+                    label: "1",
+                    ocr_text_artifact_id: artifactId,
+                }] }}
+                WHERE object_id = ${tenantOneObjectIdTwo}
+            `;
+        } finally {
+            await sql.close();
+        }
+
+        await mkdir(dirname(join(stagingRoot, storageKey)), { recursive: true });
+        await Bun.write(join(stagingRoot, storageKey), "concurrent page 1");
+
+        const makeSubmitRequest = () => new Request(
+            `http://localhost/api/objects/${tenantOneObjectIdTwo}/curation/submit`,
+            {
+                method: "POST",
+                headers: {
+                    authorization: `Bearer ${operatorToken}`,
+                    "content-type": "application/json",
+                },
+                body: JSON.stringify({ revision: 0, review_note: null }),
+            },
+        );
+        const responses = await Promise.all([
+            app.fetch(makeSubmitRequest()),
+            app.fetch(makeSubmitRequest()),
+        ]);
+        expect(responses.map((response) => response.status)).toEqual([200, 200]);
+        const responseBodies = await Promise.all(responses.map(async (response) => await response.json())) as Array<{
+            revision: number;
+            request: { id: string };
+        }>;
+        expect(responseBodies[0]?.revision).toBe(1);
+        expect(responseBodies[1]?.revision).toBe(1);
+        expect(responseBodies[0]?.request.id).toBe(responseBodies[1]?.request.id);
+        expect(await countStagedCurationPublications(tenantOneObjectIdTwo)).toBe(1);
+
+        const verifySql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await verifySql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            const rows = await verifySql<Array<{ count: number }>>`
+                SELECT COUNT(*)::int AS count
+                FROM archive_requests
+                WHERE tenant_id = ${tenantOneId}
+                  AND target_id = ${tenantOneObjectIdTwo}
+                  AND action_type = 'curation_apply'
+                  AND status IN ('PENDING', 'PROCESSING')
+            `;
+            expect(rows[0]?.count).toBe(1);
+        } finally {
+            await verifySql.close();
+        }
+
+        const cleanupSql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await cleanupSql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await cleanupSql`
+                DELETE FROM archive_requests
+                WHERE tenant_id = ${tenantOneId}
+                  AND target_id = ${tenantOneObjectIdTwo}
+                  AND action_type = 'curation_apply'
+            `;
+            await cleanupSql`
+                DELETE FROM object_edit_events WHERE object_id = ${tenantOneObjectIdTwo}
+            `;
+            await cleanupSql`
+                UPDATE object_edits
+                SET revision = 0, updated_at = now(), updated_by = NULL
+                WHERE object_id = ${tenantOneObjectIdTwo}
+            `;
+            await cleanupSql`
+                UPDATE objects
+                SET metadata = ${{ source: "scanner-b" }},
+                    curation_state = 'needs_review'
+                WHERE object_id = ${tenantOneObjectIdTwo}
+            `;
+            await cleanupSql`
+                DELETE FROM object_artifacts WHERE id = ${artifactId}
             `;
         } finally {
             await cleanupSql.close();

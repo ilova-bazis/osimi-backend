@@ -1,5 +1,6 @@
 import {
   runArtifactFinalizationSweep,
+  runCurationPublicationSourceCleanup,
   runStagingRetentionSweep,
   runStuckAttentionCheck,
 } from "./operations.ts";
@@ -156,6 +157,18 @@ export function startBackgroundJobs(): JobRuntime {
         failed: result.failed,
         completed_retention_days: completedRetentionDays,
         failed_canceled_retention_days: failedCanceledRetentionDays,
+      });
+
+      const publicationSources = await runCurationPublicationSourceCleanup({
+        batchSize: retentionBatchSize,
+        claimTimeoutSeconds: retentionClaimTimeoutSeconds,
+      });
+      logJobEvent("INFO", "jobs.curation_publication_source_cleanup", {
+        claimed: publicationSources.claimed,
+        purged: publicationSources.purged,
+        missing: publicationSources.missing,
+        failed: publicationSources.failed,
+        orphaned: publicationSources.orphaned,
       });
     } catch (error) {
       logJobEvent("ERROR", "jobs.staging_retention.failed", {

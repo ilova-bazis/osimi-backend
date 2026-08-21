@@ -77,6 +77,16 @@ All endpoints must be tenant-aware.
 - `admin` bypasses object assignment checks. Embargo and artifact availability do not limit editing authorization.
 - An in-tenant object denied by this policy returns `403 FORBIDDEN`; missing or cross-tenant objects return `404 NOT_FOUND`.
 
+### Object Curation Publication
+
+- At most one `curation_apply` archive request may be `PENDING` or `PROCESSING` for a tenant and object.
+- An exact retry is identified by `(tenant, object, curated kind, publication revision)` and returns the original request in any status without incrementing the object revision. The stable idempotency key must not depend on retry date.
+- A different publication while one is active must return `409 PUBLICATION_ALREADY_ACTIVE` with the existing request id and status. It must not increment revision, create history, retain newly staged bytes, or silently replace/deduplicate the newer content.
+- A terminal request (`COMPLETED`, `FAILED`, or `CANCELED`) no longer blocks the next publication.
+- Deployment migration `0015` serializes archive-request writers before reconciliation, retains an existing `PROCESSING` publication over any queued `PENDING` duplicates, and may cancel duplicate PENDING rows with explicit migration provenance. It must fail closed when more than one request is `PROCESSING`; operators must quiesce workers and reconcile those requests before retrying migration.
+- New publication sources are durable backend-owned files addressed by a request-relative URL. Reads require worker authentication and the active matching archive-request lease, and the worker must verify persisted byte length and SHA-256 before applying.
+- Source cleanup retains `COMPLETED` and `CANCELED` requests for 24 hours and `FAILED` requests for 7 days, preserves active sources, and sweeps only untracked files older than 24 hours.
+
 ### Session Persistence Requirements
 
 - Session authentication must be persisted in the database (in-memory-only sessions are not sufficient)

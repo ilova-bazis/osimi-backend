@@ -3,10 +3,15 @@ import type { UserRole } from "../auth/types.ts";
 import { isObjectAccessAuthorized } from "../domain/objects/access-policy.ts";
 import {
   type ArchiveRequestSqlExecutor,
-  createArchiveRequestWithExecutor,
+  findActiveCurationApplyByObjectWithExecutor,
   findActiveArchiveRequestByDedupeKeyWithExecutor,
+  tryCreateCurationApplyArchiveRequestWithExecutor,
 } from "./archive-request-repo.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
+import {
+  createCurationPublicationWithExecutor,
+  findCurationPublicationByIdentity,
+} from "./curation-publication-repo.ts";
 
 interface ObjectEditRow {
   object_id: string;
@@ -106,6 +111,8 @@ export interface SubmittedCurationRequestRecord {
   id: string;
   actionType: "curation_apply";
   status: "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED" | "CANCELED";
+  createdAt: Date;
+  requestedBy: string;
 }
 
 export interface ListObjectEditEventsResult {
@@ -128,6 +135,7 @@ export type SubmitDocumentCurationResult =
   | { status: "invalid_media_type" }
   | { status: "revision_conflict"; latestRevision: number }
   | { status: "deduped"; record: ObjectEditRecord; request: SubmittedCurationRequestRecord }
+  | { status: "publication_active"; request: SubmittedCurationRequestRecord }
   | { status: "submitted"; record: ObjectEditRecord; request: SubmittedCurationRequestRecord };
 
 export type UpdateObjectEditMetadataResult =
@@ -940,6 +948,14 @@ export async function submitDocumentCuration(params: {
   revision: number;
   requestId: string;
   idempotencyKey: string;
+  publicationRevision: number;
+  targetVersion: string;
+  source: {
+    storageKey: string;
+    contentType: string;
+    sizeBytes: number;
+    checksumSha256: string;
+  };
   actionPayload: JsonObject;
   reviewNote: string | null;
 }): Promise<SubmitDocumentCurationResult> {
@@ -980,6 +996,35 @@ export async function submitDocumentCuration(params: {
         ON CONFLICT (object_id) DO NOTHING
       `;
 
+      const exactPublication = await findCurationPublicationByIdentity({
+        tenantId: params.tenantId,
+        objectId: params.objectId,
+        curatedKind: "ocr_curated",
+        publicationRevision: params.publicationRevision,
+        executor: transaction,
+      });
+      if (
+        exactPublication?.requestStatus &&
+        exactPublication.requestedBy &&
+        exactPublication.requestCreatedAt
+      ) {
+        const row = await selectObjectEditRow(transaction, {
+          tenantId: params.tenantId,
+          objectId: params.objectId,
+        });
+        return {
+          status: "deduped",
+          record: mapObjectEdit(row!),
+          request: {
+            id: exactPublication.requestId,
+            actionType: "curation_apply",
+            status: exactPublication.requestStatus,
+            createdAt: exactPublication.requestCreatedAt,
+            requestedBy: exactPublication.requestedBy,
+          },
+        };
+      }
+
       const existing = await findActiveArchiveRequestByDedupeKeyWithExecutor(
         transaction,
         {
@@ -1001,6 +1046,28 @@ export async function submitDocumentCuration(params: {
             id: existing.id,
             actionType: "curation_apply",
             status: existing.status,
+            createdAt: existing.createdAt,
+            requestedBy: existing.requestedBy,
+          },
+        };
+      }
+
+      const activePublication = await findActiveCurationApplyByObjectWithExecutor(
+        transaction,
+        {
+          tenantId: params.tenantId,
+          objectId: params.objectId,
+        },
+      );
+      if (activePublication) {
+        return {
+          status: "publication_active",
+          request: {
+            id: activePublication.id,
+            actionType: "curation_apply",
+            status: activePublication.status,
+            createdAt: activePublication.createdAt,
+            requestedBy: activePublication.requestedBy,
           },
         };
       }
@@ -1026,6 +1093,54 @@ export async function submitDocumentCuration(params: {
             ? "review_in_progress"
             : currentRow.curation_state;
 
+      const createdRequest = await tryCreateCurationApplyArchiveRequestWithExecutor(transaction, {
+        requestId: params.requestId,
+        tenantId: params.tenantId,
+        targetType: "object",
+        targetId: params.objectId,
+        actionType: "curation_apply",
+        actionPayload: params.actionPayload,
+        requestedBy: params.actorUserId,
+        dedupeKey: params.idempotencyKey,
+      });
+
+      if (!createdRequest) {
+        const concurrentPublication = await findActiveCurationApplyByObjectWithExecutor(
+          transaction,
+          {
+            tenantId: params.tenantId,
+            objectId: params.objectId,
+          },
+        );
+        if (!concurrentPublication) {
+          throw new Error("Active curation publication conflict did not resolve to a request.");
+        }
+
+        return {
+          status: "publication_active",
+          request: {
+            id: concurrentPublication.id,
+            actionType: "curation_apply",
+            status: concurrentPublication.status,
+            createdAt: concurrentPublication.createdAt,
+            requestedBy: concurrentPublication.requestedBy,
+          },
+        };
+      }
+
+      await createCurationPublicationWithExecutor(transaction, {
+        requestId: createdRequest.id,
+        tenantId: params.tenantId,
+        objectId: params.objectId,
+        curatedKind: "ocr_curated",
+        publicationRevision: params.publicationRevision,
+        targetVersion: params.targetVersion,
+        storageKey: params.source.storageKey,
+        contentType: params.source.contentType,
+        sizeBytes: params.source.sizeBytes,
+        checksumSha256: params.source.checksumSha256,
+      });
+
       await transaction`
         UPDATE objects
         SET curation_state = ${nextCurationState}::object_curation_state,
@@ -1040,17 +1155,6 @@ export async function submitDocumentCuration(params: {
             updated_by = ${params.actorUserId}
         WHERE object_id = ${params.objectId}
       `;
-
-      await createArchiveRequestWithExecutor(transaction, {
-        requestId: params.requestId,
-        tenantId: params.tenantId,
-        targetType: "object",
-        targetId: params.objectId,
-        actionType: "curation_apply",
-        actionPayload: params.actionPayload,
-        requestedBy: params.actorUserId,
-        dedupeKey: params.idempotencyKey,
-      });
 
       await transaction`
         INSERT INTO object_edit_events (
@@ -1090,9 +1194,11 @@ export async function submitDocumentCuration(params: {
         status: "submitted",
         record: mapObjectEdit(updatedRow!),
         request: {
-          id: params.requestId,
+          id: createdRequest.id,
           actionType: "curation_apply",
-          status: "PENDING",
+          status: createdRequest.status,
+          createdAt: createdRequest.createdAt,
+          requestedBy: createdRequest.requestedBy,
         },
       };
     });

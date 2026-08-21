@@ -35,6 +35,7 @@ import { parseLeaseTokenBody } from "../validation/lease.ts";
 import { parseUploadTokenParam } from "../validation/ingestion.ts";
 import {
     completeArchiveRequestByWorker,
+    downloadCurationPublicationSource,
     failArchiveRequestByWorker,
     heartbeatArchiveRequestLease,
     leaseNextArchiveRequest,
@@ -43,6 +44,7 @@ import {
 } from "../services/archive-request-service.ts";
 import {
     getObjectEditDetail,
+    getObjectCurationPublicationForTenant,
     getObjectEditHistoryForTenant,
     patchObjectMetadataForTenant,
     putDocumentCurationForTenant,
@@ -280,6 +282,56 @@ const submitObjectCurationRoute: RouteDefinition = {
                 auth: authenticated,
                 objectId,
                 body,
+            }),
+        );
+    },
+};
+
+const downloadCurationPublicationSourceRoute: RouteDefinition = {
+    method: "GET",
+    path: "/api/archive-requests/:request_id/source",
+    handler: withWorkerAuth(async (request, _context, worker) => {
+        const pathname = new URL(request.url).pathname;
+        const requestId = parseArchiveRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/archive-requests\/([^/]+)\/source$/,
+                "request_id",
+            ),
+        );
+        const leaseToken = request.headers
+            .get("x-archive-request-lease-token")
+            ?.trim();
+        if (!leaseToken) {
+            throw new ValidationError(
+                "Header 'x-archive-request-lease-token' is required.",
+            );
+        }
+        return await downloadCurationPublicationSource({
+            requestId,
+            leaseToken,
+            workerId: worker.workerId,
+        });
+    }),
+};
+
+const getObjectCurationPublicationRoute: RouteDefinition = {
+    method: "GET",
+    path: "/api/objects/:object_id/curation-publication",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, ["archiver", "admin"]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/curation-publication$/,
+                "object_id",
+            ),
+        );
+        return jsonResponse(
+            await getObjectCurationPublicationForTenant({
+                auth: authenticated,
+                objectId,
             }),
         );
     },
@@ -1147,6 +1199,8 @@ export const objectRoutes: RouteDefinition[] = [
     getObjectCurationHistoryRoute,
     putObjectDocumentCurationRoute,
     submitObjectCurationRoute,
+    getObjectCurationPublicationRoute,
+    downloadCurationPublicationSourceRoute,
     deleteObjectEditLockRoute,
     requestObjectResyncRoute,
     listObjectResyncRequestsRoute,

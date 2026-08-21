@@ -160,6 +160,9 @@ Behavior:
 - creates a `curation_apply` archive request
 - increments revision
 - emits immutable `CURATION_SUBMITTED` history event
+- permits only one active (`PENDING` or `PROCESSING`) publication per tenant and object
+- returns the original request for an exact revision-qualified retry, including after it is terminal, without incrementing revision
+- rejects different content while a publication is active with `409 PUBLICATION_ALREADY_ACTIVE`, without retaining its staged bytes
 
 ## Revision and Conflict Semantics
 
@@ -168,7 +171,17 @@ Behavior:
 3. Revision increments by 1 for each successful edit write.
 4. Archive-side apply completion/failure MUST NOT silently mutate user draft revision.
 5. OCR page curation writes update only the submitted page set and MUST NOT overwrite unrelated curated pages.
-6. Submit-for-review is revision-guarded and MUST create at most one active `curation_apply` request per object+target version.
+6. Submit-for-review is revision-guarded and MUST create at most one active `curation_apply` request per tenant and object, regardless of target version.
+7. An exact revision-qualified retry MUST return its original request in any status. A different publication MUST return `409 PUBLICATION_ALREADY_ACTIVE` while another request is active and MUST NOT increment revision or silently deduplicate newer content.
+8. A terminal `curation_apply` request permits the next publication.
+
+### Deployment Migration Safety
+
+- Migration `0015_one_active_curation_apply_per_object.sql` reconciles legacy active duplicates before creating the database invariant.
+- Migration takes an exclusive `archive_requests` table lock before inspecting or reconciling rows, so in-flight worker leases/writes finish first and no writer can enter between reconciliation and index creation.
+- When exactly one request is `PROCESSING`, it is retained regardless of newer PENDING rows; duplicate PENDING rows are canceled with migration provenance and terminal timestamps.
+- With no PROCESSING request, the newest PENDING request by `created_at DESC, id DESC` is retained.
+- More than one PROCESSING request is not automatically reconcilable because workers may already be writing archive output. Migration fails before changing rows or creating the index, and operators must quiesce workers and reconcile the requests before retrying.
 
 ## Async `curation_apply` Contract
 
@@ -177,7 +190,8 @@ Queue payload SHOULD include:
 - `object_id`
 - `curated_kind`
 - `target_version`
-- secure downloadable reference to curated file body
+- lease-protected `request_source` reference to a backend-retained curated file body
+- immutable `publication_revision`, byte length, and SHA-256 checkpoint
 
 Worker result MUST include at least:
 
@@ -191,7 +205,13 @@ Worker result MUST include at least:
 Apply semantics:
 
 - full-file replacement
-- idempotent by `(object_id, curated_kind, target_version)`
+- idempotent by `(object_id, curated_kind, publication_revision)`; `target_version` remains the UTC submission day used for archive naming
+
+Source lifecycle:
+
+- only the worker holding the active archive-request lease may read the source
+- `COMPLETED` and `CANCELED` sources are retained for 24 hours; `FAILED` sources are retained for 7 days
+- cleanup uses fenced claims, records missing files as successfully purged, and removes untracked source files only after they are 24 hours old
 
 ## Reprocessing and Stale Semantics
 

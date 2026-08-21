@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -8,7 +8,11 @@ import { sql as sqlIdentifier } from "bun";
 import { createSqlClient } from "../../../src/db/client.ts";
 import { runMigrations } from "../../../src/db/migrate.ts";
 import { claimStagingPurgeBatch, completeStagingPurge } from "../../../src/repos/ingestion-repo.ts";
-import { runStagingRetentionSweep, runStuckAttentionCheck } from "../../../src/jobs/operations.ts";
+import {
+  runCurationPublicationSourceCleanup,
+  runStagingRetentionSweep,
+  runStuckAttentionCheck,
+} from "../../../src/jobs/operations.ts";
 import { runWithRuntimeConfig } from "../../../src/runtime/config.ts";
 import { resolveStagingPath } from "../../../src/storage/staging.ts";
 import { TEST_DATABASE_URL } from "../test-database.ts";
@@ -225,6 +229,100 @@ describe("jobs operations", () => {
       expect(await Bun.file(failedPath).exists()).toBe(false);
       expect(await Bun.file(completedPreviewPath).exists()).toBe(false);
       expect(await Bun.file(failedPreviewPath).exists()).toBe(false);
+    } finally {
+      await sql.close();
+    }
+  });
+
+  test("cleans terminal curation sources and old untracked files", async () => {
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+    const tenantId = "00000000-0000-0000-0000-000000000901";
+    const objectId = "OBJ-20260821-CLEANUP";
+    const requestedBy = "10000000-0000-0000-0000-000000000901";
+    const completedId = "20000000-0000-0000-0000-000000000901";
+    const failedId = "20000000-0000-0000-0000-000000000902";
+    const missingId = "20000000-0000-0000-0000-000000000903";
+    const activeId = "20000000-0000-0000-0000-000000000904";
+    const sourceKey = (requestId: string) =>
+      `tenants/${tenantId}/archive-request-sources/${objectId}/${requestId}/source.txt`;
+    const orphanKey = sourceKey("20000000-0000-0000-0000-000000000999");
+
+    try {
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      await sql`
+        INSERT INTO tenants (id, slug, name)
+        VALUES (${tenantId}, 'curation-source-cleanup', 'Curation source cleanup')
+      `;
+      await sql`
+        INSERT INTO objects (object_id, tenant_id, title)
+        VALUES (${objectId}, ${tenantId}, 'Cleanup object')
+      `;
+      await sql`
+        INSERT INTO archive_requests (
+          id, tenant_id, target_type, target_id, action_type, requested_by,
+          dedupe_key, status, completed_at
+        ) VALUES
+          (${completedId}, ${tenantId}, 'object', ${objectId}, 'curation_apply', ${requestedBy}, 'cleanup-completed', 'COMPLETED', now() - interval '2 days'),
+          (${failedId}, ${tenantId}, 'object', ${objectId}, 'curation_apply', ${requestedBy}, 'cleanup-failed', 'FAILED', NULL),
+          (${missingId}, ${tenantId}, 'object', ${objectId}, 'curation_apply', ${requestedBy}, 'cleanup-missing', 'CANCELED', now() - interval '2 days'),
+          (${activeId}, ${tenantId}, 'object', ${objectId}, 'curation_apply', ${requestedBy}, 'cleanup-active', 'PENDING', NULL)
+      `;
+      await sql`
+        INSERT INTO curation_publications (
+          request_id, tenant_id, object_id, curated_kind, publication_revision,
+          target_version, storage_key, content_type, size_bytes, checksum_sha256,
+          cleanup_eligible_at
+        ) VALUES
+          (${completedId}, ${tenantId}, ${objectId}, 'ocr_curated', 1, '2026-08-19', ${sourceKey(completedId)}, 'text/plain', 9, ${"a".repeat(64)}, now() - interval '1 hour'),
+          (${failedId}, ${tenantId}, ${objectId}, 'ocr_curated', 2, '2026-08-19', ${sourceKey(failedId)}, 'text/plain', 6, ${"b".repeat(64)}, now() - interval '1 hour'),
+          (${missingId}, ${tenantId}, ${objectId}, 'ocr_curated', 3, '2026-08-19', ${sourceKey(missingId)}, 'text/plain', 7, ${"c".repeat(64)}, now() - interval '1 hour'),
+          (${activeId}, ${tenantId}, ${objectId}, 'ocr_curated', 4, '2026-08-21', ${sourceKey(activeId)}, 'text/plain', 6, ${"d".repeat(64)}, NULL)
+      `;
+
+      for (const [storageKey, contents] of [
+        [sourceKey(completedId), "completed"],
+        [sourceKey(failedId), "failed"],
+        [sourceKey(activeId), "active"],
+        [orphanKey, "orphan"],
+      ] as const) {
+        const path = runWithRuntimeConfig(
+          { databaseUrl: TEST_DATABASE_URL, dbSchema: schema, stagingRoot },
+          () => resolveStagingPath(storageKey),
+        );
+        await mkdir(dirname(path), { recursive: true });
+        await Bun.write(path, contents);
+      }
+      const orphanPath = runWithRuntimeConfig(
+        { databaseUrl: TEST_DATABASE_URL, dbSchema: schema, stagingRoot },
+        () => resolveStagingPath(orphanKey),
+      );
+      const oldTime = new Date(Date.now() - 2 * 60 * 60 * 1_000);
+      await utimes(orphanPath, oldTime, oldTime);
+
+      const result = await runWithRuntimeConfig(
+        { databaseUrl: TEST_DATABASE_URL, dbSchema: schema, stagingRoot },
+        () => runCurationPublicationSourceCleanup({ orphanMinAgeSeconds: 3600 }),
+      );
+
+      expect(result).toEqual({ claimed: 3, purged: 3, missing: 1, failed: 0, orphaned: 1 });
+      expect(await Bun.file(orphanPath).exists()).toBe(false);
+      const activePath = runWithRuntimeConfig(
+        { databaseUrl: TEST_DATABASE_URL, dbSchema: schema, stagingRoot },
+        () => resolveStagingPath(sourceKey(activeId)),
+      );
+      expect(await Bun.file(activePath).exists()).toBe(true);
+      const rows = await sql<Array<{ request_id: string; purged_at: Date | null }>>`
+        SELECT request_id, purged_at
+        FROM curation_publications
+        WHERE object_id = ${objectId}
+        ORDER BY publication_revision
+      `;
+      expect(rows.map((row) => [row.request_id, row.purged_at !== null])).toEqual([
+        [completedId, true],
+        [failedId, true],
+        [missingId, true],
+        [activeId, false],
+      ]);
     } finally {
       await sql.close();
     }

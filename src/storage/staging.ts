@@ -125,6 +125,16 @@ export function buildObjectArtifactStorageKey(params: {
   return `tenants/${params.tenantId}/objects/${params.objectId}/artifacts/${params.requestId}${uploadSegment}-${safeStorageKeySegment(params.artifactKind)}${safeVariant}.${safeExtension || "bin"}`;
 }
 
+export function buildCurationPublicationSourceStorageKey(params: {
+  tenantId: string;
+  objectId: string;
+  requestId: string;
+  extension: string;
+}): string {
+  const safeExtension = safeStorageKeySegment(params.extension).replace(/^\./, "");
+  return `tenants/${params.tenantId}/archive-request-sources/${safeStorageKeySegment(params.objectId)}/${params.requestId}/source.${safeExtension || "bin"}`;
+}
+
 export function createUploadToken(payload: UploadTokenPayload): string {
   const encodedPayload = toBase64Url(JSON.stringify(payload));
   const signature = sign(encodedPayload);

@@ -106,6 +106,75 @@ describe("database migrations", () => {
         const accessRequestIndexNames = accessRequestIndexRows.map((row) => row.indexname);
         expect(accessRequestIndexNames.includes("object_access_requests_one_pending_per_user_idx")).toBe(true);
 
+        const archiveRequestIndexRows = await sql<{ indexname: string }[]>`
+          SELECT indexname
+          FROM pg_indexes
+          WHERE schemaname = ${schema}
+            AND tablename = 'archive_requests'
+        `;
+        const archiveRequestIndexNames = archiveRequestIndexRows.map((row) => row.indexname);
+        expect(
+          archiveRequestIndexNames.includes(
+            "archive_requests_one_active_curation_apply_per_object_idx",
+          ),
+        ).toBe(true);
+
+        await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+        const tenantId = crypto.randomUUID();
+        const requestedBy = crypto.randomUUID();
+        const targetId = "OBJ-20260820-MIGRATION";
+        const firstRequestId = crypto.randomUUID();
+        await sql`
+          INSERT INTO archive_requests (
+            id, tenant_id, target_type, target_id, action_type, requested_by, dedupe_key
+          )
+          VALUES (
+            ${firstRequestId}, ${tenantId}, 'object', ${targetId}, 'curation_apply',
+            ${requestedBy}, 'migration-active-1'
+          )
+        `;
+        let uniquenessError: unknown;
+        try {
+          await sql`
+            INSERT INTO archive_requests (
+              id, tenant_id, target_type, target_id, action_type, requested_by, dedupe_key
+            )
+            VALUES (
+              ${crypto.randomUUID()}, ${tenantId}, 'object', ${targetId}, 'curation_apply',
+              ${requestedBy}, 'migration-active-2'
+            )
+          `;
+        } catch (error) {
+          uniquenessError = error;
+        }
+        const postgresError = uniquenessError as {
+          code?: unknown;
+          errno?: unknown;
+          constraint?: unknown;
+          message?: unknown;
+        } | undefined;
+        expect([postgresError?.code, postgresError?.errno]).toContain("23505");
+        expect(
+          postgresError?.constraint ===
+            "archive_requests_one_active_curation_apply_per_object_idx" ||
+            (typeof postgresError?.message === "string" &&
+              postgresError.message.includes(
+                "archive_requests_one_active_curation_apply_per_object_idx",
+              )),
+        ).toBe(true);
+        await sql`
+          UPDATE archive_requests SET status = 'COMPLETED' WHERE id = ${firstRequestId}
+        `;
+        await sql`
+          INSERT INTO archive_requests (
+            id, tenant_id, target_type, target_id, action_type, requested_by, dedupe_key
+          )
+          VALUES (
+            ${crypto.randomUUID()}, ${tenantId}, 'object', ${targetId}, 'curation_apply',
+            ${requestedBy}, 'migration-active-2'
+          )
+        `;
+
         const constraintRows = await sql<{ conname: string }[]>`
           SELECT conname
           FROM pg_constraint c
