@@ -568,9 +568,12 @@ Committed ingestion files may expose temporary upload previews from VPS staging 
 
 - v1 preview support is limited to image and video uploads.
 - Previews are temporary derivatives tied to `ingestion_files`, not permanent `object_artifacts`.
-- After commit, preview-capable files transition to preview-pending until a worker-generated thumbnail preview is uploaded back to VPS staging.
+- After commit, valid image uploads up to 20 MiB attempt synchronous in-process thumbnail generation (Sharp resize to at most 2048px, JPEG quality 80); success marks the preview `ready` immediately.
+- Images that cannot be generated in-process (oversized, invalid, or unsupported image bytes) remain `pending` for the external preview worker.
+- Video uploads remain `pending` for the external preview worker.
 - Generated thumbnail preview uploads must use a validated browser-viewable image output type, stay within the configured preview byte limit, and report bounded width/height dimensions on completion.
 - Unsupported media return an explicit unsupported preview state.
+- Preview retrieval (`GET /api/ingestions/:id/files/:fileId/preview`) is read-only: it returns 404 for missing files, non-ready previews, and ready previews whose staged bytes are absent, and it never triggers or schedules thumbnail generation.
 - Preview generation uses a preview-specific worker claim/report flow and does not require the normal ingestion processing lease.
 
 ---

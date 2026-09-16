@@ -357,7 +357,8 @@ Ingestion response shapes in this section are authoritative with `src/validation
   - `ingestion` (Ingestion Schema)
   - `files[]` (array of Ingestion File Schema)
   - preview behavior:
-    - image and video uploads return `preview.status = pending` after commit until a worker-generated thumbnail preview is uploaded back to VPS staging
+    - valid image uploads up to 20 MiB attempt synchronous in-process thumbnail generation during commit and return `preview.status = ready` on success
+    - images that cannot be generated in-process (oversized, invalid, or unsupported image bytes) and video uploads return `preview.status = pending` until a worker-generated thumbnail preview is uploaded back to VPS staging
     - unsupported media return `preview.status = unsupported`
     - retention-purged staged previews return `preview.status = purged`
     - `preview.url` is populated only when `preview.status = ready`
@@ -381,11 +382,12 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - Notes:
   - preview bytes are served from temporary VPS staging storage
   - preview availability follows ingestion staging retention and cleanup rules
+  - retrieval is read-only: it never triggers, schedules, or retries thumbnail generation
 - Error behavior:
   - `400 BAD_REQUEST` for invalid path params
   - `401 UNAUTHORIZED` for missing/invalid/expired session token
   - `403 FORBIDDEN` when authenticated role is not allowed
-  - `404 NOT_FOUND` when ingestion/file does not exist in tenant scope or preview is not ready
+  - `404 NOT_FOUND` when ingestion/file does not exist in tenant scope, preview is not ready, or ready preview bytes are missing from staging
 
 ### POST `/api/worker/ingestion-previews/claim`
 
@@ -708,7 +710,8 @@ Ingestion response shapes in this section are authoritative with `src/validation
 - 200 response:
   - `file` (Ingestion File Schema)
   - preview behavior:
-    - committed image/video files are marked `preview.status = pending`
+    - committed valid images up to 20 MiB attempt synchronous in-process thumbnail generation and are marked `preview.status = ready` on success
+    - committed images that cannot be generated in-process and committed videos are marked `preview.status = pending` for worker generation
     - committed unsupported media are marked `preview.status = unsupported`
 - Error behavior:
   - `400 BAD_REQUEST` for invalid path/body shape

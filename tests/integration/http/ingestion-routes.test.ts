@@ -1192,6 +1192,95 @@ describe("ingestion routes", () => {
       .toMatchObject({ status: "unsupported" });
   });
 
+  test("returns 404 for a pending video preview without mutating preview state", async () => {
+    const app = createTestApp();
+    const ingestionId = await createIngestionDraft({
+      app,
+      body: {
+        batch_label: "batch-preview-pending-video",
+        classification_type: "interview",
+        item_kind: "video",
+      },
+    });
+    const file = await createCommittedFile({
+      app,
+      ingestionId,
+      filename: "sample.mp4",
+      contentType: "video/mp4",
+      payload: "mp4data",
+    });
+
+    const detailResponse = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}`, {
+        method: "GET",
+        headers: { authorization: `Bearer ${authToken}` },
+      }),
+    );
+    expect(detailResponse.status).toBe(200);
+    const detailBody = (await detailResponse.json()) as {
+      files: Array<{ id: string; preview: { status: string; url: string | null } }>;
+    };
+    expect(detailBody.files.find((entry) => entry.id === file.fileId)?.preview)
+      .toMatchObject({ status: "pending", url: null });
+
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+    const readPreviewState = async () => {
+      const rows = await sql<
+        Array<{
+          preview_status: string;
+          preview_claimed_by: string | null;
+          preview_claimed_at: Date | null;
+          preview_storage_key: string | null;
+          preview_generated_at: Date | null;
+          updated_at: Date;
+        }>
+      >`
+        SELECT preview_status, preview_claimed_by, preview_claimed_at,
+               preview_storage_key, preview_generated_at, updated_at
+        FROM ingestion_files
+        WHERE id = ${file.fileId}
+      `;
+      return rows[0] ?? null;
+    };
+
+    try {
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      const before = await readPreviewState();
+      expect(before?.preview_status).toBe("pending");
+      expect(before?.preview_claimed_at).toBeNull();
+      expect(before?.preview_storage_key).toBeNull();
+
+      const previewResponse = await app.fetch(
+        new Request(
+          `http://localhost/api/ingestions/${ingestionId}/files/${file.fileId}/preview`,
+          {
+            method: "GET",
+            headers: { authorization: `Bearer ${authToken}` },
+          },
+        ),
+      );
+      expect(previewResponse.status).toBe(404);
+
+      const after = await readPreviewState();
+      expect(after).toEqual(before);
+
+      const detailAfterResponse = await app.fetch(
+        new Request(`http://localhost/api/ingestions/${ingestionId}`, {
+          method: "GET",
+          headers: { authorization: `Bearer ${authToken}` },
+        }),
+      );
+      expect(detailAfterResponse.status).toBe(200);
+      const detailAfterBody = (await detailAfterResponse.json()) as {
+        files: Array<{ id: string; preview: { status: string; url: string | null } }>;
+      };
+      expect(detailAfterBody.files.find((entry) => entry.id === file.fileId)?.preview)
+        .toMatchObject({ status: "pending", url: null });
+    } finally {
+      await sql.close();
+    }
+  });
+
   test("updates ingestion metadata while draft", async () => {
     const app = createTestApp();
 

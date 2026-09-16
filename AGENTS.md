@@ -53,42 +53,58 @@ Equivalent:
 bun run index.ts
 ```
 
-### Type-check (no dedicated npm script yet)
+### Type-check
 
 ```bash
-bunx tsc --noEmit
+bun run typecheck
 ```
 
-### Test suite
+### Unit tests
 
 ```bash
-bun test
+bun run test:unit
 ```
+
+### Integration tests
+
+```bash
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/osimi_test bun run test:integration
+```
+
+### Release gate
+
+```bash
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/osimi_test bun run test:release
+```
+
+Integration tests require `TEST_DATABASE_URL`; they never fall back to
+`DATABASE_URL`. The database name must include `test` unless an explicitly
+acknowledged disposable database uses `ALLOW_UNSAFE_TEST_DATABASE_NAME=true`.
 
 ### Run a single test file
 
 ```bash
-bun test tests/integration/http/event-routes.test.ts
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/osimi_test bun test tests/integration/http/event-routes.test.ts
 ```
 
 ### Run tests by test name pattern
 
 ```bash
-bun test --test-name-pattern "lease exclusivity"
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/osimi_test bun test --test-name-pattern "lease exclusivity"
 ```
 
 Shorthand also works:
 
 ```bash
-bun test -t "ingestion completed"
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/osimi_test bun test -t "ingestion completed"
 ```
 
 ### Useful focused test modes
 
 ```bash
-bun test --only
-bun test --only-failures
-bun test --timeout 10000
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/osimi_test bun test --only
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/osimi_test bun test --only-failures
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/osimi_test bun test --timeout 10000
 ```
 
 ### Migrations
@@ -96,6 +112,11 @@ bun test --timeout 10000
 ```bash
 bun run migrate
 ```
+
+Migration schema precedence is `--schema`, then `DB_SCHEMA`, then `public`.
+An explicit override emits a warning when it differs from `DB_SCHEMA`.
+`--dry-run` performs no DDL or writes, and migration runners are serialized by
+a database-scoped advisory lock.
 
 Direct invocation with flags:
 
@@ -112,7 +133,7 @@ bun run create-user
 
 ## Environment Notes
 
-- Integration migration tests require `TEST_DATABASE_URL` or `DATABASE_URL`.
+- Integration tests require `TEST_DATABASE_URL`; they never use `DATABASE_URL`.
 - Lease signing and background jobs use env vars documented in `README.md`.
 - For schema-aware local/testing runs, ensure migration schema and runtime schema are aligned.
 

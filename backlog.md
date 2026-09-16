@@ -7,13 +7,13 @@
   - Added DB uniqueness guard on `objects.source_ingestion_id` (non-null).
 
 - [x] Decide and codify ingestion-to-object cardinality.
-  - Decision: `1 ingestion -> 1 object` (MVP).
-  - Applied in schema/service/tests; requirement wording updated accordingly.
+  - Decision: one ingestion is a submission container for one or more item-scoped objects.
+  - `INGESTION_ITEM_COMPLETED` materializes objects; `INGESTION_COMPLETED` is aggregate-only.
 
 - [x] Align object ID authority model across code and docs.
-  - `INGESTION_COMPLETED`, `OBJECT_CREATED`, and `ARTIFACT_CREATED` now require `object_id`.
+  - `INGESTION_ITEM_COMPLETED`, `OBJECT_CREATED`, and `ARTIFACT_CREATED` require `object_id`.
   - Backend event flow no longer generates `object_id`; it uses archive-supplied identity.
-  - Completion path rejects conflicting object identity for the same ingestion.
+  - Item completion rejects conflicting object identity for the same ingestion item.
   - Contract/docs aligned in requirements, architecture, and implementation phases.
 
 ## Medium Priority
@@ -27,8 +27,8 @@
   - Remove any leftover dead imports from previous refactors.
 
 - [x] Add concurrency-focused tests for object completion idempotency.
-  - Added concurrent completion test for same ingestion.
-  - Asserts single object row under the `1 ingestion -> 1 object` decision.
+  - Added concurrent completion test for the same ingestion item.
+  - Asserts one object row per item under the item-scoped cardinality decision.
 
 ## Documentation
 

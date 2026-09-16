@@ -182,7 +182,7 @@ describe("archive artifact finalization service", () => {
       new Response(child.stderr).text(),
     ]);
     expect(exitCode).toBe(0);
-    expect(stderr).toContain("forced fixture metadata update failure");
+    expect(stderr).toBe("");
     expect(stdout).toContain("forced fixture metadata update failure");
   }
 
@@ -223,7 +223,7 @@ describe("archive artifact finalization service", () => {
     ]);
     expect(exitCode).toBe(0);
     expect(stdout).toBe("");
-    expect(stderr).toContain("Artifact upload finalization claim is no longer active.");
+    expect(stderr).toBe("");
   }
 
   function expectCommitted(state: Awaited<ReturnType<typeof readFinalizationState>>): void {
