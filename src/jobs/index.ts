@@ -1,4 +1,5 @@
 import {
+  runArchiveRequestSourceCleanup,
   runArtifactFinalizationSweep,
   runCurationPublicationSourceCleanup,
   runStagingRetentionSweep,
@@ -169,6 +170,17 @@ export function startBackgroundJobs(): JobRuntime {
         missing: publicationSources.missing,
         failed: publicationSources.failed,
         orphaned: publicationSources.orphaned,
+      });
+
+      const requestSources = await runArchiveRequestSourceCleanup({
+        batchSize: retentionBatchSize,
+        claimTimeoutSeconds: retentionClaimTimeoutSeconds,
+      });
+      logJobEvent("INFO", "jobs.archive_request_source_cleanup", {
+        claimed: requestSources.claimed,
+        purged: requestSources.purged,
+        missing: requestSources.missing,
+        failed: requestSources.failed,
       });
     } catch (error) {
       logJobEvent("ERROR", "jobs.staging_retention.failed", {

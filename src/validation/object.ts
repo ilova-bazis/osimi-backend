@@ -88,6 +88,7 @@ export const archiveRequestActionTypeSchema = z.enum([
     "object_resync",
     "artifact_fetch",
     "curation_apply",
+    "object_revision_apply",
 ]);
 
 export const objectDatePrecisionSchema = z.enum(["none", "year", "month", "day"]);
@@ -214,6 +215,7 @@ const objectEditCapabilitiesSchema = z.object({
     can_edit_metadata: z.boolean(),
     can_curate_text: z.boolean(),
     can_submit_review: z.boolean(),
+    can_submit_changes: z.boolean(),
 });
 
 const objectEditDocumentCurationPayloadSchema = z.object({
@@ -294,6 +296,76 @@ export const objectCurationPublicationResponseSchema = z.object({
     }).nullable(),
 }).strict();
 
+const objectChangeSubmissionRequestStatusSchema = z.enum([
+    "PENDING",
+    "PROCESSING",
+    "COMPLETED",
+    "FAILED",
+    "CANCELED",
+]);
+
+const objectChangeSubmissionSchema = z.object({
+    id: z.uuid(),
+    request_id: z.uuid(),
+    submitted_revision: z.number().int().min(0),
+    status: objectChangeSubmissionRequestStatusSchema,
+    submitted_at: z.string(),
+    submitted_by: z.string().nullable(),
+    completed_at: z.string().nullable(),
+    failure_reason: z.string().nullable(),
+});
+
+export const submitObjectChangesBodySchema = z.strictObject({
+    revision: z.number().int().min(0),
+    submission_note: nullableTrimmedStringSchema,
+});
+
+export const submitObjectChangesResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    current_revision: z.number().int().min(0),
+    submitted_revision: z.number().int().min(0),
+    submission: z.object({
+        id: z.uuid(),
+        request_id: z.uuid(),
+        action_type: z.literal("object_revision_apply"),
+        status: objectChangeSubmissionRequestStatusSchema,
+        submitted_at: z.string(),
+        submitted_by: z.string().nullable(),
+    }),
+}).strict();
+
+export const objectChangeStatusResponseSchema = z.object({
+    object_id: objectIdParamSchema,
+    current_revision: z.number().int().min(0),
+    latest_submitted_revision: z.number().int().min(0).nullable(),
+    latest_applied_revision: z.number().int().min(0).nullable(),
+    archive_out_of_sync: z.boolean(),
+    active_submission: objectChangeSubmissionSchema.nullable(),
+    latest_submission: objectChangeSubmissionSchema.nullable(),
+}).strict();
+
+export const retryObjectChangeSubmissionBodySchema = z
+    .strictObject({
+        retry_reason: nullableTrimmedStringSchema.optional(),
+    })
+    .transform((value) => ({
+        retry_reason: value.retry_reason ?? null,
+    }));
+
+export const workerObjectRevisionApplyResultSchema = z.strictObject({
+    schema_version: z.literal("1.0"),
+    submission_id: z.uuid(),
+    object_id: objectIdParamSchema,
+    object_revision: z.number().int().min(0),
+    package_sha256: z
+        .string()
+        .trim()
+        .regex(/^[0-9a-f]{64}$/, "Expected a 64-character lowercase SHA-256 checksum."),
+    disposition: z.literal("applied"),
+    archive_revision_id: z.string().trim().min(1),
+    applied_at: z.iso.datetime({ offset: true }),
+});
+
 export const releaseObjectEditLockResponseSchema = z.object({
     object_id: objectIdParamSchema,
     released: z.boolean(),
@@ -304,6 +376,11 @@ const objectEditHistoryEventTypeSchema = z.enum([
     "RIGHTS_UPDATED",
     "DOCUMENT_PAGE_UPDATED",
     "CURATION_SUBMITTED",
+    "ACCESS_POLICY_UPDATED",
+    "CHANGES_SUBMITTED",
+    "CHANGES_RETRY_REQUESTED",
+    "CHANGES_SYNCHRONIZED",
+    "CHANGES_SYNC_FAILED",
 ]);
 
 const objectEditHistoryEventSchema = z.object({
@@ -622,6 +699,7 @@ export const workerFailObjectDownloadRequestBodySchema = z.strictObject({
 export const workerCompleteArchiveRequestBodySchema = z.strictObject({
     lease_token: z.string().trim().min(1),
     upload_token: z.string().trim().min(1).optional(),
+    result: jsonObjectSchema.optional(),
 });
 
 export const workerFailArchiveRequestBodySchema = z.strictObject({
@@ -684,6 +762,7 @@ export const replaceObjectAvailableFilesResponseSchema = z.object({
 
 export const updateAccessPolicyBodySchema = z
     .strictObject({
+        revision: z.number().int().min(0),
         access_level: accessLevelSchema,
         embargo_kind: embargoKindSchema,
         embargo_until: z.iso.datetime({ offset: true }).nullable().optional(),
@@ -1110,6 +1189,7 @@ export const updateAccessPolicyResponseSchema = z.object({
     object: objectDtoSchema.extend({
         ingest_manifest: jsonObjectSchema.nullable(),
     }),
+    revision: z.number().int().min(0),
 });
 
 export const createAccessRequestResponseSchema = z.object({
@@ -1292,6 +1372,19 @@ export type SubmitObjectCurationResponse = z.infer<
 >;
 export type ObjectCurationPublicationResponse = z.infer<
     typeof objectCurationPublicationResponseSchema
+>;
+export type SubmitObjectChangesBody = z.infer<typeof submitObjectChangesBodySchema>;
+export type SubmitObjectChangesResponse = z.infer<
+    typeof submitObjectChangesResponseSchema
+>;
+export type ObjectChangeStatusResponse = z.infer<
+    typeof objectChangeStatusResponseSchema
+>;
+export type RetryObjectChangeSubmissionBody = z.infer<
+    typeof retryObjectChangeSubmissionBodySchema
+>;
+export type WorkerObjectRevisionApplyResult = z.infer<
+    typeof workerObjectRevisionApplyResultSchema
 >;
 export type CreateObjectDownloadRequestResponse = z.infer<
     typeof createObjectDownloadRequestResponseSchema
@@ -1661,6 +1754,39 @@ export function parseUpdateAccessPolicyBody(
     value: unknown,
 ): UpdateAccessPolicyBody {
     const parsed = updateAccessPolicyBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseSubmitObjectChangesBody(
+    value: unknown,
+): SubmitObjectChangesBody {
+    const parsed = submitObjectChangesBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseRetryObjectChangeSubmissionBody(
+    value: unknown,
+): RetryObjectChangeSubmissionBody {
+    const parsed = retryObjectChangeSubmissionBodySchema.safeParse(value);
+    if (!parsed.success) {
+        throw mapZodErrorToValidation(parsed.error);
+    }
+
+    return parsed.data;
+}
+
+export function parseWorkerObjectRevisionApplyResult(
+    value: unknown,
+): WorkerObjectRevisionApplyResult {
+    const parsed = workerObjectRevisionApplyResultSchema.safeParse(value);
     if (!parsed.success) {
         throw mapZodErrorToValidation(parsed.error);
     }

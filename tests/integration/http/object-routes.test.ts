@@ -1358,13 +1358,14 @@ describe("object routes", () => {
         expect(foreignLoad.status).toBe(200);
         const foreignBody = (await foreignLoad.json()) as {
             lock: { locked_by: string | null };
-            capabilities: { can_edit_metadata: boolean; can_curate_text: boolean; can_submit_review: boolean };
+            capabilities: { can_edit_metadata: boolean; can_curate_text: boolean; can_submit_review: boolean; can_submit_changes: boolean };
         };
         expect(foreignBody.lock.locked_by).toBe("10000000-0000-0000-0000-000000000001");
         expect(foreignBody.capabilities).toEqual({
             can_edit_metadata: false,
             can_curate_text: false,
             can_submit_review: false,
+            can_submit_changes: false,
         });
 
         const lockedWrite = await app.fetch(
@@ -1507,6 +1508,7 @@ describe("object routes", () => {
                 can_edit_metadata: boolean;
                 can_curate_text: boolean;
                 can_submit_review: boolean;
+                can_submit_changes: boolean;
             };
             curation_payload: {
                 kind: "document";
@@ -1545,6 +1547,7 @@ describe("object routes", () => {
             can_edit_metadata: true,
             can_curate_text: false,
             can_submit_review: false,
+            can_submit_changes: false,
         });
         expect(body.curation_payload.kind).toBe("document");
         expect(body.curation_payload.machine_ocr_artifact_id).toBeNull();
@@ -1625,6 +1628,7 @@ describe("object routes", () => {
                 can_edit_metadata: boolean;
                 can_curate_text: boolean;
                 can_submit_review: boolean;
+                can_submit_changes: boolean;
             };
             curation_payload: {
                 kind: string;
@@ -1645,6 +1649,7 @@ describe("object routes", () => {
             can_edit_metadata: true,
             can_curate_text: true,
             can_submit_review: true,
+            can_submit_changes: false,
         });
         expect(initialEditBody.curation_payload.kind).toBe("document");
         if (initialEditBody.curation_payload.kind !== "document") {
@@ -2835,6 +2840,7 @@ describe("object routes", () => {
         expect(editResponse.status).toBe(200);
         const editBody = (await editResponse.json()) as {
             metadata: { title: string };
+            revision: number;
         };
         expect(editBody.metadata.title).toBe("Retitled With Thumbnail");
 
@@ -2860,6 +2866,7 @@ describe("object routes", () => {
                         "content-type": "application/json",
                     },
                     body: JSON.stringify({
+                        revision: editBody.revision,
                         access_level: "family",
                         embargo_kind: "none",
                     }),
@@ -2870,10 +2877,12 @@ describe("object routes", () => {
         expect(patchPolicyResponse.status).toBe(200);
         const patchPolicyBody = (await patchPolicyResponse.json()) as {
             object: { thumbnail_artifact_id: string | null };
+            revision: number;
         };
         expect(patchPolicyBody.object.thumbnail_artifact_id).toBe(
             thumbnailArtifactId,
         );
+        expect(patchPolicyBody.revision).toBeGreaterThan(editBody.revision);
     });
 
     test("validates conditional access-policy embargo fields", async () => {

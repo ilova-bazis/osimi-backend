@@ -93,7 +93,8 @@ Load the current editing state for one object. Calling this endpoint auto-acquir
   "capabilities": {
     "can_edit_metadata": true,
     "can_curate_text": true,
-    "can_submit_review": true
+    "can_submit_review": true,
+    "can_submit_changes": true
   },
   "curation_payload": {
     "kind": "document",
@@ -143,6 +144,10 @@ Load the current editing state for one object. Calling this endpoint auto-acquir
   - legacy wire name for the ability to publish curated OCR
   - `true` under the same role, lock, media, and page-projection conditions as `can_curate_text`
   - does not indicate that a human review workflow exists
+- `capabilities.can_submit_changes`
+  - `true` for authorized archiver and admin users when the object is not locked by another editor and object change submission is enabled for the environment (`OBJECT_REVISION_APPLY_ENABLED`)
+  - `false` for a foreign active lock or when submission is disabled
+  - applies to every media type; documents without an OCR page projection may still submit metadata-only changes
 - `curation_payload.kind`
   - currently mirrors `media_type`
   - for `document`, `curation_payload.pages[]` contains OCR editing data

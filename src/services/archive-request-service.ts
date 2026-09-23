@@ -23,12 +23,17 @@ import {
   type ArchiveRequestTargetType,
 } from "../repos/archive-request-repo.ts";
 import { findCurationPublicationByRequestId } from "../repos/curation-publication-repo.ts";
+import { findArchiveRequestSourceByRequestId } from "../repos/archive-request-source-repo.ts";
 import { resolveStagingPath } from "../storage/staging.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
-import type {
-  WorkerCompleteArchiveRequestBody,
-  WorkerPresignObjectArtifactUploadBody,
-  WorkerPresignObjectArtifactUploadResponse,
+import {
+  completeObjectRevisionApplyByWorker,
+} from "./object-change-submission-service.ts";
+import {
+  parseWorkerObjectRevisionApplyResult,
+  type WorkerCompleteArchiveRequestBody,
+  type WorkerPresignObjectArtifactUploadBody,
+  type WorkerPresignObjectArtifactUploadResponse,
 } from "../validation/object.ts";
 
 const DEFAULT_ARCHIVE_REQUEST_LEASE_TTL_SECONDS = 60 * 5;
@@ -178,7 +183,7 @@ export async function leaseNextArchiveRequest(params: {
   };
 }
 
-export async function downloadCurationPublicationSource(params: {
+export async function downloadArchiveRequestSource(params: {
   requestId: string;
   leaseToken: string;
   workerId?: string;
@@ -187,8 +192,11 @@ export async function downloadCurationPublicationSource(params: {
     requestId: params.requestId,
     leaseToken: params.leaseToken,
   });
-  if (authorizedLease.actionType !== "curation_apply") {
-    throw new ConflictError("Archive request does not expose a curation source.");
+  if (
+    authorizedLease.actionType !== "curation_apply" &&
+    authorizedLease.actionType !== "object_revision_apply"
+  ) {
+    throw new ConflictError("Archive request does not expose a downloadable source.");
   }
   if (
     params.workerId &&
@@ -198,35 +206,98 @@ export async function downloadCurationPublicationSource(params: {
     throw new ConflictError("Lease belongs to a different worker.");
   }
 
+  if (authorizedLease.actionType === "object_revision_apply") {
+    return await serveArchiveRequestSourceFile({
+      requestId: params.requestId,
+      loadSource: async () => {
+        const source = await findArchiveRequestSourceByRequestId({
+          requestId: params.requestId,
+        });
+        if (!source) {
+          return undefined;
+        }
+        return {
+          storageKey: source.storageKey,
+          contentType: source.contentType,
+          sizeBytes: source.sizeBytes,
+          checksumSha256: source.checksumSha256,
+          purged: source.purgedAt !== null,
+        };
+      },
+      missingMessage: "Archive request source was not found.",
+    });
+  }
+
   const publication = await findCurationPublicationByRequestId({
     requestId: params.requestId,
   });
-  if (!publication || publication.purgedAt) {
-    throw new NotFoundError("Curation publication source was not found.");
+  return await serveArchiveRequestSourceFile({
+    requestId: params.requestId,
+    loadSource: async () => {
+      if (!publication) {
+        return undefined;
+      }
+      return {
+        storageKey: publication.storageKey,
+        contentType: publication.contentType,
+        sizeBytes: publication.sizeBytes,
+        checksumSha256: publication.checksumSha256,
+        purged: publication.purgedAt !== null,
+      };
+    },
+    missingMessage: "Curation publication source was not found.",
+  });
+}
+
+async function serveArchiveRequestSourceFile(params: {
+  requestId: string;
+  loadSource: () => Promise<
+    | {
+        storageKey: string;
+        contentType: string;
+        sizeBytes: number;
+        checksumSha256: string;
+        purged: boolean;
+      }
+    | undefined
+  >;
+  missingMessage: string;
+}): Promise<Response> {
+  const source = await params.loadSource();
+  if (!source || source.purged) {
+    throw new NotFoundError(params.missingMessage);
   }
 
-  const file = Bun.file(resolveStagingPath(publication.storageKey));
+  const file = Bun.file(resolveStagingPath(source.storageKey));
   if (!(await file.exists())) {
-    throw new NotFoundError("Curation publication source was not found.");
+    throw new NotFoundError(params.missingMessage);
   }
-  if (file.size !== publication.sizeBytes) {
-    throw new ConflictError("Curation publication source size does not match its checkpoint.");
+  if (file.size !== source.sizeBytes) {
+    throw new ConflictError("Archive request source size does not match its checkpoint.");
   }
   const bytes = await file.arrayBuffer();
   const checksum = createHash("sha256").update(new Uint8Array(bytes)).digest("hex");
-  if (checksum !== publication.checksumSha256) {
-    throw new ConflictError("Curation publication source checksum does not match its checkpoint.");
+  if (checksum !== source.checksumSha256) {
+    throw new ConflictError("Archive request source checksum does not match its checkpoint.");
   }
 
   return new Response(bytes, {
     status: 200,
     headers: {
-      "content-type": publication.contentType,
-      "content-length": String(publication.sizeBytes),
-      "x-content-sha256": publication.checksumSha256,
+      "content-type": source.contentType,
+      "content-length": String(source.sizeBytes),
+      "x-content-sha256": source.checksumSha256,
       "cache-control": "no-store",
     },
   });
+}
+
+export async function downloadCurationPublicationSource(params: {
+  requestId: string;
+  leaseToken: string;
+  workerId?: string;
+}): Promise<Response> {
+  return await downloadArchiveRequestSource(params);
 }
 
 export async function heartbeatArchiveRequestLease(params: {
@@ -325,6 +396,34 @@ export async function completeArchiveRequestByWorker(params: {
     return {
       status: "completed",
       request: serializeArchiveRequest(finalized.request),
+    };
+  }
+
+  if (authorizedLease.actionType === "object_revision_apply") {
+    if (!params.body.result) {
+      throw new ValidationError(
+        "Field 'result' is required when completing object_revision_apply requests.",
+      );
+    }
+
+    const result = parseWorkerObjectRevisionApplyResult(params.body.result);
+    await completeObjectRevisionApplyByWorker({
+      requestId: params.requestId,
+      leaseId: authorizedLease.leaseId,
+      leaseTokenId: authorizedLease.leaseTokenId,
+      result,
+    });
+
+    const completedRequest = await findArchiveRequestById({
+      requestId: authorizedLease.requestId,
+    });
+    if (!completedRequest) {
+      throw new ConflictError("Archive request could not be reloaded after completion.");
+    }
+
+    return {
+      status: "completed",
+      request: serializeArchiveRequest(completedRequest),
     };
   }
 

@@ -1428,6 +1428,7 @@ The object editing endpoints below apply both their listed role requirement and 
     - `can_edit_metadata`
     - `can_curate_text`
     - `can_submit_review`
+    - `can_submit_changes`
   - `curation_payload`:
     - for `document`:
       - `kind = document`
@@ -1471,7 +1472,8 @@ The object editing endpoints below apply both their listed role requirement and 
   "capabilities": {
     "can_edit_metadata": true,
     "can_curate_text": true,
-    "can_submit_review": true
+    "can_submit_review": true,
+    "can_submit_changes": true
   },
   "curation_payload": {
     "kind": "document",

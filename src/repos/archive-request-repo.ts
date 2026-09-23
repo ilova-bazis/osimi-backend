@@ -15,7 +15,8 @@ export type ArchiveRequestTargetType = "object" | "ingestion";
 export type ArchiveRequestActionType =
     | "object_resync"
     | "artifact_fetch"
-    | "curation_apply";
+    | "curation_apply"
+    | "object_revision_apply";
 
 interface ArchiveRequestRow {
     id: string;
@@ -128,6 +129,11 @@ export interface FindActiveCurationApplyByObjectParams {
     objectId: string;
 }
 
+export interface FindObjectMutationByObjectParams {
+    tenantId: string;
+    objectId: string;
+}
+
 function mapArchiveRequest(row: ArchiveRequestRow): ArchiveRequestRecord {
     return {
         id: row.id,
@@ -188,9 +194,9 @@ export async function createArchiveRequestWithExecutor(
     return mapArchiveRequest(rows[0]!);
 }
 
-export async function tryCreateCurationApplyArchiveRequestWithExecutor(
+export async function tryCreateArchiveRequestWithExecutor(
     executor: ArchiveRequestSqlExecutor,
-    params: CreateArchiveRequestParams & { actionType: "curation_apply" },
+    params: CreateArchiveRequestParams,
 ): Promise<ArchiveRequestRecord | undefined> {
     const rows = await executor<ArchiveRequestRow[]>`
       INSERT INTO archive_requests (
@@ -217,6 +223,13 @@ export async function tryCreateCurationApplyArchiveRequestWithExecutor(
 
     const row = rows[0];
     return row ? mapArchiveRequest(row) : undefined;
+}
+
+export async function tryCreateCurationApplyArchiveRequestWithExecutor(
+    executor: ArchiveRequestSqlExecutor,
+    params: CreateArchiveRequestParams & { actionType: "curation_apply" },
+): Promise<ArchiveRequestRecord | undefined> {
+    return await tryCreateArchiveRequestWithExecutor(executor, params);
 }
 
 export async function createArchiveRequest(
@@ -344,6 +357,72 @@ export async function findCurrentCurationApplyByObject(params: {
 
         const row = rows[0];
         return row ? mapArchiveRequest(row) : undefined;
+    });
+}
+
+export async function findActiveObjectMutationByObjectWithExecutor(
+    executor: ArchiveRequestSqlExecutor,
+    params: FindObjectMutationByObjectParams,
+): Promise<ArchiveRequestRecord | undefined> {
+    const rows = await executor<ArchiveRequestRow[]>`
+      SELECT id, tenant_id, target_type, target_id, action_type, action_payload,
+             requested_by, dedupe_key, status, failure_reason, failure_details,
+             lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
+             created_at, updated_at, completed_at
+      FROM archive_requests req
+      WHERE req.tenant_id = ${params.tenantId}
+        AND req.target_type = 'object'
+        AND req.target_id = ${params.objectId}
+        AND req.action_type IN ('curation_apply', 'object_revision_apply')
+        AND req.status IN ('PENDING', 'PROCESSING')
+      ORDER BY req.created_at DESC, req.id DESC
+      LIMIT 1
+    `;
+
+    const row = rows[0];
+    return row ? mapArchiveRequest(row) : undefined;
+}
+
+export async function findActiveObjectMutationByObject(params: {
+    tenantId: string;
+    objectId: string;
+}): Promise<ArchiveRequestRecord | undefined> {
+    return await withSchemaClient(async (sql) => {
+        return await findActiveObjectMutationByObjectWithExecutor(sql, params);
+    });
+}
+
+export async function findLatestObjectMutationByObjectWithExecutor(
+    executor: ArchiveRequestSqlExecutor,
+    params: FindObjectMutationByObjectParams,
+): Promise<ArchiveRequestRecord | undefined> {
+    const rows = await executor<ArchiveRequestRow[]>`
+      SELECT id, tenant_id, target_type, target_id, action_type, action_payload,
+             requested_by, dedupe_key, status, failure_reason, failure_details,
+             lease_id, lease_token_id, lease_expires_at, leased_by, released_at,
+             created_at, updated_at, completed_at
+      FROM archive_requests req
+      WHERE req.tenant_id = ${params.tenantId}
+        AND req.target_type = 'object'
+        AND req.target_id = ${params.objectId}
+        AND req.action_type IN ('curation_apply', 'object_revision_apply')
+      ORDER BY
+        (req.status IN ('PENDING', 'PROCESSING')) DESC,
+        req.created_at DESC,
+        req.id DESC
+      LIMIT 1
+    `;
+
+    const row = rows[0];
+    return row ? mapArchiveRequest(row) : undefined;
+}
+
+export async function findLatestObjectMutationByObject(params: {
+    tenantId: string;
+    objectId: string;
+}): Promise<ArchiveRequestRecord | undefined> {
+    return await withSchemaClient(async (sql) => {
+        return await findLatestObjectMutationByObjectWithExecutor(sql, params);
     });
 }
 
@@ -592,6 +671,15 @@ export async function completeArchiveRequest(params: {
         FROM completed
         WHERE publication.request_id = completed.id
         RETURNING publication.request_id
+      ), source_cleanup AS (
+        UPDATE archive_request_sources source
+        SET cleanup_eligible_at = COALESCE(
+              source.cleanup_eligible_at,
+              now() + interval '24 hours'
+            )
+        FROM completed
+        WHERE source.request_id = completed.id
+        RETURNING source.request_id
       )
       SELECT * FROM completed
     `;
@@ -782,11 +870,21 @@ export async function failArchiveRequest(params: {
     `;
         const row = rows[0];
         if (!row) return undefined;
+        const retryable = params.failureDetails.retryable === true;
+        const retentionDays = retryable ? 30 : 7;
         await transaction`
           UPDATE curation_publications
           SET cleanup_eligible_at = COALESCE(
                 cleanup_eligible_at,
                 now() + interval '7 days'
+              )
+          WHERE request_id = ${row.id}
+        `;
+        await transaction`
+          UPDATE archive_request_sources
+          SET cleanup_eligible_at = COALESCE(
+                cleanup_eligible_at,
+                now() + (${retentionDays}::int * interval '1 day')
               )
           WHERE request_id = ${row.id}
         `;

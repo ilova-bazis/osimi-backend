@@ -13,6 +13,7 @@ import {
 } from "../http/errors.ts";
 import type { AuthenticatedContext } from "../auth/guards.ts";
 import { requireObjectEditAccess } from "./object-edit-authorization.ts";
+import { isObjectRevisionApplyEnabled } from "./object-change-submission-service.ts";
 import { listArtifactsByObjectId, type ObjectArtifactRecord } from "../repos/object-repo.ts";
 import {
   acquireObjectEditLock,
@@ -214,6 +215,7 @@ async function serializeObjectEdit(record: ObjectEditRecord): Promise<ObjectEdit
       can_edit_metadata: true,
       can_curate_text: mediaType === "document",
       can_submit_review: false,
+      can_submit_changes: false,
     },
     curation_payload: curationPayload,
   };
@@ -253,6 +255,7 @@ export async function getObjectEditDetail(params: {
     response.capabilities.can_edit_metadata = false;
     response.capabilities.can_curate_text = false;
     response.capabilities.can_submit_review = false;
+    response.capabilities.can_submit_changes = false;
     return response;
   }
 
@@ -266,6 +269,8 @@ export async function getObjectEditDetail(params: {
     hasDocumentPageProjection &&
     (params.auth.role === "archiver" || params.auth.role === "admin");
   response.capabilities.can_submit_review = response.capabilities.can_curate_text;
+  response.capabilities.can_submit_changes =
+    response.capabilities.can_edit_metadata && isObjectRevisionApplyEnabled();
 
   return response;
 }

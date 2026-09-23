@@ -1,6 +1,8 @@
 import {
     ConflictError,
+    LockedError,
     NotFoundError,
+    RevisionConflictError,
     ValidationError,
 } from "../http/errors.ts";
 import { encodeCursor } from "../http/pagination.ts";
@@ -64,7 +66,6 @@ import {
     listObjects,
     type ArtifactKind,
     type ObjectListSort,
-    updateObjectAccessPolicy,
     updateObjectMetadataPages,
     type ObjectArtifactRecord,
     type ObjectRecord,
@@ -83,6 +84,7 @@ import {
 import { resolveMaxUploadSizeBytes } from "../runtime/config.ts";
 import { parseMediaType } from "../http/media-type.ts";
 import { finalizeVerifiedArchiveArtifactUpload } from "./archive-artifact-finalization-service.ts";
+import { updateObjectAccessPolicyRevisioned } from "../repos/object-edit-repo.ts";
 import {
     authorizeWorkerLeaseForArchiveRequest,
     type AuthorizedWorkerArchiveRequestLease,
@@ -2965,14 +2967,16 @@ export async function updateObjectAccessPolicyForTenant(params: {
     objectId: string;
     body: UpdateAccessPolicyBody;
 }): Promise<UpdateAccessPolicyResponse> {
-    const updated = await updateObjectAccessPolicy({
+    const result = await updateObjectAccessPolicyRevisioned({
         tenantId: params.auth.tenantId,
         objectId: params.objectId,
+        actorUserId: params.auth.userId,
+        revision: params.body.revision,
         accessLevel: params.body.access_level,
         embargoKind: params.body.embargo_kind,
         embargoUntil:
             params.body.embargo_kind === "timed"
-                ? (params.body.embargo_until ?? null)
+                ? new Date(params.body.embargo_until!)
                 : null,
         embargoCurationState:
             params.body.embargo_kind === "curation_state"
@@ -2982,6 +2986,27 @@ export async function updateObjectAccessPolicyForTenant(params: {
         sensitivityNote: params.body.sensitivity_note ?? null,
     });
 
+    if (result.status === "not_found") {
+        throw new NotFoundError(`Object '${params.objectId}' was not found.`);
+    }
+
+    if (result.status === "locked") {
+        throw new LockedError("Object is currently being edited by another user.", {
+            locked_by: result.lockedBy,
+            locked_until: result.lockedUntil.toISOString(),
+        });
+    }
+
+    if (result.status === "revision_conflict") {
+        throw new RevisionConflictError("Object revision is stale.", {
+            latest_revision: result.latestRevision,
+        });
+    }
+
+    const updated = await findObjectById({
+        tenantId: params.auth.tenantId,
+        objectId: params.objectId,
+    });
     if (!updated) {
         throw new NotFoundError(`Object '${params.objectId}' was not found.`);
     }
@@ -2996,6 +3021,7 @@ export async function updateObjectAccessPolicyForTenant(params: {
             ...serializeObject(updated, { includeIngestManifest: true }),
             thumbnail_artifact_id: thumbnailArtifactId ?? null,
         },
+        revision: result.record.revision,
     };
 }
 

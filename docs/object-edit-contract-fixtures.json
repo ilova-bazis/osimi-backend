@@ -29,7 +29,8 @@
     "capabilities": {
       "can_edit_metadata": true,
       "can_curate_text": true,
-      "can_submit_review": true
+      "can_submit_review": true,
+      "can_submit_changes": true
     },
     "curation_payload": {
       "kind": "document",

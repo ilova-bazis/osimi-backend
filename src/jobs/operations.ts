@@ -16,6 +16,12 @@ import {
   curationPublicationStorageKeyExists,
   failCurationPublicationCleanup,
 } from "../repos/curation-publication-repo.ts";
+import {
+  archiveRequestSourceStorageKeyExists,
+  claimArchiveRequestSourceCleanupBatch,
+  completeArchiveRequestSourceCleanup,
+  failArchiveRequestSourceCleanup,
+} from "../repos/archive-request-source-repo.ts";
 import { stagingRootPath } from "../storage/staging.ts";
 
 export interface StagingRetentionConfig {
@@ -58,6 +64,13 @@ export interface CurationPublicationSourceCleanupResult extends StagingRetention
   orphaned: number;
 }
 
+async function archiveRequestSourceStorageKeyIsTracked(storageKey: string): Promise<boolean> {
+  if (await curationPublicationStorageKeyExists(storageKey)) {
+    return true;
+  }
+  return await archiveRequestSourceStorageKeyExists(storageKey);
+}
+
 export async function runCurationPublicationSourceCleanup(config: {
   batchSize?: number;
   claimTimeoutSeconds?: number;
@@ -96,7 +109,7 @@ export async function runCurationPublicationSourceCleanup(config: {
     try {
       const path = resolveStagingPath(storageKey);
       const file = await stat(path);
-      if (file.mtimeMs > orphanCutoff || await curationPublicationStorageKeyExists(storageKey)) {
+      if (file.mtimeMs > orphanCutoff || await archiveRequestSourceStorageKeyIsTracked(storageKey)) {
         continue;
       }
       await rm(dirname(path), { recursive: true, force: true });
@@ -107,6 +120,39 @@ export async function runCurationPublicationSourceCleanup(config: {
   }
 
   return { claimed: claims.length, purged, missing, failed, orphaned };
+}
+
+export async function runArchiveRequestSourceCleanup(config: {
+  batchSize?: number;
+  claimTimeoutSeconds?: number;
+} = {}): Promise<StagingRetentionResult> {
+  const claims = await claimArchiveRequestSourceCleanupBatch({
+    batchSize: config.batchSize ?? 25,
+    claimTimeoutSeconds: config.claimTimeoutSeconds ?? 900,
+  });
+  let purged = 0;
+  let missing = 0;
+  let failed = 0;
+
+  for (const claim of claims) {
+    const path = resolveStagingPath(claim.storageKey);
+    const existed = await stat(path).then(() => true).catch(() => false);
+    try {
+      await rm(path, { force: true });
+      if (await completeArchiveRequestSourceCleanup(claim)) {
+        purged += 1;
+        if (!existed) missing += 1;
+      }
+    } catch (error) {
+      failed += 1;
+      await failArchiveRequestSourceCleanup({
+        claim,
+        message: error instanceof Error ? error.message : "filesystem_error",
+      });
+    }
+  }
+
+  return { claimed: claims.length, purged, missing, failed };
 }
 
 export async function runArtifactFinalizationSweep(config: {

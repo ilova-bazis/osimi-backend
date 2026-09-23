@@ -13,7 +13,7 @@ import {
   findCurationPublicationByIdentity,
 } from "./curation-publication-repo.ts";
 
-interface ObjectEditRow {
+export interface ObjectEditRow {
   object_id: string;
   tenant_id: string;
   type: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
@@ -31,6 +31,14 @@ interface ObjectEditRow {
   rights_note: string | null;
   sensitivity_note: string | null;
   access_level: "private" | "family" | "public";
+  embargo_kind: "none" | "timed" | "curation_state";
+  embargo_until: Date | null;
+  embargo_curation_state:
+    | "needs_review"
+    | "review_in_progress"
+    | "reviewed"
+    | "curation_failed"
+    | null;
   metadata: JsonObject;
   updated_at: Date;
   tags: string[] | null;
@@ -49,7 +57,12 @@ interface ObjectEditEventRow {
     | "METADATA_UPDATED"
     | "RIGHTS_UPDATED"
     | "DOCUMENT_PAGE_UPDATED"
-    | "CURATION_SUBMITTED";
+    | "CURATION_SUBMITTED"
+    | "ACCESS_POLICY_UPDATED"
+    | "CHANGES_SUBMITTED"
+    | "CHANGES_RETRY_REQUESTED"
+    | "CHANGES_SYNCHRONIZED"
+    | "CHANGES_SYNC_FAILED";
   actor_user_id: string | null;
   revision_before: number | null;
   revision_after: number | null;
@@ -71,6 +84,9 @@ export interface ObjectEditRecord {
   rightsNote: string | null;
   sensitivityNote: string | null;
   accessLevel: ObjectEditRow["access_level"];
+  embargoKind: ObjectEditRow["embargo_kind"];
+  embargoUntil: Date | null;
+  embargoCurationState: ObjectEditRow["embargo_curation_state"];
   metadata: JsonObject;
   updatedAt: Date;
   tags: string[];
@@ -177,11 +193,10 @@ function getActiveLockHeldByAnotherUser(
   }
 }
 
-async function isObjectEditAuthorized(
+export async function isObjectEditAuthorized(
   sql: ArchiveRequestSqlExecutor,
   params: { tenantId: string; objectId: string; userId: string; role: UserRole; accessLevel: ObjectEditRow["access_level"] },
-): Promise<boolean> {
-  const assignments = await sql<{ granted_level: "family" | "private" }[]>`
+): Promise<boolean> {  const assignments = await sql<{ granted_level: "family" | "private" }[]>`
     SELECT granted_level
     FROM object_access_assignments
     WHERE tenant_id = ${params.tenantId}
@@ -197,7 +212,7 @@ async function isObjectEditAuthorized(
   });
 }
 
-function mapObjectEdit(row: ObjectEditRow): ObjectEditRecord {
+export function mapObjectEdit(row: ObjectEditRow): ObjectEditRecord {
   return {
     objectId: row.object_id,
     tenantId: row.tenant_id,
@@ -212,6 +227,9 @@ function mapObjectEdit(row: ObjectEditRow): ObjectEditRecord {
     rightsNote: row.rights_note,
     sensitivityNote: row.sensitivity_note,
     accessLevel: row.access_level,
+    embargoKind: row.embargo_kind,
+    embargoUntil: row.embargo_until,
+    embargoCurationState: row.embargo_curation_state,
     metadata: row.metadata,
     updatedAt: row.updated_at,
     tags: Array.isArray(row.tags) ? row.tags : [],
@@ -369,7 +387,7 @@ function getMetadataDocumentPageNumbers(metadata: JsonObject): number[] {
     .sort((left, right) => left - right);
 }
 
-async function selectObjectEditRow(
+export async function selectObjectEditRow(
   sql: ArchiveRequestSqlExecutor,
   params: {
     tenantId: string;
@@ -393,6 +411,9 @@ async function selectObjectEditRow(
           obj.rights_note,
           obj.sensitivity_note,
           obj.access_level,
+          obj.embargo_kind,
+          obj.embargo_until,
+          obj.embargo_curation_state,
           obj.metadata,
           obj.updated_at,
           COALESCE((
@@ -433,6 +454,9 @@ async function selectObjectEditRow(
           obj.rights_note,
           obj.sensitivity_note,
           obj.access_level,
+          obj.embargo_kind,
+          obj.embargo_until,
+          obj.embargo_curation_state,
           obj.metadata,
           obj.updated_at,
           COALESCE((
@@ -1200,6 +1224,127 @@ export async function submitDocumentCuration(params: {
           createdAt: createdRequest.createdAt,
           requestedBy: createdRequest.requestedBy,
         },
+      };
+    });
+  });
+}
+
+export type UpdateObjectAccessPolicyRevisionedResult =
+  | { status: "not_found" }
+  | { status: "locked"; lockedBy: string; lockedUntil: Date }
+  | { status: "revision_conflict"; latestRevision: number }
+  | { status: "updated"; record: ObjectEditRecord };
+
+export async function updateObjectAccessPolicyRevisioned(params: {
+  tenantId: string;
+  objectId: string;
+  actorUserId: string;
+  revision: number;
+  accessLevel: ObjectEditRow["access_level"];
+  embargoKind: ObjectEditRow["embargo_kind"];
+  embargoUntil: Date | null;
+  embargoCurationState: ObjectEditRow["embargo_curation_state"];
+  rightsNote: string | null;
+  sensitivityNote: string | null;
+}): Promise<UpdateObjectAccessPolicyRevisionedResult> {
+  return await withSchemaClient(async (sql) => {
+    return await sql.begin(async (transaction) => {
+      const currentRow = await selectObjectEditRow(transaction, {
+        tenantId: params.tenantId,
+        objectId: params.objectId,
+        forUpdate: true,
+      });
+
+      if (!currentRow) {
+        return { status: "not_found" };
+      }
+
+      const activeLock = getActiveLockHeldByAnotherUser(currentRow, params.actorUserId);
+      if (activeLock) {
+        return { status: "locked", ...activeLock };
+      }
+
+      await transaction`
+        INSERT INTO object_edits (object_id, revision)
+        VALUES (${params.objectId}, 0)
+        ON CONFLICT (object_id) DO NOTHING
+      `;
+
+      const revisionRows = await transaction<{ revision: number }[]>`
+        SELECT revision
+        FROM object_edits
+        WHERE object_id = ${params.objectId}
+        LIMIT 1
+      `;
+      const currentRevision = revisionRows[0]?.revision ?? 0;
+      if (currentRevision !== params.revision) {
+        return {
+          status: "revision_conflict",
+          latestRevision: currentRevision,
+        };
+      }
+      const nextRevision = currentRevision + 1;
+
+      await transaction`
+        UPDATE objects
+        SET access_level = ${params.accessLevel}::object_access_level,
+            embargo_kind = ${params.embargoKind}::object_embargo_kind,
+            embargo_until = ${params.embargoUntil}::timestamptz,
+            embargo_curation_state = ${params.embargoCurationState}::object_curation_state,
+            rights_note = ${params.rightsNote}::text,
+            sensitivity_note = ${params.sensitivityNote}::text,
+            updated_at = now()
+        WHERE object_id = ${params.objectId}
+      `;
+
+      await transaction`
+        UPDATE object_edits
+        SET revision = ${nextRevision},
+            updated_at = now(),
+            updated_by = ${params.actorUserId}
+        WHERE object_id = ${params.objectId}
+      `;
+
+      await transaction`
+        INSERT INTO object_edit_events (
+          id,
+          object_id,
+          tenant_id,
+          type,
+          actor_user_id,
+          revision_before,
+          revision_after,
+          payload
+        )
+        VALUES (
+          ${crypto.randomUUID()},
+          ${params.objectId},
+          ${params.tenantId},
+          ${"ACCESS_POLICY_UPDATED"},
+          ${params.actorUserId},
+          ${currentRevision},
+          ${nextRevision},
+          ${<JsonObject>{
+            fields: [
+              "access_level",
+              "embargo_kind",
+              "embargo_until",
+              "embargo_curation_state",
+              "rights_note",
+              "sensitivity_note",
+            ],
+          }}
+        )
+      `;
+
+      const updatedRow = await selectObjectEditRow(transaction, {
+        tenantId: params.tenantId,
+        objectId: params.objectId,
+      });
+
+      return {
+        status: "updated",
+        record: mapObjectEdit(updatedRow!),
       };
     });
   });

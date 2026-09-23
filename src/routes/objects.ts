@@ -18,6 +18,8 @@ import {
     parsePatchObjectMetadataBody,
     parsePutDocumentCurationBody,
     parseReplaceObjectTextManifestBody,
+    parseRetryObjectChangeSubmissionBody,
+    parseSubmitObjectChangesBody,
     parseSubmitObjectCurationBody,
     parseResolveAccessRequestBody,
     parseReplaceObjectAvailableFilesBody,
@@ -51,6 +53,11 @@ import {
     releaseObjectEditLockForTenant,
     submitObjectCurationForTenant,
 } from "../services/object-edit-service.ts";
+import {
+    getObjectChangeStatusForTenant,
+    retryObjectChangeSubmissionForTenant,
+    submitObjectChangesForTenant,
+} from "../services/object-change-submission-service.ts";
 import { replaceObjectTextManifest } from "../services/object-text-manifest-service.ts";
 import {
     completeObjectDownloadRequestByWorker,
@@ -284,6 +291,92 @@ const submitObjectCurationRoute: RouteDefinition = {
                 body,
             }),
         );
+    },
+};
+
+const submitObjectChangesRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/objects/:object_id/changes/submit",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, ["archiver", "admin"]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/changes\/submit$/,
+                "object_id",
+            ),
+        );
+        const body = parseSubmitObjectChangesBody(await parseJsonBody(request));
+        const result = await submitObjectChangesForTenant({
+            auth: authenticated,
+            objectId,
+            body,
+        });
+        return jsonResponse(result.response, {
+            status: result.outcome === "created" ? 202 : 200,
+        });
+    },
+};
+
+const getObjectChangeStatusRoute: RouteDefinition = {
+    method: "GET",
+    path: "/api/objects/:object_id/changes/status",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, [
+            "viewer",
+            "archiver",
+            "admin",
+        ]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/changes\/status$/,
+                "object_id",
+            ),
+        );
+        return jsonResponse(
+            await getObjectChangeStatusForTenant({
+                auth: authenticated,
+                objectId,
+            }),
+        );
+    },
+};
+
+const retryObjectChangeSubmissionRoute: RouteDefinition = {
+    method: "POST",
+    path: "/api/objects/:object_id/change-submissions/:request_id/retry",
+    handler: async (request, context) => {
+        const authenticated = requireRole(context, ["archiver", "admin"]);
+        const pathname = new URL(request.url).pathname;
+        const objectId = parseObjectIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/([^/]+)\/change-submissions\/[^/]+\/retry$/,
+                "object_id",
+            ),
+        );
+        const requestId = parseArchiveRequestIdParam(
+            extractPathParam(
+                pathname,
+                /^\/api\/objects\/[^/]+\/change-submissions\/([^/]+)\/retry$/,
+                "request_id",
+            ),
+        );
+        const body = parseRetryObjectChangeSubmissionBody(
+            await parseOptionalJsonBody(request),
+        );
+        const result = await retryObjectChangeSubmissionForTenant({
+            auth: authenticated,
+            objectId,
+            requestId,
+            retryReason: body.retry_reason,
+        });
+        return jsonResponse(result.response, {
+            status: result.outcome === "requeued" ? 202 : 200,
+        });
     },
 };
 
@@ -1199,6 +1292,9 @@ export const objectRoutes: RouteDefinition[] = [
     getObjectCurationHistoryRoute,
     putObjectDocumentCurationRoute,
     submitObjectCurationRoute,
+    submitObjectChangesRoute,
+    getObjectChangeStatusRoute,
+    retryObjectChangeSubmissionRoute,
     getObjectCurationPublicationRoute,
     downloadCurationPublicationSourceRoute,
     deleteObjectEditLockRoute,
