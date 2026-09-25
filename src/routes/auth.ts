@@ -27,9 +27,13 @@ function parseLoginBody(payload: unknown): { username: string; password: string;
 const loginRoute: RouteDefinition = {
   method: "POST",
   path: "/api/auth/login",
+  auth: "none",
   handler: async (request, context) => {
     const body = parseLoginBody(await parseJsonBody(request));
-    const principal = await loginWithPassword(body, createAuthAuditContext(request, context.requestId));
+    const principal = await loginWithPassword(body, {
+      auditContext: createAuthAuditContext(request, context.requestId),
+      rateLimiter: context.loginRateLimiter,
+    });
 
     return jsonResponse({
       token: principal.sessionToken,

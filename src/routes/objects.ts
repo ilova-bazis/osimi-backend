@@ -944,6 +944,7 @@ const failObjectDownloadRequestRoute: RouteDefinition = {
 const workerUploadObjectArtifactRoute: RouteDefinition = {
     method: "PUT",
     path: "/api/archive-requests/uploads/:token",
+    auth: "none",
     handler: async (request) => {
         const pathname = new URL(request.url).pathname;
         const uploadToken = parseUploadTokenParam(
@@ -966,6 +967,7 @@ const workerUploadObjectArtifactRoute: RouteDefinition = {
 const workerUploadObjectArtifactLegacyRoute: RouteDefinition = {
     method: "PUT",
     path: "/api/object-download-requests/uploads/:token",
+    auth: "none",
     handler: async (request) => {
         const pathname = new URL(request.url).pathname;
         const uploadToken = parseUploadTokenParam(

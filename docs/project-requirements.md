@@ -94,6 +94,11 @@ All endpoints must be tenant-aware.
 - Sessions must support expiry and explicit revocation (logout)
 - Session validation must enforce active user, active tenant, and active tenant membership
 - Authentication lifecycle events (login/logout/session rejection) must be persisted for audit
+- Failed login attempts must be rate limited per normalized username with a
+  finite, recoverable cooldown; rate-limited attempts are recorded for audit
+  without leaking credential or account-existence details
+- Worker authentication failures must be bounded and observable without
+  storing worker tokens; valid worker requests are never throttled
 
 ---
 
@@ -511,6 +516,13 @@ Purpose: allow the private worker to report ingestion progress and outcomes to t
 - `POST /api/auth/login`
 - `POST /api/auth/logout`
 - `GET /api/auth/me`
+
+Authentication and worker-auth failure counters are bounded, process-local,
+in-memory state. The production topology has one API instance, so counters are
+not synchronized through PostgreSQL or another centralized store. They reset
+when that instance restarts. Deploying multiple API instances requires a new
+coordination design before scaling out. Public login submissions additionally
+require trusted-client-IP rate limiting at NPM.
 
 ---
 

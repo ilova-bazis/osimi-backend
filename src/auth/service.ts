@@ -1,4 +1,4 @@
-import { UnauthorizedError, ValidationError } from "../http/errors.ts";
+import { DependencyTimeoutError, RateLimitedError, UnauthorizedError, ValidationError } from "../http/errors.ts";
 import {
   createSession,
   findActiveSessionByTokenHash,
@@ -8,18 +8,30 @@ import {
   touchSessionLastSeenAt,
   updateUserLastLoginAt,
 } from "../repos/auth-repo.ts";
+import { DatabaseQueryTimeoutError } from "../db/client.ts";
+import { resolveLoginDependencyTimeoutMs } from "../runtime/config.ts";
 import type { AuthenticatedPrincipal } from "./types.ts";
+import type { RateLimiter } from "./rate-limit.ts";
+import { WorkGuard, DEFAULT_MAX_CONCURRENT_LOGIN_WORK } from "./work-guard.ts";
 
 const AUTHORIZATION_HEADER = "authorization";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const DEFAULT_SESSION_TTL_SECONDS = 60 * 60 * 24;
+const LOGIN_RATE_LIMIT_KEY_PREFIX = "login:";
+const MAX_RATE_LIMIT_KEY_USERNAME_LENGTH = 128;
+const loginWorkGuard = new WorkGuard(DEFAULT_MAX_CONCURRENT_LOGIN_WORK);
 
 interface LoginInput {
   username: string;
   password: string;
   tenantId?: string;
+}
+
+interface LoginOptions {
+  auditContext?: AuthAuditContext;
+  rateLimiter: RateLimiter;
 }
 
 export interface AuthAuditContext {
@@ -173,7 +185,7 @@ async function safeRecordAuthAuditEvent(params: {
       ip: params.context.ip,
       userAgent: params.context.userAgent,
       payload: params.payload,
-    });
+    }, { timeoutMs: resolveLoginDependencyTimeoutMs() });
   } catch (error) {
     console.error(
       `[auth-audit:${params.context.requestId}] failed to persist auth audit event`,
@@ -182,9 +194,27 @@ async function safeRecordAuthAuditEvent(params: {
   }
 }
 
+function loginRateLimitKey(usernameNormalized: string): string {
+  if (usernameNormalized.length <= MAX_RATE_LIMIT_KEY_USERNAME_LENGTH) {
+    return `${LOGIN_RATE_LIMIT_KEY_PREFIX}${usernameNormalized}`;
+  }
+
+  const hashed = new Bun.CryptoHasher("sha256").update(usernameNormalized).digest("hex");
+  return `${LOGIN_RATE_LIMIT_KEY_PREFIX}${hashed}`;
+}
+
+const DUMMY_PASSWORD_HASH = await Bun.password.hash(crypto.randomUUID());
+
+function rateLimitError(retryAfterMs: number): RateLimitedError {
+  return new RateLimitedError(
+    "Too many failed login attempts. Please try again later.",
+    Math.max(1, Math.ceil(retryAfterMs / 1000)),
+  );
+}
+
 export async function loginWithPassword(
   input: LoginInput,
-  auditContext?: AuthAuditContext,
+  options: LoginOptions,
 ): Promise<AuthenticatedPrincipal> {
   const username = input.username.trim().toLowerCase();
   const password = input.password;
@@ -193,30 +223,85 @@ export async function loginWithPassword(
     throw new ValidationError("Username and password are required.");
   }
 
-  const candidates = await findLoginCandidates(username, input.tenantId);
+  const rateLimitKey = loginRateLimitKey(username);
+  const admission = options.rateLimiter.beginAttempt(rateLimitKey);
+  if (!admission.allowed) {
+    throw rateLimitError(admission.retryAfterMs);
+  }
+
+  if (!loginWorkGuard.acquire()) {
+    admission.attempt.cancel();
+    throw rateLimitError(1_000);
+  }
+
+  try {
+    return await loginWithPasswordAdmitted(input, username, password, admission, options);
+  } catch (error) {
+    if (error instanceof DatabaseQueryTimeoutError) {
+      admission.attempt.cancel();
+      throw new DependencyTimeoutError("Authentication is temporarily unavailable. Please try again.");
+    }
+    throw error;
+  } finally {
+    loginWorkGuard.release();
+  }
+}
+
+async function loginWithPasswordAdmitted(
+  input: LoginInput,
+  username: string,
+  password: string,
+  admission: Extract<ReturnType<RateLimiter["beginAttempt"]>, { allowed: true }>,
+  options: LoginOptions,
+): Promise<AuthenticatedPrincipal> {
+  const dependencyTimeoutMs = resolveLoginDependencyTimeoutMs();
+  let candidates;
+  try {
+    candidates = await findLoginCandidates(username, input.tenantId, {
+      timeoutMs: dependencyTimeoutMs,
+    });
+  } catch (error) {
+    admission.attempt.cancel();
+    throw error;
+  }
+
   if (candidates.length === 0) {
+    try {
+      await Bun.password.verify(password, DUMMY_PASSWORD_HASH);
+    } catch (error) {
+      admission.attempt.cancel();
+      throw error;
+    }
+
+    const decision = admission.attempt.settleFailure();
     await safeRecordAuthAuditEvent({
-      context: auditContext,
+      context: options.auditContext,
       eventType: "LOGIN_FAILED",
       success: false,
       tenantId: input.tenantId,
       usernameNormalized: username,
-      errorCode: "UNAUTHORIZED",
+      errorCode: decision.allowed ? "UNAUTHORIZED" : "RATE_LIMITED",
+      payload: decision.allowed ? undefined : { reason: "rate_limited" },
     });
+    if (!decision.allowed) {
+      throw rateLimitError(decision.retryAfterMs);
+    }
     throw new UnauthorizedError("Invalid credentials.");
   }
 
   if (!input.tenantId && candidates.length > 1) {
+    const decision = admission.attempt.settleFailure();
     await safeRecordAuthAuditEvent({
-      context: auditContext,
+      context: options.auditContext,
       eventType: "LOGIN_FAILED",
       success: false,
       usernameNormalized: username,
-      errorCode: "BAD_REQUEST",
-      payload: {
-        reason: "tenant_required",
-      },
+      errorCode: decision.allowed ? "BAD_REQUEST" : "RATE_LIMITED",
+      payload: decision.allowed ? { reason: "tenant_required" } : { reason: "rate_limited" },
     });
+    if (!decision.allowed) {
+      throw rateLimitError(decision.retryAfterMs);
+    }
     throw new ValidationError(
       "Field 'tenant_id' is required for multi-tenant accounts.",
     );
@@ -225,24 +310,40 @@ export async function loginWithPassword(
   const candidate = candidates.at(0);
 
   if (!candidate) {
+    admission.attempt.cancel();
     throw new UnauthorizedError("Invalid credentials.");
   }
-  const isPasswordValid = await Bun.password.verify(
-    password,
-    candidate.passwordHash,
-  );
+
+  let isPasswordValid: boolean;
+  try {
+    isPasswordValid = await Bun.password.verify(
+      password,
+      candidate.passwordHash,
+    );
+  } catch (error) {
+    admission.attempt.cancel();
+    throw error;
+  }
+
   if (!isPasswordValid) {
+    const decision = admission.attempt.settleFailure();
     await safeRecordAuthAuditEvent({
-      context: auditContext,
+      context: options.auditContext,
       eventType: "LOGIN_FAILED",
       success: false,
       tenantId: candidate.tenantId,
       userId: candidate.userId,
       usernameNormalized: username,
-      errorCode: "UNAUTHORIZED",
+      errorCode: decision.allowed ? "UNAUTHORIZED" : "RATE_LIMITED",
+      payload: decision.allowed ? undefined : { reason: "rate_limited" },
     });
+    if (!decision.allowed) {
+      throw rateLimitError(decision.retryAfterMs);
+    }
     throw new UnauthorizedError("Invalid credentials.");
   }
+
+  admission.attempt.settleSuccess();
 
   const now = new Date();
   const expiresAt = computeSessionExpiry(now);
@@ -256,12 +357,14 @@ export async function loginWithPassword(
     tenantId: candidate.tenantId,
     membershipId: candidate.membershipId,
     expiresAt,
+  }, { timeoutMs: dependencyTimeoutMs });
+
+  await updateUserLastLoginAt(candidate.userId, {
+    timeoutMs: dependencyTimeoutMs,
   });
 
-  await updateUserLastLoginAt(candidate.userId);
-
   await safeRecordAuthAuditEvent({
-    context: auditContext,
+    context: options.auditContext,
     eventType: "LOGIN_SUCCEEDED",
     success: true,
     tenantId: candidate.tenantId,

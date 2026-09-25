@@ -389,6 +389,7 @@ const retryIngestionRoute: RouteDefinition = {
 const uploadBySignedUrlRoute: RouteDefinition = {
   method: "PUT",
   path: "/api/uploads/:token",
+  auth: "none",
   handler: async (request, _context) => {
     const pathname = new URL(request.url).pathname;
     const uploadToken = parseUploadTokenParam(

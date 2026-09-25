@@ -52,6 +52,45 @@ curl --fail --show-error --silent https://archive.example.com/login
 
 Also log in through the browser, upload a disposable file, confirm the worker can authenticate and process it, and verify the file exists below `STAGING_HOST_PATH`.
 
+## Rate Limiting
+
+The API applies bounded in-memory rate limits for repeated failed logins
+(per normalized username) and repeated missing/invalid worker credentials.
+Blocked requests receive JSON `429 RATE_LIMITED` with a `Retry-After` header.
+Login blocks after five failures in a 10-minute window and allows attempts
+again after a 10-minute cooldown.
+The login candidate lookup has a bounded database deadline and returns
+`503 DEPENDENCY_TIMEOUT` without counting a credential failure on timeout.
+Database pool connection waits are capped globally. State is process-local
+and resets on container restart; it does not require a database migration.
+Limits are fixed defaults in the API image.
+
+This is intentionally a single-instance design. Production deploys exactly one
+`api` service replica, so rate-limit counters are not synchronized through
+PostgreSQL, Redis, or another centralized store. Do not scale the API above one
+replica without first replacing or coordinating the in-memory counters. A
+restart clears those counters; the independent NPM per-IP limit remains the
+public edge control during an API restart.
+
+The public proxy must additionally apply per-IP limits to public login
+submissions. Configure method-aware limits for both `POST /login` (forwarded to
+`osimi-ui:3000`) and `POST /api/auth/login` (forwarded to `osimi-api:3000`).
+Keep ordinary `GET /login` page views unaffected. Derive the rate-limit key
+from the proxy's trusted client address; do not trust a caller-supplied
+`X-Forwarded-For` header. Where possible, also bound publicly reachable worker
+control paths without throttling signed upload/download transfers. Internal
+worker traffic that bypasses the proxy must remain usable.
+
+Validate the generated proxy configuration before reloading and test POST,
+GET, trailing-slash, query-string, and spoofed-forwarding-header cases. The
+backend account limit and the proxy per-IP limit have different scopes and are
+both required.
+
+Before the production rate-limiting rollout, record the live verification in
+`deploy/npm-rate-limit-verification.md`. That record must contain the active
+rate and burst, trusted client-IP source, generated-config validation result,
+and observed responses for both login paths.
+
 ## Backup
 
 Before migrations or upgrades, back up PostgreSQL with the existing database operator workflow and snapshot or copy `STAGING_HOST_PATH`. The Compose project owns neither PostgreSQL data nor worker/archive storage.

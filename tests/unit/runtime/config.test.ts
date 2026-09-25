@@ -5,16 +5,22 @@ import { describe, expect, test } from "bun:test";
 import { parseLeaseToken } from "../../../src/auth/worker-lease.ts";
 import {
   DEFAULT_CORS_ALLOWED_ORIGINS,
+  DEFAULT_LOGIN_DEPENDENCY_TIMEOUT_MS,
+  DEFAULT_LOGIN_RATE_LIMIT,
   DEFAULT_MAX_ARTIFACT_SEARCH_TEXT_BYTES,
   DEFAULT_MAX_UPLOAD_SIZE_BYTES,
   DEFAULT_READINESS_TIMEOUT_MS,
   DEFAULT_SHUTDOWN_GRACE_PERIOD_MS,
+  DEFAULT_WORKER_AUTH_RATE_LIMIT,
   parseCorsAllowedOrigins,
   resolveCorsAllowedOrigins,
+  resolveLoginRateLimitPolicy,
+  resolveLoginDependencyTimeoutMs,
   resolveMaxArtifactSearchTextBytes,
   resolveMaxUploadSizeBytes,
   resolveReadinessTimeoutMs,
   resolveShutdownGracePeriodMs,
+  resolveWorkerAuthRateLimitPolicy,
   runWithRuntimeConfig,
   validateSigningConfiguration,
   validateRuntimeConfiguration,
@@ -116,6 +122,71 @@ describe("upload size configuration", () => {
     for (const maxUploadSizeBytes of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
       expect(() => resolveMaxUploadSizeBytes({ maxUploadSizeBytes })).toThrow(
         "Runtime upload size limit",
+      );
+    }
+  });
+});
+
+describe("rate limit configuration", () => {
+  test("uses defaults and accepts runtime policy overrides", () => {
+    expect(resolveLoginRateLimitPolicy({})).toEqual(DEFAULT_LOGIN_RATE_LIMIT);
+    expect(DEFAULT_LOGIN_RATE_LIMIT).toMatchObject({
+      maxFailures: 5,
+      windowMs: 10 * 60_000,
+      cooldownMs: 10 * 60_000,
+    });
+    expect(resolveWorkerAuthRateLimitPolicy({})).toEqual(DEFAULT_WORKER_AUTH_RATE_LIMIT);
+
+    const policy = { maxFailures: 2, windowMs: 1_000, cooldownMs: 1_000, maxEntries: 5 };
+    expect(resolveLoginRateLimitPolicy({ loginRateLimit: policy })).toEqual(policy);
+    expect(resolveWorkerAuthRateLimitPolicy({ workerAuthRateLimit: policy })).toEqual(policy);
+
+    const policyWithTimeout = {
+      maxFailures: 2,
+      windowMs: 1_000,
+      cooldownMs: 1_000,
+      maxEntries: 5,
+      attemptTimeoutMs: 2_000,
+    };
+    expect(resolveLoginRateLimitPolicy({ loginRateLimit: policyWithTimeout })).toEqual(policyWithTimeout);
+  });
+
+  test("rejects invalid rate limit policies", () => {
+    const invalid = [
+      { maxFailures: 0, windowMs: 1_000, cooldownMs: 1_000, maxEntries: 10 },
+      { maxFailures: 1.5, windowMs: 1_000, cooldownMs: 1_000, maxEntries: 10 },
+      { maxFailures: 1, windowMs: -1, cooldownMs: 1_000, maxEntries: 10 },
+      { maxFailures: 1, windowMs: 1_000, cooldownMs: 0, maxEntries: 10 },
+      { maxFailures: 1, windowMs: 1_000, cooldownMs: 1_000, maxEntries: 0 },
+      { maxFailures: 1, windowMs: 1_000, cooldownMs: 1_000, maxEntries: 10, attemptTimeoutMs: 0 },
+      { maxFailures: 1, windowMs: 1_000, cooldownMs: 1_000, maxEntries: 10, attemptTimeoutMs: -5 },
+      { maxFailures: 1, windowMs: 1_000, cooldownMs: 1_000, maxEntries: 10, attemptTimeoutMs: 1.5 },
+    ];
+
+    for (const loginRateLimit of invalid) {
+      expect(() => resolveLoginRateLimitPolicy({ loginRateLimit })).toThrow(
+        "Runtime login rate limit",
+      );
+    }
+
+    for (const workerAuthRateLimit of invalid) {
+      expect(() => resolveWorkerAuthRateLimitPolicy({ workerAuthRateLimit })).toThrow(
+        "Runtime worker auth rate limit",
+      );
+    }
+  });
+});
+
+describe("login dependency timeout configuration", () => {
+  test("uses the production default and accepts a runtime test override", () => {
+    expect(resolveLoginDependencyTimeoutMs({})).toBe(DEFAULT_LOGIN_DEPENDENCY_TIMEOUT_MS);
+    expect(resolveLoginDependencyTimeoutMs({ loginDependencyTimeoutMs: 50 })).toBe(50);
+  });
+
+  test("rejects invalid runtime values", () => {
+    for (const loginDependencyTimeoutMs of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(() => resolveLoginDependencyTimeoutMs({ loginDependencyTimeoutMs })).toThrow(
+        "Runtime login dependency timeout",
       );
     }
   });

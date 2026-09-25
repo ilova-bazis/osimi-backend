@@ -19,10 +19,16 @@ type WorkerRouteHandler = (
 export function withWorkerAuth(
   handler: WorkerRouteHandler,
 ): RouteDefinition["handler"] {
-  return (request, context) => {
-    const worker = requireWorkerAuthentication(request);
+  const wrapped: RouteDefinition["handler"] = (request, context) => {
+    const worker = requireWorkerAuthentication(request, {
+      rateLimiter: context.workerAuthRateLimiter,
+      requestId: context.requestId,
+    });
     return handler(request, context, worker);
   };
+
+  wrapped.authMode = "worker";
+  return wrapped;
 }
 
 interface WorkerIngestionBodyRouteData<TBody> {

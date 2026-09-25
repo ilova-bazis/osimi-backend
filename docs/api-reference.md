@@ -9,6 +9,8 @@ This document is the practical route reference for the Osimi backend.
 - All timestamps are ISO-8601 strings.
 - Pagination defaults: `limit=50`, max `limit=200`.
 - Responses include header `x-request-id`.
+- `429 RATE_LIMITED` responses include a `Retry-After` header in whole seconds.
+  Rate-limit state is bounded in-memory state that resets on process restart.
 
 ## Authentication Modes
 
@@ -25,6 +27,8 @@ This document is the practical route reference for the Osimi backend.
 - Optional header: `x-worker-id: <worker-id>`
 - Used by worker/internal control endpoints (including ingestion lease/event routes, internal available-files sync, and object-download worker routes).
 - Missing/invalid token resolves to `401 UNAUTHORIZED`.
+- Repeated missing/invalid worker credentials resolve to `429 RATE_LIMITED` with
+  `Retry-After`; successful worker authentication is never throttled.
 
 ### 3) Signed token URLs (upload/download transport)
 
@@ -117,6 +121,8 @@ Error codes: `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `METHOD_NO
 - Error behavior:
   - `400 BAD_REQUEST` for invalid body shape or when `tenant_id` is required but missing for multi-tenant account
   - `401 UNAUTHORIZED` for invalid credentials
+  - `429 RATE_LIMITED` with a `Retry-After` header after five failed attempts for the normalized username in a 10-minute window; the cooldown is 10 minutes; missing-`tenant_id` rejections count toward the same limit, and attempts beyond the admitted in-flight budget are rejected before credential verification; a bounded global cap on concurrent login verification protects the server and rejects excess work with `429`; the limit uses bounded in-memory state and resets on process restart
+  - `503 DEPENDENCY_TIMEOUT` when a login database dependency exceeds its deadline; timed-out attempts do not count as credential failures
 
 ### POST `/api/auth/logout`
 

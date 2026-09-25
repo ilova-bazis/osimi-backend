@@ -97,6 +97,7 @@ const releaseRoute: RouteDefinition = {
 const workerDownloadRoute: RouteDefinition = {
   method: "GET",
   path: "/api/worker/downloads/:token",
+  auth: "none",
   handler: async (request, _context) => {
     const pathname = new URL(request.url).pathname;
     const token = parseUploadTokenParam(

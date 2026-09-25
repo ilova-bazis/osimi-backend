@@ -21,6 +21,11 @@ This document defines the required tests for the Osimi backend control plane (VP
 
 - Auth login success with valid credentials and tenant membership
 - Auth login failure with invalid credentials
+- Auth login rate limiting: repeated failures for a username return `429 RATE_LIMITED` with `Retry-After`, recover after the cooldown, and reset on success; unknown usernames, tenant variation, and missing-`tenant_id` outcomes cannot bypass the username limit; concurrent attempts are admitted only within the in-flight budget and rejected attempts produce no extra audit writes
+- Auth login dependency timeout: a timed-out login database dependency returns `503 DEPENDENCY_TIMEOUT` without counting a credential failure; expired reservations cannot alter newer limiter state
+- Route auth isolation: incidental or invalid Bearer headers on login, worker-auth, and public signed-token routes do not trigger session lookups or bypass their route-specific authentication controls
+- Worker auth rate limiting: repeated missing/invalid worker credentials are bounded and audited without token values; valid worker authentication remains unaffected
+- Signed-token paths are redacted in backend access logs
 - Auth session persistence across app instance restarts
 - Auth session revocation on logout
 - Auth session expiry rejection

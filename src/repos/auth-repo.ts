@@ -1,5 +1,5 @@
 import type { UserRole } from "../auth/types.ts";
-import { withSchemaClient } from "../db/client.ts";
+import { executeWithDeadline, withSchemaClient } from "../db/client.ts";
 
 type AuthAuditEventType =
   | "LOGIN_SUCCEEDED"
@@ -72,10 +72,12 @@ function mapActiveSession(row: ActiveSessionRow): ActiveSession {
 export async function findLoginCandidates(
   usernameNormalized: string,
   tenantId?: string,
+  options: { timeoutMs?: number } = {},
 ): Promise<LoginCandidate[]> {
   const rows = await withSchemaClient(async (sql) => {
     if (tenantId) {
-      return await sql<LoginCandidateRow[]>`
+      return await executeWithDeadline(
+        sql<LoginCandidateRow[]>`
         SELECT
           usr.id AS user_id,
           usr.username,
@@ -92,10 +94,13 @@ export async function findLoginCandidates(
           AND mem.is_active = true
           AND ten.is_active = true
         ORDER BY mem.created_at ASC
-      `;
+      `,
+        options.timeoutMs,
+      );
     }
 
-    return await sql<LoginCandidateRow[]>`
+    return await executeWithDeadline(
+      sql<LoginCandidateRow[]>`
       SELECT
         usr.id AS user_id,
         usr.username,
@@ -111,20 +116,28 @@ export async function findLoginCandidates(
         AND mem.is_active = true
         AND ten.is_active = true
       ORDER BY mem.created_at ASC
-    `;
-  });
+    `,
+      options.timeoutMs,
+    );
+  }, options);
 
   return rows.map(mapLoginCandidate);
 }
 
-export async function updateUserLastLoginAt(userId: string): Promise<void> {
+export async function updateUserLastLoginAt(
+  userId: string,
+  options: { timeoutMs?: number } = {},
+): Promise<void> {
   await withSchemaClient(async (sql) => {
-    await sql`
-      UPDATE users
-      SET last_login_at = now(), updated_at = now()
-      WHERE id = ${userId}
-    `;
-  });
+    await executeWithDeadline(
+      sql`
+        UPDATE users
+        SET last_login_at = now(), updated_at = now()
+        WHERE id = ${userId}
+      `,
+      options.timeoutMs,
+    );
+  }, options);
 }
 
 export async function createSession(params: {
@@ -136,31 +149,34 @@ export async function createSession(params: {
   expiresAt: Date;
   ip?: string;
   userAgent?: string;
-}): Promise<void> {
+}, options: { timeoutMs?: number } = {}): Promise<void> {
   await withSchemaClient(async (sql) => {
-    await sql`
-      INSERT INTO auth_sessions (
-        id,
-        session_token_hash,
-        user_id,
-        tenant_id,
-        membership_id,
-        expires_at,
-        ip,
-        user_agent
-      )
-      VALUES (
-        ${params.sessionId},
-        ${params.tokenHash},
-        ${params.userId},
-        ${params.tenantId},
-        ${params.membershipId},
-        ${params.expiresAt.toISOString()},
-        ${params.ip ?? null},
-        ${params.userAgent ?? null}
-      )
-    `;
-  });
+    await executeWithDeadline(
+      sql`
+        INSERT INTO auth_sessions (
+          id,
+          session_token_hash,
+          user_id,
+          tenant_id,
+          membership_id,
+          expires_at,
+          ip,
+          user_agent
+        )
+        VALUES (
+          ${params.sessionId},
+          ${params.tokenHash},
+          ${params.userId},
+          ${params.tenantId},
+          ${params.membershipId},
+          ${params.expiresAt.toISOString()},
+          ${params.ip ?? null},
+          ${params.userAgent ?? null}
+        )
+      `,
+      options.timeoutMs,
+    );
+  }, options);
 }
 
 export async function findActiveSessionByTokenHash(
@@ -239,39 +255,42 @@ export async function insertAuthAuditEvent(params: {
   ip?: string;
   userAgent?: string;
   payload?: Record<string, unknown>;
-}): Promise<void> {
+}, options: { timeoutMs?: number } = {}): Promise<void> {
   await withSchemaClient(async (sql) => {
-    await sql`
-      INSERT INTO auth_audit_events (
-        id,
-        request_id,
-        event_type,
-        success,
-        tenant_id,
-        user_id,
-        session_id,
-        username_normalized,
-        error_code,
-        ip,
-        user_agent,
-        payload
-      )
-      VALUES (
-        ${crypto.randomUUID()},
-        ${params.requestId},
-        ${params.eventType},
-        ${params.success},
-        ${params.tenantId ?? null},
-        ${params.userId ?? null},
-        ${params.sessionId ?? null},
-        ${params.usernameNormalized ?? null},
-        ${params.errorCode ?? null},
-        ${params.ip ?? null},
-        ${params.userAgent ?? null},
-        CAST(${JSON.stringify(params.payload ?? {})} AS jsonb)
-      )
-    `;
-  });
+    await executeWithDeadline(
+      sql`
+        INSERT INTO auth_audit_events (
+          id,
+          request_id,
+          event_type,
+          success,
+          tenant_id,
+          user_id,
+          session_id,
+          username_normalized,
+          error_code,
+          ip,
+          user_agent,
+          payload
+        )
+        VALUES (
+          ${crypto.randomUUID()},
+          ${params.requestId},
+          ${params.eventType},
+          ${params.success},
+          ${params.tenantId ?? null},
+          ${params.userId ?? null},
+          ${params.sessionId ?? null},
+          ${params.usernameNormalized ?? null},
+          ${params.errorCode ?? null},
+          ${params.ip ?? null},
+          ${params.userAgent ?? null},
+          CAST(${JSON.stringify(params.payload ?? {})} AS jsonb)
+        )
+      `,
+      options.timeoutMs,
+    );
+  }, options);
 }
 
 interface TenantRow {

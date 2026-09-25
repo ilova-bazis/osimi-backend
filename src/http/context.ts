@@ -1,8 +1,10 @@
 import { ForbiddenError, InternalServerError, ValidationError, createErrorResponse, isAppError } from "./errors.ts";
 import { IDEMPOTENCY_KEY_HEADER, parseIdempotencyKey } from "./idempotency.ts";
 import { logHttpRequest, logLevelFromStatus } from "./logging.ts";
+import { redactTokenPaths } from "./redaction.ts";
 import { createAuthAuditContext, resolvePrincipalFromRequest } from "../auth/service.ts";
 import type { UserRole } from "../auth/types.ts";
+import type { RateLimiter } from "../auth/rate-limit.ts";
 
 export interface RequestContext {
   requestId: string;
@@ -15,6 +17,8 @@ export interface RequestContext {
   startedAt: Date;
   method: string;
   pathname: string;
+  loginRateLimiter: RateLimiter;
+  workerAuthRateLimiter: RateLimiter;
 }
 
 type ContextHandler = (context: RequestContext) => Response | Promise<Response>;
@@ -67,12 +71,14 @@ function parseTenantId(rawValue: string | undefined): string | undefined {
 async function buildRequestContext(
   request: Request,
   requestId: string,
-  skipAuth: boolean,
+  skipSessionAuth: boolean,
+  skipRequestMetadata: boolean,
+  rateLimits: RequestRateLimits,
 ): Promise<RequestContext> {
-  const tenantHeader = skipAuth
+  const tenantHeader = skipRequestMetadata
     ? undefined
     : parseTenantId(normalizeHeaderValue(request.headers.get(TENANT_ID_HEADER)));
-  const principal = skipAuth
+  const principal = skipSessionAuth
     ? undefined
     : await resolvePrincipalFromRequest(request, createAuthAuditContext(request, requestId));
 
@@ -81,7 +87,7 @@ async function buildRequestContext(
   }
 
   const tenantId = principal?.tenantId ?? tenantHeader;
-  const idempotencyKey = skipAuth
+  const idempotencyKey = skipRequestMetadata
     ? undefined
     : parseIdempotencyKey(request.headers.get(IDEMPOTENCY_KEY_HEADER));
   const url = new URL(request.url);
@@ -97,13 +103,24 @@ async function buildRequestContext(
     startedAt: new Date(),
     method: request.method.toUpperCase(),
     pathname: url.pathname,
+    loginRateLimiter: rateLimits.login,
+    workerAuthRateLimiter: rateLimits.workerAuth,
   };
+}
+
+export interface RequestRateLimits {
+  login: RateLimiter;
+  workerAuth: RateLimiter;
 }
 
 export async function withRequestContext(
   request: Request,
   handler: ContextHandler,
-  options: { skipAuth?: boolean } = {},
+  options: {
+    skipSessionAuth?: boolean;
+    skipRequestMetadata?: boolean;
+    rateLimits: RequestRateLimits;
+  },
 ): Promise<Response> {
   const fallbackRequestId: string = crypto.randomUUID();
   let requestId: string = fallbackRequestId;
@@ -125,7 +142,7 @@ export async function withRequestContext(
       event: "http_request",
       request_id: fallbackRequestId,
       method,
-      path: pathname,
+      path: redactTokenPaths(pathname),
       status: response.status,
       duration_ms: durationMs,
       error_code: isAppError(error) ? error.code : "INTERNAL_SERVER_ERROR",
@@ -136,7 +153,13 @@ export async function withRequestContext(
   }
 
   try {
-    const context = await buildRequestContext(request, requestId, options.skipAuth ?? false);
+    const context = await buildRequestContext(
+      request,
+      requestId,
+      options.skipSessionAuth ?? false,
+      options.skipRequestMetadata ?? false,
+      options.rateLimits,
+    );
     const response = await handler(context);
 
     if (!(response instanceof Response)) {
@@ -152,7 +175,7 @@ export async function withRequestContext(
       event: "http_request",
       request_id: requestId,
       method: context.method,
-      path: context.pathname,
+      path: redactTokenPaths(context.pathname),
       status: response.status,
       duration_ms: durationMs,
       tenant_id: context.tenantId,
@@ -173,7 +196,7 @@ export async function withRequestContext(
       event: "http_request",
       request_id: requestId,
       method,
-      path: pathname,
+      path: redactTokenPaths(pathname),
       status: response.status,
       duration_ms: durationMs,
       error_code: isAppError(error) ? error.code : "INTERNAL_SERVER_ERROR",

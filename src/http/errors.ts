@@ -13,7 +13,9 @@ export type ErrorCode =
   | "VALIDATION_FAILED"
   | "SERVICE_UNAVAILABLE"
   | "CONFIGURATION_ERROR"
-  | "INTERNAL_SERVER_ERROR";
+  | "INTERNAL_SERVER_ERROR"
+  | "RATE_LIMITED"
+  | "DEPENDENCY_TIMEOUT";
 
 export interface AppErrorOptions {
   details?: unknown;
@@ -111,6 +113,21 @@ export class ConfigurationError extends AppError {
   }
 }
 
+export class RateLimitedError extends AppError {
+  readonly retryAfterSeconds: number;
+
+  constructor(message: string, retryAfterSeconds: number, details?: unknown) {
+    super(429, "RATE_LIMITED", message, { details });
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+export class DependencyTimeoutError extends AppError {
+  constructor(message = "The request timed out while waiting for a required dependency.", details?: unknown) {
+    super(503, "DEPENDENCY_TIMEOUT", message, { details });
+  }
+}
+
 export class InternalServerError extends AppError {
   constructor(message = "An unexpected error occurred.", details?: unknown, cause?: unknown) {
     super(500, "INTERNAL_SERVER_ERROR", message, {
@@ -142,9 +159,13 @@ function createErrorBody(error: AppError, requestId: string): Record<string, unk
 
 export function createErrorResponse(error: unknown, requestId: string): Response {
   if (isAppError(error)) {
-    return jsonResponse(createErrorBody(error, requestId), {
+    const response = jsonResponse(createErrorBody(error, requestId), {
       status: error.status,
     });
+    if (error instanceof RateLimitedError) {
+      response.headers.set("retry-after", String(Math.max(1, error.retryAfterSeconds)));
+    }
+    return response;
   }
 
   console.error(`[${requestId}] Unhandled error`, error);

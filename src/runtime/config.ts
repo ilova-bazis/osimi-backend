@@ -7,10 +7,33 @@ export const DEFAULT_MAX_UPLOAD_SIZE_BYTES = 2 * 1024 * 1024 * 1024;
 export const DEFAULT_MAX_ARTIFACT_SEARCH_TEXT_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_READINESS_TIMEOUT_MS = 1_000;
 export const DEFAULT_SHUTDOWN_GRACE_PERIOD_MS = 60_000;
+export const DEFAULT_LOGIN_DEPENDENCY_TIMEOUT_MS = 10_000;
 export const DEFAULT_CORS_ALLOWED_ORIGINS = [
   "http://localhost:4444",
   "http://localhost:5173",
 ] as const;
+
+export interface RateLimitPolicyConfig {
+  maxFailures: number;
+  windowMs: number;
+  cooldownMs: number;
+  maxEntries: number;
+  attemptTimeoutMs?: number;
+}
+
+export const DEFAULT_LOGIN_RATE_LIMIT: RateLimitPolicyConfig = {
+  maxFailures: 5,
+  windowMs: 10 * 60_000,
+  cooldownMs: 10 * 60_000,
+  maxEntries: 10_000,
+};
+
+export const DEFAULT_WORKER_AUTH_RATE_LIMIT: RateLimitPolicyConfig = {
+  maxFailures: 50,
+  windowMs: 5 * 60_000,
+  cooldownMs: 5 * 60_000,
+  maxEntries: 10_000,
+};
 
 export interface RuntimeConfig {
   databaseUrl?: string;
@@ -22,8 +45,11 @@ export interface RuntimeConfig {
   maxUploadSizeBytes?: number;
   maxArtifactSearchTextBytes?: number;
   readinessTimeoutMs?: number;
+  loginDependencyTimeoutMs?: number;
   shutdownGracePeriodMs?: number;
   corsAllowedOrigins?: readonly string[];
+  loginRateLimit?: RateLimitPolicyConfig;
+  workerAuthRateLimit?: RateLimitPolicyConfig;
 }
 
 const runtimeConfigStore = new AsyncLocalStorage<RuntimeConfig>();
@@ -154,6 +180,68 @@ export function parseCorsAllowedOrigins(value: string): readonly string[] {
   );
 }
 
+function validateRateLimitField(value: number, field: string, source: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new ConfigurationError(`${source} field '${field}' must be a positive safe integer.`);
+  }
+
+  return value;
+}
+
+function validateRateLimitPolicy(
+  value: RateLimitPolicyConfig | undefined,
+  defaultValue: RateLimitPolicyConfig,
+  source: string,
+): RateLimitPolicyConfig {
+  if (value === undefined) {
+    return defaultValue;
+  }
+
+  const resolved: RateLimitPolicyConfig = {
+    maxFailures: validateRateLimitField(value.maxFailures, "maxFailures", source),
+    windowMs: validateRateLimitField(value.windowMs, "windowMs", source),
+    cooldownMs: validateRateLimitField(value.cooldownMs, "cooldownMs", source),
+    maxEntries: validateRateLimitField(value.maxEntries, "maxEntries", source),
+  };
+
+  if (value.attemptTimeoutMs !== undefined) {
+    resolved.attemptTimeoutMs = validateRateLimitField(value.attemptTimeoutMs, "attemptTimeoutMs", source);
+  }
+
+  return resolved;
+}
+
+export function resolveLoginRateLimitPolicy(
+  config: RuntimeConfig = getRuntimeConfig(),
+): RateLimitPolicyConfig {
+  return validateRateLimitPolicy(
+    config.loginRateLimit,
+    DEFAULT_LOGIN_RATE_LIMIT,
+    "Runtime login rate limit",
+  );
+}
+
+export function resolveWorkerAuthRateLimitPolicy(
+  config: RuntimeConfig = getRuntimeConfig(),
+): RateLimitPolicyConfig {
+  return validateRateLimitPolicy(
+    config.workerAuthRateLimit,
+    DEFAULT_WORKER_AUTH_RATE_LIMIT,
+    "Runtime worker auth rate limit",
+  );
+}
+
+export function resolveLoginDependencyTimeoutMs(
+  config: RuntimeConfig = getRuntimeConfig(),
+): number {
+  return resolvePositiveInteger({
+    runtimeValue: config.loginDependencyTimeoutMs,
+    environmentValue: undefined,
+    defaultValue: DEFAULT_LOGIN_DEPENDENCY_TIMEOUT_MS,
+    source: "Runtime login dependency timeout",
+  });
+}
+
 export function resolveCorsAllowedOrigins(
   config: RuntimeConfig = getRuntimeConfig(),
 ): readonly string[] {
@@ -174,6 +262,9 @@ export function validateRuntimeConfiguration(config: RuntimeConfig = getRuntimeC
   resolveMaxUploadSizeBytes(config);
   resolveMaxArtifactSearchTextBytes(config);
   resolveCorsAllowedOrigins(config);
+  resolveLoginRateLimitPolicy(config);
+  resolveWorkerAuthRateLimitPolicy(config);
+  resolveLoginDependencyTimeoutMs(config);
 }
 
 function resolvePositiveInteger(params: {

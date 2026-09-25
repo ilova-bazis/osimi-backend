@@ -5,14 +5,19 @@ import {
   NotFoundError,
   ServiceUnavailableError,
 } from "./http/errors.ts";
+import { redactTokenPaths } from "./http/redaction.ts";
+import { createRateLimiter } from "./auth/rate-limit.ts";
 import { createRoutes } from "./routes/index.ts";
 import type { RouteDefinition } from "./routes/types.ts";
+import type { RouteAuthMode } from "./routes/types.ts";
 import {
   createReadinessService,
   type ReadinessService,
 } from "./services/readiness-service.ts";
 import {
   resolveCorsAllowedOrigins,
+  resolveLoginRateLimitPolicy,
+  resolveWorkerAuthRateLimitPolicy,
   runWithRuntimeConfig,
   validateRuntimeConfiguration,
   type RuntimeConfig,
@@ -104,6 +109,12 @@ interface DynamicRoute {
   method: string;
   path: string;
   handler: RouteDefinition["handler"];
+  authMode: RouteAuthMode;
+}
+
+interface RegisteredRoute {
+  handler: RouteDefinition["handler"];
+  authMode: RouteAuthMode;
 }
 
 export function createApp(
@@ -126,7 +137,11 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
   const routeDefinitions = options.routeDefinitions ?? createRoutes(readiness);
   validateRuntimeConfiguration(runtimeConfig);
   const corsAllowedOrigins = new Set(resolveCorsAllowedOrigins(runtimeConfig));
-  const handlers = new Map<string, RouteDefinition["handler"]>();
+  const rateLimits = {
+    login: createRateLimiter(resolveLoginRateLimitPolicy(runtimeConfig)),
+    workerAuth: createRateLimiter(resolveWorkerAuthRateLimitPolicy(runtimeConfig)),
+  };
+  const handlers = new Map<string, RegisteredRoute>();
   const methodsByPath = new Map<string, Set<string>>();
   const dynamicRoutes: DynamicRoute[] = [];
   const registeredRouteKeys = new Set<string>();
@@ -135,6 +150,10 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
     const normalizedPath = normalizePath(route.path);
     const method = route.method.toUpperCase();
     const key = routeKey(method, normalizedPath);
+    const registeredRoute: RegisteredRoute = {
+      handler: route.handler,
+      authMode: route.auth ?? route.handler.authMode ?? "session",
+    };
 
     if (registeredRouteKeys.has(key)) {
       throw new Error(`Duplicate route registration detected for '${key}'.`);
@@ -146,10 +165,10 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
       dynamicRoutes.push({
         method,
         path: normalizedPath,
-        handler: route.handler,
+        ...registeredRoute,
       });
     } else {
-      handlers.set(key, route.handler);
+      handlers.set(key, registeredRoute);
     }
 
     const methods = methodsByPath.get(normalizedPath) ?? new Set<string>();
@@ -188,26 +207,26 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
         let response: Response;
 
         try {
-          response = await withRequestContext(request, async (context) => {
-            const url = new URL(request.url);
-            const pathname = normalizePath(url.pathname);
-            const method = request.method.toUpperCase();
-            const key = routeKey(method, pathname);
-            let handler = handlers.get(key);
+          const url = new URL(request.url);
+          const pathname = normalizePath(url.pathname);
+          const method = request.method.toUpperCase();
+          const key = routeKey(method, pathname);
+          let matchedRoute = handlers.get(key);
 
-            if (!handler) {
-              for (const route of dynamicRoutes) {
-                if (
-                  route.method === method &&
-                  pathMatches(route.path, pathname)
-                ) {
-                  handler = route.handler;
-                  break;
-                }
+          if (!matchedRoute) {
+            for (const route of dynamicRoutes) {
+              if (
+                route.method === method &&
+                pathMatches(route.path, pathname)
+              ) {
+                matchedRoute = route;
+                break;
               }
             }
+          }
 
-            if (!handler) {
+          response = await withRequestContext(request, async (context) => {
+            if (!matchedRoute) {
               let allowedMethods = methodsByPath.get(pathname);
 
               if (!allowedMethods) {
@@ -225,17 +244,19 @@ export function createAppWithOptions(options: CreateAppOptions = {}): App {
               }
 
               if (allowedMethods) {
-                throw new MethodNotAllowedError(pathname, [...allowedMethods]);
+                throw new MethodNotAllowedError(redactTokenPaths(pathname), [...allowedMethods]);
               }
 
               throw new NotFoundError(
-                `Route '${method} ${pathname}' was not found.`,
+                `Route '${method} ${redactTokenPaths(pathname)}' was not found.`,
               );
             }
 
-            return await handler(request, context);
+            return await matchedRoute.handler(request, context);
           }, {
-            skipAuth: isProbe,
+            skipSessionAuth: isProbe || matchedRoute?.authMode !== "session",
+            skipRequestMetadata: isProbe,
+            rateLimits,
           });
         } catch (error) {
           const fallbackRequestId = crypto.randomUUID();

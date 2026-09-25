@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { requireAuthenticated, requireRole } from "../../../src/auth/guards.ts";
+import { createRateLimiter } from "../../../src/auth/rate-limit.ts";
 import type { RequestContext } from "../../../src/http/context.ts";
 
 function createContext(overrides: Partial<RequestContext> = {}): RequestContext {
@@ -9,6 +10,8 @@ function createContext(overrides: Partial<RequestContext> = {}): RequestContext 
     startedAt: new Date(),
     method: "GET",
     pathname: "/",
+    loginRateLimiter: createRateLimiter({ maxFailures: 5, windowMs: 60_000, cooldownMs: 60_000, maxEntries: 100 }),
+    workerAuthRateLimiter: createRateLimiter({ maxFailures: 5, windowMs: 60_000, cooldownMs: 60_000, maxEntries: 100 }),
     ...overrides,
   };
 }
