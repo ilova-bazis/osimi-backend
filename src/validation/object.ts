@@ -814,6 +814,7 @@ export const objectDtoSchema = z.object({
     tenant_id: z.string(),
     type: objectTypeSchema,
     title: z.string(),
+    description: z.string().nullable(),
     language: z.string().nullable(),
     tags: z.array(z.string()),
     metadata: jsonObjectSchema,
@@ -972,6 +973,7 @@ const objectViewerSchema = z.object({
 
 export const objectDetailResponseSchema = z.object({
     object: objectDtoSchema.extend({
+        people: z.array(z.string()),
         ingest_manifest: jsonObjectSchema.nullable(),
         is_authorized: z.boolean(),
         is_deliverable: z.boolean(),

@@ -61,6 +61,7 @@ async function createQueuedIngestion(
   app: ReturnType<typeof createApp>,
   token: string,
   overrides?: Record<string, unknown>,
+  itemSummaries: Record<string, unknown>[] = [{}],
 ): Promise<string> {
   const createResponse = await app.fetch(
     new Request("http://localhost/api/ingestions", {
@@ -126,6 +127,7 @@ async function createQueuedIngestion(
   );
   expect(commitResponse.status).toBe(200);
 
+  for (const [index, itemSummary] of itemSummaries.entries()) {
   const createItemResponse = await app.fetch(
     new Request(`http://localhost/api/ingestions/${ingestionId}/items`, {
       method: "POST",
@@ -134,8 +136,9 @@ async function createQueuedIngestion(
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        item_index: 1,
+        item_index: index + 1,
         title: "Events Item 001",
+        summary: itemSummary,
       }),
     }),
   );
@@ -159,6 +162,7 @@ async function createQueuedIngestion(
     ),
   );
   expect(linkFileResponse.status).toBe(201);
+  }
 
   const submitResponse = await app.fetch(
     new Request(`http://localhost/api/ingestions/${ingestionId}/submit`, {
@@ -322,6 +326,98 @@ describe("event routes", () => {
     await resetActiveIngestions(schema);
   });
 
+  test("projects the same effective metadata as the lease for distinct item overrides", async () => {
+    const app = createTestApp();
+    const ingestionId = await createQueuedIngestion(app, authToken, {
+      access_level: "public",
+      summary: buildSummary({
+        classification: { summary: "Inherited", tags: ["inherited"] },
+        people: { mentioned: ["Inherited Person"], authors: ["Author"] },
+      }),
+    }, [
+      { classification: { summary: " Item description ", tags: ["item"], type: "image", language: "ru" }, people: { mentioned: [" Alice ", "Alice", "Bob"] },
+        custom: { nested: { retained: true }, labels: ["extension"] }, title: { edition: "first" },
+        dates: { collection_note: "archive", created: { source_label: "scan" } },
+        object_id: "forged", schema_version: "forged", access: { level: "private" }, item_kind: "audio" },
+      { classification: { summary: null, tags: [] }, people: { mentioned: [] }, custom: null },
+    ]);
+    const leaseResponse = await app.fetch(new Request(`http://localhost/api/ingestions/${ingestionId}/lease`, {
+      method: "POST", headers: { "x-worker-auth-token": "worker-secret" },
+    }));
+    expect(leaseResponse.status).toBe(200);
+    const { lease } = await leaseResponse.json() as { lease: {
+      lease_token: string;
+      items: Array<{ ingestion_item_id: string; catalog_json: Record<string, unknown> }>;
+    } };
+    expect(lease.items).toHaveLength(2);
+    for (const [index, item] of lease.items.entries()) {
+      expect(item.catalog_json).toMatchObject({ schema_version: "1.0", object_id: null, access: { level: "public" }, item_kind: "document" });
+      const objectId = `OBJ-20260213-OVERRIDE${index}`;
+      const response = await app.fetch(new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+        method: "POST",
+        headers: { "x-worker-auth-token": "worker-secret", "content-type": "application/json" },
+        body: JSON.stringify({ lease_token: lease.lease_token, events: [{
+          event_id: crypto.randomUUID(), event_type: "INGESTION_ITEM_COMPLETED",
+          ingestion_item_id: item.ingestion_item_id, object_id: objectId,
+          timestamp: new Date().toISOString(), payload: {},
+        }] }),
+      }));
+      expect(response.status).toBe(200);
+      const detailResponse = await app.fetch(new Request(`http://localhost/api/objects/${objectId}`, {
+        headers: { authorization: `Bearer ${authToken}` },
+      }));
+      expect(detailResponse.status).toBe(200);
+      const { object } = await detailResponse.json() as { object: { description: string | null; people: string[]; tags: string[]; metadata: Record<string, unknown> } };
+      expect(object.description).toBe(index === 0 ? "Item description" : null);
+      expect(object.people).toEqual(index === 0 ? ["Alice", "Bob"] : []);
+      expect(object.tags).toEqual(index === 0 ? ["item"] : []);
+      expect(object.metadata.classification).toEqual(index === 0
+        ? { summary: " Item description ", tags: ["item"], type: "image", language: "ru" }
+        : { summary: null, tags: [] });
+      expect(item.catalog_json.classification).toEqual({
+        ...(object.metadata.classification as Record<string, unknown>), type: "document", language: "en",
+      });
+      expect(object).toMatchObject({ type: "DOCUMENT", language: "en", access_level: "public" });
+      expect(item.catalog_json.people).toEqual(object.metadata.people);
+      expect(item.catalog_json.custom).toEqual(object.metadata.custom);
+      expect(item.catalog_json.dates).toEqual(object.metadata.dates);
+      if (index === 0) expect(object.metadata.dates).toMatchObject({ collection_note: "archive", created: { source_label: "scan" } });
+      expect(object.metadata.custom).toEqual(index === 0 ? { nested: { retained: true }, labels: ["extension"] } : null);
+      if (index === 0) expect(item.catalog_json.title).toMatchObject({ primary: "Events Item 001", edition: "first" });
+      if (index === 0) {
+        const editResponse = await app.fetch(new Request(`http://localhost/api/objects/${objectId}/edit`, {
+          headers: { authorization: `Bearer ${authToken}` },
+        }));
+        expect(editResponse.status).toBe(200);
+        const edit = await editResponse.json() as { revision: number };
+        const patchResponse = await app.fetch(new Request(`http://localhost/api/objects/${objectId}/metadata`, {
+          method: "PATCH", headers: { authorization: `Bearer ${authToken}`, "content-type": "application/json" },
+          body: JSON.stringify({ revision: edit.revision, metadata: {
+            title: "Human title", publication_date: "", date_precision: "none", date_approximate: false,
+            language: "en", description: "Human edit", people: ["Editor"], tags: ["edited"],
+          }, rights: { rights_note: null, sensitivity_note: null } }),
+        }));
+        expect(patchResponse.status).toBe(200);
+        const replayResponse = await app.fetch(new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+          method: "POST", headers: { "x-worker-auth-token": "worker-secret", "content-type": "application/json" },
+          body: JSON.stringify({ lease_token: lease.lease_token, events: [{
+            event_id: crypto.randomUUID(), event_type: "INGESTION_ITEM_COMPLETED",
+            ingestion_item_id: item.ingestion_item_id, object_id: objectId,
+            timestamp: new Date().toISOString(), payload: {},
+          }] }),
+        }));
+        expect(replayResponse.status).toBe(200);
+        const editedResponse = await app.fetch(new Request(`http://localhost/api/objects/${objectId}`, {
+          headers: { authorization: `Bearer ${authToken}` },
+        }));
+        expect(await editedResponse.json()).toMatchObject({ object: {
+          description: "Human edit", people: ["Editor"], tags: ["edited"],
+          metadata: { custom: { nested: { retained: true }, labels: ["extension"] } },
+        } });
+      }
+    }
+  });
+
   test("ingests item completion events with dedupe and object finalization", async () => {
     const app = createTestApp();
     const ingestionId = await createQueuedIngestion(app, authToken, {
@@ -338,8 +434,9 @@ describe("event routes", () => {
         },
         classification: {
           tags: ["source:test", "subject:letters"],
-          summary: null,
+          summary: "  An archival letter describing the collection.  ",
         },
+        people: { mentioned: [" Muhammad Osimi ", "Ahmad Hasan Dani", "Muhammad Osimi"] },
       }),
     });
 
@@ -435,6 +532,19 @@ describe("event routes", () => {
     };
     expect(detailBody.ingestion.status).toBe("COMPLETED");
 
+    const objectResponse = await app.fetch(
+      new Request("http://localhost/api/objects/OBJ-20260213-EVT001", {
+        headers: { authorization: `Bearer ${authToken}` },
+      }),
+    );
+    expect(objectResponse.status).toBe(200);
+    expect(await objectResponse.json()).toMatchObject({
+      object: {
+        description: "An archival letter describing the collection.",
+        people: ["Muhammad Osimi", "Ahmad Hasan Dani"],
+      },
+    });
+
     const sql = createSqlClient(TEST_DATABASE_URL!);
     try {
       await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
@@ -443,6 +553,7 @@ describe("event routes", () => {
           object_id: string;
           type: string;
           title: string;
+          description: string | null;
           language_code: string | null;
           access_level: string;
           embargo_kind: string;
@@ -459,6 +570,7 @@ describe("event routes", () => {
           obj.object_id,
           obj.type,
           obj.title,
+          obj.description,
           obj.language_code,
           obj.access_level,
           obj.embargo_kind,
@@ -481,6 +593,7 @@ describe("event routes", () => {
       expect(objectRows.length).toBe(1);
       expect(objectRows[0]?.type).toBe("DOCUMENT");
       expect(objectRows[0]?.title).toBe("Events Item 001");
+      expect(objectRows[0]?.description).toBe("An archival letter describing the collection.");
       expect(objectRows[0]?.language_code).toBe("en");
       expect(objectRows[0]?.access_level).toBe("family");
       expect(objectRows[0]?.embargo_kind).toBe("timed");
@@ -504,6 +617,53 @@ describe("event routes", () => {
     } finally {
       await sql.close();
     }
+  });
+
+  test.each([null, "   "])("keeps empty ingestion descriptions nullable (%j)", async (description) => {
+    const app = createTestApp();
+    const ingestionId = await createQueuedIngestion(app, authToken, {
+      summary: buildSummary({ classification: { tags: [], summary: description } }),
+    });
+    const lease = await leaseIngestion(app);
+    const objectId = `OBJ-20260213-${crypto.randomUUID().replaceAll("-", "").toUpperCase()}`;
+    const response = await app.fetch(
+      new Request(`http://localhost/api/ingestions/${ingestionId}/events`, {
+        method: "POST",
+        headers: {
+          "x-worker-auth-token": "worker-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          lease_token: lease.leaseToken,
+          events: [{
+            event_id: crypto.randomUUID(),
+            event_type: "INGESTION_ITEM_COMPLETED",
+            ingestion_item_id: lease.ingestionItemId,
+            object_id: objectId,
+            timestamp: new Date().toISOString(),
+            payload: {},
+          }],
+        }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    const sql = createSqlClient(TEST_DATABASE_URL!);
+    try {
+      await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+      const rows = await sql<{ description: string | null }[]>`
+        SELECT description FROM objects WHERE object_id = ${objectId}
+      `;
+      expect(rows).toEqual([{ description: null }]);
+    } finally {
+      await sql.close();
+    }
+    const objectResponse = await app.fetch(
+      new Request(`http://localhost/api/objects/${objectId}`, {
+        headers: { authorization: `Bearer ${authToken}` },
+      }),
+    );
+    expect(objectResponse.status).toBe(200);
+    expect(await objectResponse.json()).toMatchObject({ object: { description: null, people: [] } });
   });
 
   test("replays object-id-bearing event envelopes without conflict", async () => {

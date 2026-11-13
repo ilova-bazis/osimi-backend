@@ -37,89 +37,9 @@ import type {
   WorkerLeasedItemFile,
 } from "../types/lease.ts";
 import type { JsonObject } from "../validation/ingestion.ts";
-import { parseIngestionSummary } from "../validation/catalog.ts";
+import { catalogSummaryFields, resolveEffectiveSummary } from "../domain/ingestions/effective-summary.ts";
 
 const DEFAULT_LEASE_TTL_SECONDS = 60 * 5;
-
-type CatalogDateConfidence = "low" | "medium" | "high";
-
-interface CatalogDateBlock {
-  value: string | null;
-  approximate: boolean;
-  confidence: CatalogDateConfidence;
-  note: string | null;
-}
-
-interface CatalogDates {
-  published: CatalogDateBlock;
-  created: CatalogDateBlock;
-}
-
-const DATE_VALUE_PATTERN = /^\d{4}(-\d{2})?(-\d{2})?$/;
-
-function mergeJsonObjects(base: JsonObject, patch: JsonObject): JsonObject {
-  const result: JsonObject = { ...base };
-
-  for (const [key, patchValue] of Object.entries(patch)) {
-    const baseValue = result[key];
-    if (
-      patchValue !== null &&
-      typeof patchValue === "object" &&
-      !Array.isArray(patchValue) &&
-      baseValue !== null &&
-      typeof baseValue === "object" &&
-      !Array.isArray(baseValue)
-    ) {
-      result[key] = mergeJsonObjects(baseValue as JsonObject, patchValue as JsonObject);
-      continue;
-    }
-
-    result[key] = patchValue;
-  }
-
-  return result;
-}
-
-function normalizeCatalogDateBlock(
-  candidate: unknown,
-  fallback: CatalogDateBlock,
-): CatalogDateBlock {
-  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
-    return fallback;
-  }
-
-  const raw = candidate as Record<string, unknown>;
-  const value = raw.value;
-  const approximate = raw.approximate;
-  const confidence = raw.confidence;
-  const note = raw.note;
-
-  return {
-    value:
-      value === null || (typeof value === "string" && DATE_VALUE_PATTERN.test(value))
-        ? value
-        : fallback.value,
-    approximate: typeof approximate === "boolean" ? approximate : fallback.approximate,
-    confidence:
-      confidence === "low" || confidence === "medium" || confidence === "high"
-        ? confidence
-        : fallback.confidence,
-    note: note === null || typeof note === "string" ? note : fallback.note,
-  };
-}
-
-function normalizeCatalogDates(candidate: unknown, fallback: CatalogDates): CatalogDates {
-  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
-    return fallback;
-  }
-
-  const raw = candidate as Record<string, unknown>;
-
-  return {
-    published: normalizeCatalogDateBlock(raw.published, fallback.published),
-    created: normalizeCatalogDateBlock(raw.created, fallback.created),
-  };
-}
 
 function buildItemCatalogJson(params: {
   ingestion: Awaited<ReturnType<typeof findIngestionWithCreator>>;
@@ -139,17 +59,15 @@ function buildItemCatalogJson(params: {
 
   let summary: Record<string, unknown>;
   try {
-    summary = parseIngestionSummary(ingestion.summary);
+    summary = resolveEffectiveSummary(ingestion.summary, params.item.summary as JsonObject);
   } catch {
     throw new ConflictError("Catalog metadata is required before leasing this ingestion.", {
       ingestion_id: ingestion.id,
     });
   }
 
-  const itemSummary = params.item.summary as JsonObject;
-  const mergedSummary = mergeJsonObjects(summary as JsonObject, itemSummary);
-  const fallbackDates = summary.dates as CatalogDates;
-  const effectiveDates = normalizeCatalogDates(mergedSummary.dates, fallbackDates);
+  const mergedSummary = summary;
+  const effectiveDates = summary.dates;
 
   const baseTitle = mergedSummary.title as Record<string, unknown> | undefined;
   const effectiveTitle =
@@ -161,6 +79,7 @@ function buildItemCatalogJson(params: {
       : (baseTitle ?? summary.title);
 
   const catalog: Record<string, unknown> = {
+    ...catalogSummaryFields(summary),
     schema_version: ingestion.schemaVersion,
     object_id: params.objectId ?? null,
     ingestion_item_id: params.item.id,

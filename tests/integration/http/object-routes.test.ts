@@ -2448,6 +2448,18 @@ describe("object routes", () => {
             people: ["Zarina T.", "M. Davlatov"],
             description: "Updated description",
         });
+        const detailResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}`, {
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+        expect(detailResponse.status).toBe(200);
+        expect(await detailResponse.json()).toMatchObject({
+            object: {
+                description: "Updated description",
+                people: ["Zarina T.", "M. Davlatov"],
+            },
+        });
         expect(editBody.rights).toEqual({
             access_level: "private",
             rights_note: "Updated rights note",
@@ -2855,6 +2867,15 @@ describe("object routes", () => {
         };
         expect(detailBody.object.title).toBe("Retitled With Thumbnail");
         expect(detailBody.object.thumbnail_artifact_id).toBe(thumbnailArtifactId);
+
+        const releaseResponse = await app.fetch(
+            new Request(`http://localhost/api/objects/${tenantOneObjectId}/edit-lock`, {
+                method: "DELETE",
+                headers: { authorization: `Bearer ${operatorToken}` },
+            }),
+        );
+        expect(releaseResponse.status).toBe(200);
+        expect(await releaseResponse.json()).toMatchObject({ released: true });
 
         const patchPolicyResponse = await app.fetch(
             new Request(

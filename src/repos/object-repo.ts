@@ -10,6 +10,7 @@ interface ObjectRow {
     tenant_id: string;
     type: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
     title: string;
+    description: string | null;
     language_code: string | null;
     metadata: JsonObject;
     ingest_manifest: JsonObject | null;
@@ -78,6 +79,7 @@ export interface ObjectRecord {
     tenantId: string;
     type: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
     title: string;
+    description?: string | null;
     languageCode?: string;
     tags: string[];
     metadata: JsonObject;
@@ -243,6 +245,7 @@ function mapObject(row: ObjectRow): ObjectRecord {
         tenantId: row.tenant_id,
         type: row.type,
         title: row.title,
+        description: row.description ?? null,
         languageCode: row.language_code ?? undefined,
         tags: Array.isArray(row.tags) ? row.tags : [],
         metadata: row.metadata,
@@ -292,6 +295,7 @@ export async function findObjectBySourceIngestion(params: {
         obj.tenant_id,
         obj.type,
         obj.title,
+        obj.description,
         obj.language_code,
         obj.metadata,
         obj.ingest_manifest,
@@ -340,6 +344,7 @@ export async function findObjectBySourceIngestionItem(params: {
         obj.tenant_id,
         obj.type,
         obj.title,
+        obj.description,
         obj.language_code,
         obj.metadata,
         obj.ingest_manifest,
@@ -414,6 +419,7 @@ export async function createObject(params: {
         tenant_id,
         type,
         title,
+        description,
         language_code,
         metadata,
         ingest_manifest,
@@ -459,6 +465,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
     sourceIngestionItemId?: string;
     type?: "GENERIC" | "IMAGE" | "AUDIO" | "VIDEO" | "DOCUMENT";
     title?: string;
+    description?: string | null;
     languageCode?: string;
     accessLevel?: ObjectRow["access_level"];
     embargoKind?: ObjectRow["embargo_kind"];
@@ -467,6 +474,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
     sensitivityNote?: string;
     metadata?: JsonObject;
     tags?: string[];
+    people?: string[];
     executor?: SqlExecutor;
 }): Promise<ObjectRecord> {
     return await withExecutor(params.executor, async (sql) => {
@@ -476,6 +484,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
         tenant_id,
         type,
         title,
+        description,
         language_code,
         access_level,
         embargo_kind,
@@ -491,6 +500,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
         ${params.tenantId},
         ${params.type ?? "GENERIC"},
         ${params.title ?? ""},
+        ${params.description ?? null},
         ${params.languageCode ?? null},
         ${params.accessLevel ?? "private"}::object_access_level,
         ${params.embargoKind ?? "none"}::object_embargo_kind,
@@ -508,6 +518,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
         tenant_id,
         type,
         title,
+        description,
         language_code,
         metadata,
         ingest_manifest,
@@ -535,6 +546,14 @@ export async function createOrGetObjectBySourceIngestion(params: {
                 await replaceObjectTags(sql, inserted.object_id, tags);
             }
 
+            const people = [...new Set((params.people ?? []).map((name) => name.trim()).filter(Boolean))];
+            for (const [index, name] of people.entries()) {
+                await sql`
+                  INSERT INTO object_people (object_id, person_name, sort_order)
+                  VALUES (${inserted.object_id}, ${name}, ${index})
+                `;
+            }
+
             return {
                 ...mapObject(inserted),
                 tags,
@@ -547,6 +566,7 @@ export async function createOrGetObjectBySourceIngestion(params: {
         obj.tenant_id,
         obj.type,
         obj.title,
+        obj.description,
         obj.language_code,
         obj.metadata,
         obj.ingest_manifest,
@@ -801,6 +821,7 @@ export async function listObjects(
           obj.tenant_id,
           obj.type,
           obj.title,
+          obj.description,
           obj.language_code,
           obj.metadata,
           obj.ingest_manifest,
@@ -949,6 +970,23 @@ export async function listObjects(
     });
 }
 
+export async function listObjectPeople(params: {
+    tenantId: string;
+    objectId: string;
+}): Promise<string[]> {
+    return await withSchemaClient(async (sql) => {
+        const rows = await sql<{ person_name: string }[]>`
+          SELECT person.person_name
+          FROM object_people person
+          INNER JOIN objects obj ON obj.object_id = person.object_id
+          WHERE obj.tenant_id = ${params.tenantId}
+            AND obj.object_id = ${params.objectId}
+          ORDER BY person.sort_order, person.person_name
+        `;
+        return rows.map((row) => row.person_name);
+    });
+}
+
 export async function findObjectById(params: {
     tenantId: string;
     objectId: string;
@@ -961,6 +999,7 @@ export async function findObjectById(params: {
         obj.tenant_id,
         obj.type,
         obj.title,
+        obj.description,
         obj.language_code,
         obj.metadata,
         obj.ingest_manifest,
@@ -1006,6 +1045,7 @@ export async function findObjectByIdUnscoped(params: {
         obj.tenant_id,
         obj.type,
         obj.title,
+        obj.description,
         obj.language_code,
         obj.metadata,
         obj.ingest_manifest,
@@ -1058,6 +1098,7 @@ export async function updateObjectIngestManifest(params: {
         tenant_id,
         type,
         title,
+        description,
         language_code,
         metadata,
         ingest_manifest,
@@ -1137,6 +1178,7 @@ export async function updateObjectProjectionState(params: {
         tenant_id,
         type,
         title,
+        description,
         language_code,
         metadata,
         ingest_manifest,
@@ -1201,6 +1243,7 @@ export async function updateObjectAccessPolicy(params: {
         tenant_id,
         type,
         title,
+        description,
         language_code,
         metadata,
         ingest_manifest,
@@ -1257,6 +1300,7 @@ export async function updateObjectMetadataPages(params: {
         tenant_id,
         type,
         title,
+        description,
         language_code,
         metadata,
         ingest_manifest,

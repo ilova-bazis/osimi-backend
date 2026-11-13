@@ -64,6 +64,7 @@ import {
     listObjectArtifactSummariesByObjectIds,
     listArtifactsByObjectId,
     listObjects,
+    listObjectPeople,
     type ArtifactKind,
     type ObjectListSort,
     updateObjectMetadataPages,
@@ -510,6 +511,7 @@ function serializeObject(
         tenant_id: record.tenantId,
         type: record.type,
         title: record.title,
+        description: record.description ?? null,
         language: record.languageCode ?? null,
         tags: record.tags,
         metadata: parseObjectMetadata(record.metadata),
@@ -2739,6 +2741,10 @@ export async function getObjectDetail(params: {
     return {
         object: {
             ...serializeObject(objectRecord, { includeIngestManifest: true }),
+            people: await listObjectPeople({
+                tenantId: params.auth.tenantId,
+                objectId: params.objectId,
+            }),
             thumbnail_artifact_id: thumbnailArtifactId ?? null,
             is_authorized: projection.isAuthorized,
             is_deliverable: projection.isDeliverable,

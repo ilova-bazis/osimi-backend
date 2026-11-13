@@ -134,6 +134,15 @@ DRAFT → UPLOADING → QUEUED → PROCESSING → COMPLETED
 
 ### Submission Manifest
 
+#### Effective item metadata
+
+- Worker catalogs and object completion resolve the same recursive merge of ingestion summary defaults and item summary overrides. Omitted fields inherit; arrays replace; `classification.summary: null`, empty tags, and empty `people.mentioned` explicitly clear inherited values.
+- Item summaries retain extension fields. Effective title, classification summary/tags, and people fields must have the catalog's supported types; malformed projected fields are rejected on item create/update and cannot be leased. Dates retain the existing field-by-field fallback normalization.
+- Unreserved top-level and nested extension fields retain their paths in worker catalogs and object summary metadata. Catalog readers ignore unknown fields. The server constructs `schema_version`, object/ingestion/item identifiers, item index, attribution, access and item kind; generic summary keys cannot override that envelope. Structured classification type/language and item title keep their existing precedence. Raw object summary metadata may retain legacy reserved-name keys as data, never as authoritative policy or identifiers.
+- Completion initializes first-class description, normalized tags, and stable trimmed/deduplicated mentioned people from this effective summary. Subsequent completion delivery never overwrites existing object edits.
+- A nullable description and an empty dedicated people list are authoritative; clients must not resurrect values from legacy metadata after an edit clears them.
+- Migration `0020_object_edit_event_types.sql` extends the edit-history constraint to all event types already emitted by access-policy and change-submission flows. Existing migration checksums remain unchanged.
+
 - Submission atomically freezes the ingestion manifest: metadata, files, items, links, and ordering can change only while the ingestion is `DRAFT`, `UPLOADING`, or `CANCELED` and has no active lease.
 - A submission requires every ingestion file to be committed (`UPLOADED` or `VALIDATED`).
 - A submission requires at least one item, every item to have a linked file, and every committed ingestion file to be linked to an item.

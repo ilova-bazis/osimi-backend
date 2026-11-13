@@ -67,6 +67,10 @@ This document defines the required tests for the Osimi backend control plane (VP
 - Batched event delivery commits successfully projected earlier events while allowing a failed later event to be retried
 - Event ordering tolerance (out-of-order delivery)
 - Item completion materializes one object per item and returns all item-scoped `object_ids`
+- Item-specific descriptions, tags and mentioned people agree between leased catalogs and object projections across multi-item inheritance, partial overrides and explicit clearing; extension fields survive, malformed projected fields are rejected, and replay does not overwrite edits.
+- Top-level/nested catalog extensions retain their JSON paths across lease and completion, including null clearing; generic summary fields cannot forge the server-owned envelope or access policy, and extensions survive edit/completion replay.
+- Auth audit payloads are persisted as JSON objects (including the blocking login's `reason: rate_limited`), not double-encoded JSON strings.
+- Access-policy and change-submission edit events satisfy the database constraint; cross-user edit locks still return `423` until the owner releases the lock.
 - Aggregate `INGESTION_COMPLETED` rejects object/item identity and creates no object
 - Aggregate completion cannot terminalize an ingestion while items remain non-terminal
 - Terminal item outcomes derive `COMPLETED`, `COMPLETED_WITH_ERRORS`, or `FAILED`, including skipped-item combinations

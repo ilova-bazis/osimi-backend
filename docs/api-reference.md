@@ -309,6 +309,11 @@ Ingestion response shapes in this section are authoritative with `src/validation
       - `classification`
         - `tags` (string array, unique values)
         - `summary` (string or `null`)
+          - When item completion creates an object, the ingestion-level summary is
+            trimmed and copied into `objects.description` (blank strings become
+            `null`), exposed as `metadata.description` by the object edit endpoint.
+            The original summary remains in the object's catalog metadata. Completion
+            retries do not overwrite an existing object's edited description.
       - `dates`
         - `published` and `created`
           - `value` (YYYY, YYYY-MM, YYYY-MM-DD, or `null`)
@@ -869,6 +874,10 @@ Object response shapes in this section are authoritative with `src/validation/ob
 - `tenant_id` (string)
 - `type` (`GENERIC|IMAGE|AUDIO|VIDEO|DOCUMENT`)
 - `title` (string)
+- `description` (string, nullable): authoritative description from
+  `objects.description`, included in list and detail responses. A `null` value
+  means no description; clients must not substitute stale catalog metadata or
+  ingestion manifest descriptions after a description has been cleared.
 - `language` (string, nullable)
 - `tags` (array of strings)
 - `metadata` (JSON object)
@@ -908,6 +917,12 @@ Object response shapes in this section are authoritative with `src/validation/ob
 `object_detail = base object +`
 
 - `ingest_manifest` (JSON object, nullable)
+- `people` (string array): ordered names from the dedicated `object_people`
+  records, shared with the metadata editor. Item completion initializes these
+  records from ingestion `summary.people.mentioned`, trimming and deduplicating
+  names while retaining their order. Completion retries preserve existing people
+  edits. An empty array means no people are assigned; clients must not fall back
+  to legacy catalog metadata after names have been cleared.
 - `is_authorized` (boolean)
 - `is_deliverable` (boolean)
 - `can_download` (boolean)
@@ -2742,3 +2757,21 @@ Deprecated compatibility route. New archive workers should use `POST /api/archiv
 - List endpoints return `next_cursor`; pass it back as `cursor` for pagination.
 - There is no dedicated `recents` endpoint; use `GET /api/dashboard/activity` for recents/activity UX.
 - Do not infer rendering behavior from worker/internal artifact-kind taxonomy; use `viewer.primary_source` + `viewer_payload` and resolve artifact bytes via `/view`.
+# Effective item metadata
+
+Unreserved top-level and nested extension fields are preserved at their original
+JSON paths in worker catalogs and object summary metadata. Readers ignore unknown
+fields. Server-owned catalog envelope fields (schema version, identifiers, index,
+attribution, access and item kind) always win over generic summary keys; structured
+classification type/language and item title retain their existing precedence.
+Legacy reserved-name keys in raw object metadata are data, not authoritative policy.
+
+Ingestion item summaries recursively override ingestion defaults in both worker
+lease catalogs and completion projections. Arrays replace rather than append.
+`classification.summary: null`, `classification.tags: []`, and
+`people.mentioned: []` explicitly clear inherited values. Extension fields are
+retained; title/classification/people fields used by projections must have valid
+catalog types. Invalid effective projected fields return `400` on item writes;
+leasing also validates before claiming processing work. Date fallback and item
+title precedence are preserved. Replayed completion does not overwrite later
+object edits.

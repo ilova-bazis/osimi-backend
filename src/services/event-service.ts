@@ -24,7 +24,7 @@ import {
   updateObjectProjectionState,
   type ObjectRecord,
 } from "../repos/object-repo.ts";
-import { parseIngestionSummary } from "../validation/catalog.ts";
+import { resolveEffectiveSummary } from "../domain/ingestions/effective-summary.ts";
 import { jsonObjectSchema, type IngestItemKind } from "../validation/ingestion.ts";
 import type {
   IngestWorkerEventsInput,
@@ -195,7 +195,7 @@ export async function ingestWorkerEvents(
         );
       }
 
-      const summary = parseIngestionSummary(ingestionRecord.summary);
+      const summary = resolveEffectiveSummary(ingestionRecord.summary, scopedIngestionItem.summary);
       const parsedMetadata = jsonObjectSchema.safeParse(summary);
       const titleFromItem = scopedIngestionItem.title?.trim() ?? "";
       const titleFromEvent =
@@ -220,6 +220,7 @@ export async function ingestWorkerEvents(
             scopedIngestionItem.itemKind ?? ingestionRecord.itemKind,
           ),
           title,
+          description: summary.classification.summary?.trim() || null,
           languageCode: scopedIngestionItem.languageCode ?? ingestionRecord.languageCode,
           accessLevel: ingestionRecord.accessLevel,
           embargoKind: ingestionRecord.embargoUntil ? "timed" : "none",
@@ -228,6 +229,7 @@ export async function ingestWorkerEvents(
           sensitivityNote: ingestionRecord.sensitivityNote,
           metadata: parsedMetadata.success ? parsedMetadata.data : {},
           tags: summary.classification.tags,
+          people: summary.people?.mentioned ?? [],
           executor,
         });
       }

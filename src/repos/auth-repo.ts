@@ -285,7 +285,7 @@ export async function insertAuthAuditEvent(params: {
           ${params.errorCode ?? null},
           ${params.ip ?? null},
           ${params.userAgent ?? null},
-          CAST(${JSON.stringify(params.payload ?? {})} AS jsonb)
+          ${params.payload ?? {}}
         )
       `,
       options.timeoutMs,

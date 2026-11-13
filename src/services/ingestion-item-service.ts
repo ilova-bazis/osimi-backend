@@ -284,18 +284,21 @@ export async function createIngestionItemForIngestion(params: {
   const item = await withMutableIngestion({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
-    handler: (_, executor) => createIngestionItem({
-      id: crypto.randomUUID(),
-      tenantId: params.auth.tenantId,
-      ingestionId: params.ingestionId,
-      itemIndex: params.body.item_index,
-      classificationType: params.body.classification_type,
-      itemKind: params.body.item_kind,
-      languageCode: params.body.language_code,
-      title: params.body.title,
-      summary: params.body.summary,
-      executor,
-    }),
+    handler: (current, executor) => {
+      resolveEffectiveSummary(current.summary, params.body.summary ?? {});
+      return createIngestionItem({
+        id: crypto.randomUUID(),
+        tenantId: params.auth.tenantId,
+        ingestionId: params.ingestionId,
+        itemIndex: params.body.item_index,
+        classificationType: params.body.classification_type,
+        itemKind: params.body.item_kind,
+        languageCode: params.body.language_code,
+        title: params.body.title,
+        summary: params.body.summary,
+        executor,
+      });
+    },
   });
   if (!item) {
     throw new ConflictError("Ingestion item could not be created.");
@@ -566,17 +569,20 @@ export async function updateIngestionItemMetadata(params: {
   const updated = await withMutableIngestion({
     tenantId: params.auth.tenantId,
     ingestionId: params.ingestionId,
-    handler: (_, executor) => updateIngestionItem({
-      tenantId: params.auth.tenantId,
-      ingestionId: params.ingestionId,
-      ingestionItemId: params.ingestionItemId,
-      classificationType: params.body.classification_type,
-      itemKind: params.body.item_kind,
-      languageCode: params.body.language_code,
-      title: params.body.title,
-      summary: nextSummary,
-      executor,
-    }),
+    handler: (current, executor) => {
+      resolveEffectiveSummary(current.summary, nextSummary ?? existingItem.summary);
+      return updateIngestionItem({
+        tenantId: params.auth.tenantId,
+        ingestionId: params.ingestionId,
+        ingestionItemId: params.ingestionItemId,
+        classificationType: params.body.classification_type,
+        itemKind: params.body.item_kind,
+        languageCode: params.body.language_code,
+        title: params.body.title,
+        summary: nextSummary,
+        executor,
+      });
+    },
   });
 
   if (!updated) {
@@ -587,3 +593,4 @@ export async function updateIngestionItemMetadata(params: {
     item: serializeIngestionItem(updated),
   };
 }
+import { resolveEffectiveSummary } from "../domain/ingestions/effective-summary.ts";

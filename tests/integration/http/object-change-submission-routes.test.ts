@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { sql as sqlIdentifier } from "bun";
 
 import { createAppWithOptions as createApp } from "../../../src/app.ts";
@@ -98,6 +98,7 @@ describe("object change submission routes", () => {
     }
 
     beforeAll(async () => {
+        const machineText = "machine change page 1\n";
         process.env.OBJECT_REVISION_APPLY_ENABLED = "true";
         schema = `changes_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
         stagingRoot = await mkdtemp(join(tmpdir(), "osimi-changes-staging-"));
@@ -176,7 +177,8 @@ describe("object change submission routes", () => {
         INSERT INTO object_access_assignments (object_id, tenant_id, user_id, granted_level, created_by)
         VALUES
           (${documentObjectId}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000001"}, ${"private"}::object_access_granted_level, ${"10000000-0000-0000-0000-000000000003"}),
-          (${imageObjectId}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000001"}, ${"private"}::object_access_granted_level, ${"10000000-0000-0000-0000-000000000003"})
+          (${imageObjectId}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000001"}, ${"private"}::object_access_granted_level, ${"10000000-0000-0000-0000-000000000003"}),
+          (${documentObjectId}, ${tenantOneId}, ${"10000000-0000-0000-0000-000000000002"}, ${"private"}::object_access_granted_level, ${"10000000-0000-0000-0000-000000000003"})
       `;
 
             await sql`
@@ -188,14 +190,13 @@ describe("object change submission routes", () => {
           ${"page-1"},
           ${pageOneStorageKey},
           ${"text/plain"},
-          ${21}
+          ${Buffer.byteLength(machineText)}
         )
       `;
         } finally {
             await sql.close();
         }
 
-        const machineText = "machine change page 1\n";
         const artifactPath = join(stagingRoot, pageOneStorageKey);
         await mkdir(dirname(artifactPath), { recursive: true });
         await Bun.write(artifactPath, machineText);
@@ -204,6 +205,16 @@ describe("object change submission routes", () => {
         operatorToken = await login(app, "archiver@osimi.local", "operator123");
         viewerToken = await login(app, "viewer@osimi.local", "viewer123");
         adminToken = await login(app, "admin@osimi.local", "admin123");
+    });
+
+    beforeEach(async () => {
+        const sql = createSqlClient(TEST_DATABASE_URL!);
+        try {
+            await sql`SET search_path TO ${sqlIdentifier(schema)}, public`;
+            await sql`DELETE FROM archive_requests`;
+        } finally {
+            await sql.close();
+        }
     });
 
     afterAll(() => {
@@ -499,7 +510,8 @@ describe("object change submission routes", () => {
         expect(second.status).toBe(409);
         const secondBody = second.body;
         const secondError = secondBody.error as Record<string, unknown>;
-        expect(secondError.code).toBe("CHANGES_ALREADY_ACTIVE");
+        expect(secondError.code).toBe("CONFLICT");
+        expect(secondError.details).toMatchObject({ code: "CHANGES_ALREADY_ACTIVE" });
 
         await resetObjectEditState({
             objectId: documentObjectId,
@@ -651,9 +663,10 @@ describe("object change submission routes", () => {
         );
         expect(nonRetryableResponse.status).toBe(409);
         const nonRetryableBody = (await nonRetryableResponse.json()) as {
-            error: { code: string };
+            error: { code: string; details: { code: string } };
         };
-        expect(nonRetryableBody.error.code).toBe("NOT_RETRYABLE");
+        expect(nonRetryableBody.error.code).toBe("CONFLICT");
+        expect(nonRetryableBody.error.details.code).toBe("NOT_RETRYABLE");
 
         await resetObjectEditState({
             objectId: documentObjectId,
@@ -710,9 +723,10 @@ describe("object change submission routes", () => {
         );
         expect(supersededResponse.status).toBe(409);
         const supersededBody = (await supersededResponse.json()) as {
-            error: { code: string };
+            error: { code: string; details: { code: string } };
         };
-        expect(supersededBody.error.code).toBe("RETRY_SUPERSEDED");
+        expect(supersededBody.error.code).toBe("CONFLICT");
+        expect(supersededBody.error.details.code).toBe("RETRY_SUPERSEDED");
 
         await resetObjectEditState({
             objectId: documentObjectId,
